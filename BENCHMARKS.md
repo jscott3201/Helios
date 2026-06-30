@@ -27,6 +27,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P02 real server inference | Passed | `57f8d5f` plus local P02 benchmark changes | `server_openai_http_real_helper_generate_per_request` | `benchmarks/out/P02-real-server-inference/{records.jsonl,summary.json,report.md,blockers.md,curl-fixtures.md}` | Run ID `p02-1782844669`; localhost HTTP server route generated 128 tokens for 1K/4K/8K/16K and compared against P01 warm session. |
 | 2026-06-30 | P03 native graph triage | Passed | `88788a5` | `native_graph_vs_helper_cli_triage` | `benchmarks/out/P03-native-graph-triage/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p03-1782845820`; helper/default and `GEMMA4D_USE_NATIVE_GRAPH=1` outputs/logits matched on two tokenizer-controlled prompts plus 1K/4K/8K one-token probes. |
 | 2026-06-30 | P04 incremental native KV decode | Passed | `4f265cc` | `incremental_native_kv_vs_helper_cli` | `benchmarks/out/P04-incremental-native-kv/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p04-1782847670`; helper/default and native generated tokens matched on small prompts plus 1K/4K/8K probes; steady decode p50/p95 stayed flat across 8x context growth. |
+| 2026-06-30 | P05 true native MTP verification | Passed | `57ac3a6` | `native_target_and_native_mtp_ffi` | `benchmarks/out/P05-native-mtp/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p05-1782849629`; real native target+assistant FFI loop matched non-MTP native output for block sizes 1 and 2, then auto-disabled because acceptance was 0.000. |
 
 ## P00 Baseline Snapshot
 
@@ -169,6 +170,32 @@ Native context probe results:
 | `repeat_9259_4k` | 4096 | 16 | `parity_with_logit_drift` | 1.125 | 384.234 | 10929.037 | 2179.249 | 84.154 | 88.571 | 88.571 | 9.212 |
 | `repeat_9259_8k` | 8192 | 16 | `parity_with_logit_drift` | 1.000 | 448.234 | 27663.036 | 12515.177 | 85.814 | 88.730 | 1202.597 | 12.763 |
 
+## P05 Native MTP Snapshot
+
+P05 drives the real native FFI path directly: native target load, native MTP
+assistant load, `gemma4_mtp_draft_block`, and `gemma4_verify_tokens`. The
+benchmark reconstructs emitted tokens from verifier committed-token metadata and
+falls back to native `decode_one` when acceptance gates auto-disable MTP.
+
+Claim inventory from the `57ac3a6` run:
+
+| Category | Result |
+|---|---|
+| Exactness | `hello_smoke` and `hello_reference_prefix` matched the non-MTP native baseline for block sizes `1` and `2`. |
+| Acceptance | All four cases had acceptance rate `0.000`; each run attempted one verify pass and rolled back once. |
+| Auto-disable | All four cases auto-disabled because acceptance `0.000` fell below the `0.350` threshold. |
+| Default recommendation | `keep_disabled_by_default`. |
+| Peak MLX memory | MTP peak was `6.946 GB` to `6.957 GB`, below the 14 GB P05 threshold. |
+
+Native MTP probe results:
+
+| Probe | Block | Exact | Attempted | Accepted | Rate | Accepted/Verify | Verify Passes | Rollbacks | Auto Disabled | Baseline tok/s | MTP tok/s | MTP Peak GB |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|
+| `hello_smoke` | 1 | `true` | 1 | 0 | 0.000 | 0.000 | 1 | 1 | `true` | 4.880 | 4.561 | 6.946 |
+| `hello_smoke` | 2 | `true` | 2 | 0 | 0.000 | 0.000 | 1 | 1 | `true` | 4.880 | 4.627 | 6.950 |
+| `hello_reference_prefix` | 1 | `true` | 1 | 0 | 0.000 | 0.000 | 1 | 1 | `true` | 4.978 | 4.306 | 6.952 |
+| `hello_reference_prefix` | 2 | `true` | 2 | 0 | 0.000 | 0.000 | 1 | 1 | `true` | 4.978 | 4.235 | 6.957 |
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -182,6 +209,8 @@ Native context probe results:
 | 2026-06-30 | Added P03 native graph triage harness and goal contract. The harness runs paired helper/default and `GEMMA4D_USE_NATIVE_GRAPH=1` CLI probes, writes records/report/blockers, and inventories parity, drift, unsupported ops, memory cliffs, and hotspots. | `crates/gemma4d-bench/examples/p03_native_graph_triage.rs`, `codex/goals/P03-native-graph-triage.goal.md` | `cargo test -p gemma4d-server -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench --example p03_native_graph_triage -- --out-dir benchmarks/out/P03-native-graph-triage --model-path artifacts/models/gemma-4-12B-it-4bit` |
 | 2026-06-30 | Added native incremental KV decode for the opt-in hand-written graph: prefill materializes per-layer KV state, decode_one consumes cached K/V, sliding-window layers retain the last 1024 positions, full-attention layers retain the full prefix, and `active_kv_bytes` is surfaced through FFI/server JSON/HTTP metrics. | `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs`, `crates/gemma4d-server/src/lib.rs`, `crates/gemma4d-server/src/http.rs` | `cargo test -p gemma4d-ffi -p gemma4d-server --all-targets`; native short probe with `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-server -- generate --model-path artifacts/models/gemma-4-12B-it-4bit --token-ids 9259 --max-context-tokens 32768 --max-new-tokens 8 --json`. |
 | 2026-06-30 | Added P04 incremental native-KV benchmark harness and goal contract. The harness runs paired helper/default and native CLI probes, records active KV bytes, peak MLX memory, generated-token parity, greedy-logit diagnostics, raw decode latencies, and steady-state p50/p95 decode growth. | `crates/gemma4d-bench/examples/p04_incremental_native_kv.rs`, `codex/goals/P04-incremental-native-kv.goal.md` | `cargo test -p gemma4d-ffi -p gemma4d-server -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench --example p04_incremental_native_kv -- --out-dir benchmarks/out/P04-incremental-native-kv --model-path artifacts/models/gemma-4-12B-it-4bit`; `make verify`. |
+| 2026-06-30 | Added committed-token metadata to `Gemma4StepResult` so real MTP verify/rollback can emit the target fallback token without scripted fixture knowledge. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; P05 benchmark run. |
+| 2026-06-30 | Added P05 native MTP benchmark harness and goal contract. The harness uses real native target and assistant FFI handles, compares MTP output against non-MTP native output, records acceptance/rollback/speed/memory, and exercises auto-disable fallback. | `crates/gemma4d-bench/examples/p05_native_mtp.rs`, `codex/goals/P05-native-mtp.goal.md` | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p05_native_mtp -- --out-dir benchmarks/out/P05-native-mtp --model-path artifacts/models/gemma-4-12B-it-4bit --assistant-model-path artifacts/models/gemma-4-12B-it-qat-assistant-4bit`. |
 
 ## Verification Gates
 
@@ -204,6 +233,11 @@ Native context probe results:
 | 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P04 native KV and benchmark changes. |
 | 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-server -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P04 FFI/server metrics and benchmark harness. |
 | 2026-06-30 | `cargo run -p gemma4d-bench --example p04_incremental_native_kv -- --out-dir benchmarks/out/P04-incremental-native-kv --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P04 records, summary, report, and blocker report with no blockers. |
+| 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed. |
+| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P05 FFI and benchmark changes. |
+| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P05 FFI committed-token metadata and benchmark harness. |
+| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p05_native_mtp -- --out-dir benchmarks/out/P05-native-mtp --model-path artifacts/models/gemma-4-12B-it-4bit --assistant-model-path artifacts/models/gemma-4-12B-it-qat-assistant-4bit` | Passed | Required escalated Metal access; wrote P05 records, summary, report, and blocker report with no blockers. |
+| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_FULL_MODEL_TESTS=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo test -p gemma4d-ffi native_graph_prefills_one_token_when_explicitly_enabled -- --nocapture` | Passed | Required escalated Metal access; covers real native target/assistant FFI path and committed-token metadata assertions. |
 | 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed. |
 
 ## Current Claim Boundaries
@@ -234,3 +268,8 @@ Native context probe results:
 - P04 long-context greedy-logit deltas are diagnostic because generated token
   IDs matched helper outputs. They should not be used as proof of broad
   numerical parity outside the measured probes.
+- P05 proves real native MTP correctness only for the measured text-only greedy
+  probes and block sizes `1` and `2`.
+- P05 does not justify enabling MTP by default: the measured assistant acceptance
+  rate was `0.000`, and the benchmark recommends `keep_disabled_by_default`.
+- P05 excludes adapter-active MTP, compressed active KV, and sampling MTP.
