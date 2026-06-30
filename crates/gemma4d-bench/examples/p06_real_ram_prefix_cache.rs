@@ -177,7 +177,7 @@ impl Args {
         }
         contexts.sort_unstable();
         contexts.dedup();
-        if contexts.iter().any(|context| *context == 0) {
+        if contexts.contains(&0) {
             return Err("--contexts values must be > 0".into());
         }
         if contexts.iter().any(|context| *context > max_context_tokens) {
