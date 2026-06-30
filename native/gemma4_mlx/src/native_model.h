@@ -31,6 +31,7 @@ private:
 
     std::unique_ptr<Impl> impl_;
 
+    friend class NativeMtpAssistantModel;
     friend class NativeTextModel;
 };
 
@@ -60,6 +61,42 @@ public:
         Gemma4StepResult* out,
         std::string* error,
         std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+
+private:
+    std::unique_ptr<Impl> impl_;
+
+    friend class NativeMtpAssistantModel;
+};
+
+class NativeMtpAssistantModel {
+public:
+    struct Impl;
+
+    NativeMtpAssistantModel();
+    ~NativeMtpAssistantModel();
+
+    NativeMtpAssistantModel(const NativeMtpAssistantModel&) = delete;
+    NativeMtpAssistantModel& operator=(const NativeMtpAssistantModel&) = delete;
+    NativeMtpAssistantModel(NativeMtpAssistantModel&&) noexcept;
+    NativeMtpAssistantModel& operator=(NativeMtpAssistantModel&&) noexcept;
+
+    static bool load(
+        const std::filesystem::path& model_path,
+        const Gemma4ModelManifest& manifest,
+        std::unique_ptr<NativeMtpAssistantModel>* out,
+        std::string* error);
+
+    size_t tensor_count() const;
+    std::string summary() const;
+
+    bool draft_block(
+        const NativeTextModel& target_model,
+        const NativeHiddenState& last_hidden,
+        const std::vector<int32_t>& context_tokens,
+        uint32_t block_size,
+        int32_t* out_tokens,
+        size_t* inout_count,
+        std::string* error) const;
 
 private:
     std::unique_ptr<Impl> impl_;

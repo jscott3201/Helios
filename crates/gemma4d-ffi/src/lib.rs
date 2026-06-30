@@ -3,6 +3,7 @@
 use std::{
     ffi::{CStr, CString, NulError},
     fmt,
+    marker::PhantomData,
     num::NonZeroU32,
     os::raw::c_char,
     ptr::{self, NonNull},
@@ -318,12 +319,13 @@ impl Drop for Target {
 }
 
 #[derive(Debug)]
-pub struct Drafter {
+pub struct Drafter<'target> {
     ptr: NonNull<raw::Gemma4Drafter>,
+    _target: PhantomData<&'target Target>,
 }
 
-impl Drafter {
-    pub fn load(config: &LoadConfig, target: &Target) -> Result<Self> {
+impl<'target> Drafter<'target> {
+    pub fn load(config: &LoadConfig, target: &'target Target) -> Result<Self> {
         let model_path = CString::new(config.model_path.as_str())?;
         let model_id = optional_cstring(config.model_id.as_deref())?;
         let model_revision = optional_cstring(config.model_revision.as_deref())?;
@@ -345,11 +347,14 @@ impl Drafter {
             status: Status::Runtime,
             message: "gemma4_load_drafter returned OK with a null drafter".to_owned(),
         })?;
-        Ok(Self { ptr })
+        Ok(Self {
+            ptr,
+            _target: PhantomData,
+        })
     }
 }
 
-impl Drop for Drafter {
+impl Drop for Drafter<'_> {
     fn drop(&mut self) {
         // SAFETY: `self.ptr` is an owned drafter handle returned by `gemma4_load_drafter`.
         let status = unsafe { raw::gemma4_free_drafter(self.ptr.as_ptr()) };
@@ -472,7 +477,7 @@ pub fn decode_one(target: &Target, cache: &mut KvCache, token: i32) -> Result<St
 }
 
 pub fn draft_block(
-    drafter: &Drafter,
+    drafter: &Drafter<'_>,
     cache: &mut KvCache,
     block_size: NonZeroU32,
 ) -> Result<Vec<i32>> {
@@ -666,7 +671,7 @@ mod tests {
         );
 
         let model_path = std::env::var("GEMMA4D_MODEL_PATH")
-            .unwrap_or_else(|_| "artifacts/models/gemma-4-12B-it-4bit".to_owned());
+            .unwrap_or_else(|_| workspace_path("artifacts/models/gemma-4-12B-it-4bit"));
         if !std::path::Path::new(&model_path).exists() {
             return;
         }
@@ -688,16 +693,15 @@ mod tests {
         assert!(step.peak_memory_gb > 0.0);
         assert!(step.native_last_hidden.is_some());
 
-        let decode =
-            decode_one(&target, &mut cache, step.greedy_token).expect("native decode should run");
-        assert_eq!(decode.sequence_len, 2);
-        assert_eq!(decode.greedy_token, 236772);
-        assert!(decode.peak_memory_gb > 0.0);
-        assert!(decode.native_last_hidden.is_some());
-
-        let assistant_fixture = write_assistant_fixture();
+        let assistant_model_path =
+            std::env::var("GEMMA4D_ASSISTANT_MODEL_PATH").unwrap_or_else(|_| {
+                workspace_path("artifacts/models/gemma-4-12B-it-qat-assistant-4bit")
+            });
+        if !std::path::Path::new(&assistant_model_path).exists() {
+            return;
+        }
         let drafter_config = LoadConfig {
-            model_path: assistant_fixture.to_string_lossy().into_owned(),
+            model_path: assistant_model_path,
             model_id: Some("mlx-community/gemma-4-12B-it-qat-assistant-4bit".to_owned()),
             model_revision: None,
             expected_architecture: Some("gemma4_unified_assistant".to_owned()),
@@ -706,14 +710,39 @@ mod tests {
         };
         let drafter =
             Drafter::load(&drafter_config, &target).expect("assistant manifest should load");
-        let err = draft_block(&drafter, &mut cache, NonZeroU32::new(1).expect("non-zero"))
-            .expect_err("assistant execution is still pending after shared views are present");
-        assert_eq!(err.status(), Status::UnsupportedConfig);
-        assert!(
-            err.message()
-                .contains("materialized last target hidden/shared views")
-        );
-        fs::remove_dir_all(assistant_fixture).expect("remove assistant fixture");
+        let draft_after_prefill =
+            draft_block(&drafter, &mut cache, NonZeroU32::new(1).expect("non-zero"))
+                .expect("assistant prefill block-size-1 draft should run");
+        assert_eq!(draft_after_prefill.len(), 1);
+        assert!((0..262144).contains(&draft_after_prefill[0]));
+
+        let decode =
+            decode_one(&target, &mut cache, step.greedy_token).expect("native decode should run");
+        assert_eq!(decode.sequence_len, 2);
+        assert_eq!(decode.greedy_token, 236772);
+        assert!(decode.peak_memory_gb > 0.0);
+        assert!(decode.native_last_hidden.is_some());
+
+        let draft_one = draft_block(&drafter, &mut cache, NonZeroU32::new(1).expect("non-zero"))
+            .expect("assistant block-size-1 draft should run");
+        assert_eq!(draft_one.len(), 1);
+        assert!((0..262144).contains(&draft_one[0]));
+
+        let mut baseline_cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let baseline_first =
+            prefill(&target, &mut baseline_cache, &[9259]).expect("baseline prefill should run");
+        let baseline_second = decode_one(&target, &mut baseline_cache, baseline_first.greedy_token)
+            .expect("baseline second token should run");
+        let baseline_third = decode_one(&target, &mut baseline_cache, baseline_second.greedy_token)
+            .expect("baseline third token should run");
+
+        let draft_two = draft_block(&drafter, &mut cache, NonZeroU32::new(2).expect("non-zero"))
+            .expect("assistant block-size-2 draft should run");
+        assert_eq!(draft_two.len(), 2);
+        assert!(draft_two.iter().all(|token| (0..262144).contains(token)));
+
+        assert_eq!(baseline_second.greedy_token, decode.greedy_token);
+        assert_eq!(baseline_third.sequence_len, 3);
     }
 
     #[test]
@@ -789,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn drafter_strict_load_accepts_assistant_manifest_then_draft_fails_closed() {
+    fn drafter_strict_load_accepts_assistant_manifest_but_requires_hidden_views() {
         let fixture = write_assistant_fixture();
         let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
         let config = LoadConfig {
@@ -804,7 +833,7 @@ mod tests {
         let drafter = Drafter::load(&config, &target).expect("assistant manifest should load");
         let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
         let err = draft_block(&drafter, &mut cache, NonZeroU32::new(1).expect("non-zero"))
-            .expect_err("native MTP execution should fail closed until hidden views exist");
+            .expect_err("native MTP draft should require hidden views");
         assert_eq!(err.status(), Status::UnsupportedConfig);
         assert!(err.message().contains("last target hidden/shared views"));
 
@@ -848,6 +877,13 @@ mod tests {
         fs::write(dir.join("tokenizer.json"), "{}").expect("write assistant tokenizer");
         write_safetensors_header(&dir.join("model.safetensors"), assistant_tensor_keys());
         dir
+    }
+
+    fn workspace_path(relative: &str) -> String {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../..");
+        path.push(relative);
+        path.to_string_lossy().into_owned()
     }
 
     fn assistant_config_json() -> &'static str {

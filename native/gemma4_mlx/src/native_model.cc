@@ -49,6 +49,18 @@ struct NativeTextModel::Impl {
     std::string manifest_summary;
 };
 
+struct NativeMtpAssistantModel::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    std::unordered_map<std::string, mlx::core::array> tensors;
+#endif
+    QuantizationSpec default_quantization;
+    std::unordered_map<std::string, QuantizationSpec> quantization_overrides;
+    size_t safetensor_file_count = 0;
+    size_t assistant_tensor_count = 0;
+    size_t total_tensor_count_seen = 0;
+    std::string manifest_summary;
+};
+
 namespace {
 
 std::vector<std::filesystem::path> safetensor_files(const std::filesystem::path& model_path) {
@@ -66,6 +78,11 @@ bool is_language_tensor(const std::string& key) {
     return key.rfind("language_model.model.", 0) == 0;
 }
 
+bool is_assistant_tensor(const std::string& key) {
+    return key.rfind("model.", 0) == 0 || key.rfind("pre_projection.", 0) == 0 ||
+        key.rfind("post_projection.", 0) == 0;
+}
+
 #ifdef GEMMA4D_MLX_AVAILABLE
 
 using mlx::core::array;
@@ -74,7 +91,8 @@ array to_float32(array value) {
     return mlx::core::astype(std::move(value), mlx::core::float32);
 }
 
-const array& tensor_or_throw(const NativeTextModel::Impl& impl, const std::string& key) {
+template <typename Impl>
+const array& tensor_or_throw(const Impl& impl, const std::string& key) {
     const auto found = impl.tensors.find(key);
     if (found == impl.tensors.end()) {
         throw std::runtime_error("missing loaded tensor " + key);
@@ -82,7 +100,8 @@ const array& tensor_or_throw(const NativeTextModel::Impl& impl, const std::strin
     return found->second;
 }
 
-QuantizationSpec quantization_for(const NativeTextModel::Impl& impl, const std::string& prefix) {
+template <typename Impl>
+QuantizationSpec quantization_for(const Impl& impl, const std::string& prefix) {
     const auto found = impl.quantization_overrides.find(prefix);
     if (found != impl.quantization_overrides.end()) {
         return found->second;
@@ -109,7 +128,8 @@ array model_scalar(float value) {
     return array(value, mlx::core::bfloat16);
 }
 
-array quantized_linear(const NativeTextModel::Impl& impl, const array& x, const std::string& prefix) {
+template <typename Impl>
+array quantized_linear(const Impl& impl, const array& x, const std::string& prefix) {
     const QuantizationSpec spec = quantization_for(impl, prefix);
     return model_dtype(mlx::core::quantized_matmul(
         x,
@@ -567,6 +587,134 @@ NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const
     return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(shared_kv)};
 }
 
+array target_token_embedding(const NativeTextModel::Impl& impl, int32_t token_id) {
+    const std::vector<int32_t> ids = {token_id};
+    array token_ids(ids.begin(), {1, 1}, mlx::core::int32);
+    return model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
+}
+
+array assistant_logits(const NativeMtpAssistantModel::Impl& impl, const array& h) {
+    const QuantizationSpec embed_quantization = quantization_for(impl, "model.embed_tokens");
+    array logits = mlx::core::quantized_matmul(
+        h,
+        tensor_or_throw(impl, "model.embed_tokens.weight"),
+        tensor_or_throw(impl, "model.embed_tokens.scales"),
+        std::optional<array>(tensor_or_throw(impl, "model.embed_tokens.biases")),
+        true,
+        static_cast<int>(embed_quantization.group_size),
+        static_cast<int>(embed_quantization.bits),
+        "affine");
+    logits = model_dtype(logits);
+    return mlx::core::reshape(logits, {262144});
+}
+
+bool assistant_layer_full_attention(uint32_t layer_idx) {
+    return layer_idx == 3;
+}
+
+array assistant_attention_forward(
+    const NativeMtpAssistantModel::Impl& impl,
+    const NativeHiddenState::Impl& shared,
+    const array& x,
+    uint32_t layer_idx,
+    int position_offset) {
+    const bool full_attention = assistant_layer_full_attention(layer_idx);
+    const int head_dim = full_attention ? 512 : 256;
+    const int n_heads = 16;
+    const std::string base = "model.layers." + std::to_string(layer_idx);
+
+    array queries = quantized_linear(impl, x, base + ".self_attn.q_proj");
+    queries = mlx::core::reshape(queries, {1, 1, n_heads, head_dim});
+    queries = model_dtype(mlx::core::fast::rms_norm(
+        queries,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.q_norm.weight")),
+        1e-6f));
+    queries = mlx::core::transpose(queries, {0, 2, 1, 3});
+    queries = apply_rope(queries, full_attention, head_dim, position_offset);
+
+    const array& keys = full_attention ? *shared.full_attention_key : *shared.sliding_attention_key;
+    const array& values = full_attention ? *shared.full_attention_value : *shared.sliding_attention_value;
+    array output = mlx::core::fast::scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        1.0f,
+        "",
+        std::nullopt);
+    output = mlx::core::transpose(output, {0, 2, 1, 3});
+    output = mlx::core::reshape(output, {1, 1, n_heads * head_dim});
+    return quantized_linear(impl, output, base + ".self_attn.o_proj");
+}
+
+array assistant_layer_forward(
+    const NativeMtpAssistantModel::Impl& impl,
+    const NativeHiddenState::Impl& shared,
+    const array& x,
+    uint32_t layer_idx,
+    int position_offset) {
+    const std::string base = "model.layers." + std::to_string(layer_idx);
+    const array residual = x;
+
+    array h = model_dtype(mlx::core::fast::rms_norm(
+        x,
+        std::optional<array>(tensor_or_throw(impl, base + ".input_layernorm.weight")),
+        1e-6f));
+    h = assistant_attention_forward(impl, shared, h, layer_idx, position_offset);
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(residual + h);
+
+    const array mlp_residual = h;
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".pre_feedforward_layernorm.weight")),
+        1e-6f));
+    array gate = quantized_linear(impl, h, base + ".mlp.gate_proj");
+    array up = quantized_linear(impl, h, base + ".mlp.up_proj");
+    h = model_dtype(geglu(gate, up));
+    h = quantized_linear(impl, h, base + ".mlp.down_proj");
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_feedforward_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(mlp_residual + h);
+    return model_dtype(h * tensor_or_throw(impl, base + ".layer_scalar"));
+}
+
+struct NativeMtpDraftStep {
+    int32_t token = 0;
+    array projected_hidden;
+};
+
+NativeMtpDraftStep assistant_draft_one(
+    const NativeMtpAssistantModel::Impl& assistant,
+    const NativeTextModel::Impl& target,
+    const NativeHiddenState::Impl& shared,
+    const array& current_hidden,
+    int32_t token_id,
+    int position_offset) {
+    array token_embedding = target_token_embedding(target, token_id);
+    array input = mlx::core::concatenate({token_embedding, current_hidden}, 2);
+    array h = quantized_linear(assistant, input, "pre_projection");
+
+    for (uint32_t layer = 0; layer < 4; ++layer) {
+        h = assistant_layer_forward(assistant, shared, h, layer, position_offset);
+    }
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(assistant, "model.norm.weight")),
+        1e-6f));
+
+    array logits = assistant_logits(assistant, h);
+    array greedy = mlx::core::argmax(logits);
+    array projected = quantized_linear(assistant, h, "post_projection");
+    mlx::core::eval({greedy, projected});
+
+    return NativeMtpDraftStep{greedy.item<int>(), std::move(projected)};
+}
+
 bool trace_parity_logits_enabled() {
     const char* value = std::getenv("GEMMA4D_NATIVE_TRACE_PARITY_LOGITS");
     return value != nullptr && value[0] != '\0' && std::string(value) != "0";
@@ -793,6 +941,199 @@ bool NativeTextModel::forward_greedy(
         return false;
     } catch (...) {
         *error = "native Gemma 4 forward failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+NativeMtpAssistantModel::NativeMtpAssistantModel() : impl_(std::make_unique<Impl>()) {}
+
+NativeMtpAssistantModel::~NativeMtpAssistantModel() = default;
+
+NativeMtpAssistantModel::NativeMtpAssistantModel(NativeMtpAssistantModel&&) noexcept = default;
+
+NativeMtpAssistantModel& NativeMtpAssistantModel::operator=(NativeMtpAssistantModel&&) noexcept = default;
+
+bool NativeMtpAssistantModel::load(
+    const std::filesystem::path& model_path,
+    const Gemma4ModelManifest& manifest,
+    std::unique_ptr<NativeMtpAssistantModel>* out,
+    std::string* error) {
+    if (out == nullptr || error == nullptr) {
+        return false;
+    }
+    out->reset();
+    error->clear();
+
+    if (!manifest.is_assistant) {
+        *error = "native MTP assistant load requires an assistant manifest";
+        return false;
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)model_path;
+    (void)manifest;
+    *error = "native Gemma 4 MTP assistant was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        std::unique_ptr<NativeMtpAssistantModel> model(new NativeMtpAssistantModel());
+        model->impl_->manifest_summary = manifest.summary();
+        model->impl_->default_quantization = manifest.default_quantization();
+        model->impl_->quantization_overrides = manifest.quantization_overrides;
+
+        const std::vector<std::filesystem::path> files = safetensor_files(model_path);
+        if (files.empty()) {
+            *error = "no safetensors files found in " + model_path.string();
+            return false;
+        }
+
+        for (const std::filesystem::path& file : files) {
+            auto loaded = mlx::core::load_safetensors(file.string());
+            ++model->impl_->safetensor_file_count;
+            model->impl_->total_tensor_count_seen += loaded.first.size();
+            for (auto& entry : loaded.first) {
+                if (!is_assistant_tensor(entry.first)) {
+                    continue;
+                }
+                auto inserted = model->impl_->tensors.emplace(std::move(entry.first), std::move(entry.second));
+                if (!inserted.second) {
+                    *error = "duplicate MTP assistant tensor while loading " + file.string();
+                    return false;
+                }
+            }
+        }
+
+        model->impl_->assistant_tensor_count = model->impl_->tensors.size();
+        if (model->impl_->safetensor_file_count != manifest.safetensor_file_count ||
+            model->impl_->total_tensor_count_seen != manifest.total_tensor_count ||
+            model->impl_->assistant_tensor_count != manifest.language_tensor_count) {
+            std::ostringstream message;
+            message << "native loaded MTP assistant tensor inventory does not match manifest: files="
+                    << model->impl_->safetensor_file_count << " tensors="
+                    << model->impl_->total_tensor_count_seen << " assistant_tensors="
+                    << model->impl_->assistant_tensor_count;
+            *error = message.str();
+            return false;
+        }
+
+        *out = std::move(model);
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("MLX native MTP assistant load failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "MLX native MTP assistant load failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+size_t NativeMtpAssistantModel::tensor_count() const {
+    return impl_ == nullptr ? 0 : impl_->assistant_tensor_count;
+}
+
+std::string NativeMtpAssistantModel::summary() const {
+    if (impl_ == nullptr) {
+        return "native Gemma 4 MTP assistant model is empty";
+    }
+    std::ostringstream out;
+    out << "native Gemma 4 MTP assistant loaded " << impl_->assistant_tensor_count
+        << " assistant tensors from " << impl_->safetensor_file_count
+        << " safetensor files (" << impl_->total_tensor_count_seen << " tensors scanned)";
+    if (!impl_->manifest_summary.empty()) {
+        out << "; " << impl_->manifest_summary;
+    }
+    return out.str();
+}
+
+bool NativeMtpAssistantModel::draft_block(
+    const NativeTextModel& target_model,
+    const NativeHiddenState& last_hidden,
+    const std::vector<int32_t>& context_tokens,
+    uint32_t block_size,
+    int32_t* out_tokens,
+    size_t* inout_count,
+    std::string* error) const {
+    if (out_tokens == nullptr || inout_count == nullptr || error == nullptr) {
+        return false;
+    }
+    error->clear();
+    const size_t capacity = *inout_count;
+    *inout_count = 0;
+
+    if (block_size == 0) {
+        *error = "native MTP draft requires block_size > 0";
+        return false;
+    }
+    if (block_size > 2) {
+        *error = "native MTP draft currently supports block_size <= 2 for M06";
+        return false;
+    }
+    if (capacity < block_size) {
+        *error = "native MTP draft output buffer is smaller than block_size";
+        return false;
+    }
+    if (context_tokens.empty()) {
+        *error = "native MTP draft requires at least one context token";
+        return false;
+    }
+    if (last_hidden.sequence_len() == 0 || context_tokens.size() != last_hidden.sequence_len()) {
+        *error = "native MTP draft context tokens do not match the materialized hidden state";
+        return false;
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)target_model;
+    (void)last_hidden;
+    (void)context_tokens;
+    (void)block_size;
+    (void)out_tokens;
+    *error = "native Gemma 4 MTP assistant was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->assistant_tensor_count == 0) {
+            *error = "native Gemma 4 MTP assistant model state is not loaded";
+            return false;
+        }
+        if (target_model.impl_ == nullptr || target_model.impl_->language_tensor_count == 0) {
+            *error = "native Gemma 4 target model state is not loaded for MTP token embeddings";
+            return false;
+        }
+        if (last_hidden.impl_ == nullptr || !last_hidden.has_shared_kv()) {
+            *error = "native MTP draft requires materialized target hidden/shared KV state";
+            return false;
+        }
+        const uint64_t first_position = last_hidden.sequence_len() - 1;
+        if (first_position + block_size > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            *error = "native MTP draft position offset exceeds MLX shape limits";
+            return false;
+        }
+
+        array current_hidden = last_hidden.impl_->hidden;
+        int32_t token_id = context_tokens.back();
+        size_t produced = 0;
+        for (uint32_t step = 0; step < block_size; ++step) {
+            NativeMtpDraftStep draft = assistant_draft_one(
+                *impl_,
+                *target_model.impl_,
+                *last_hidden.impl_,
+                current_hidden,
+                token_id,
+                static_cast<int>(first_position + step));
+            out_tokens[produced++] = draft.token;
+            token_id = draft.token;
+            current_hidden = std::move(draft.projected_hidden);
+        }
+
+        *inout_count = produced;
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native Gemma 4 MTP assistant draft failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native Gemma 4 MTP assistant draft failed with an unknown exception";
         return false;
     }
 #endif

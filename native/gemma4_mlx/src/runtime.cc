@@ -70,6 +70,8 @@ struct NativeDrafter {
     bool model_loaded;
     std::string model_path;
     gemma4d::Gemma4ModelManifest manifest;
+    const gemma4d::NativeTextModel* target_native_model;
+    std::unique_ptr<gemma4d::NativeMtpAssistantModel> native_model;
 };
 
 void store_error(const char* message) {
@@ -673,6 +675,8 @@ Gemma4Status gemma4_load_drafter(
     drafter->model_loaded = false;
     drafter->model_path = config->model_path;
     drafter->manifest = gemma4d::Gemma4ModelManifest{};
+    drafter->target_native_model = target->use_native_graph ? target->native_model.get() : nullptr;
+    drafter->native_model.reset();
 
     if (!config->allow_unsupported_config) {
         Gemma4Status status = validate_strict_model_artifacts(config->model_path);
@@ -687,6 +691,17 @@ Gemma4Status gemma4_load_drafter(
             return fail(
                 GEMMA4_ERR_UNSUPPORTED_CONFIG,
                 "unsupported Gemma 4 drafter manifest: " + manifest_error);
+        }
+        if (target->use_native_graph) {
+            std::string native_error;
+            if (!gemma4d::NativeMtpAssistantModel::load(
+                    config->model_path,
+                    drafter->manifest,
+                    &drafter->native_model,
+                    &native_error)) {
+                delete drafter;
+                return fail(GEMMA4_ERR_MODEL_LOAD, native_error);
+            }
         }
         drafter->model_loaded = true;
     }
@@ -747,12 +762,26 @@ Gemma4Status gemma4_mtp_draft_block(
             GEMMA4_ERR_UNSUPPORTED_CONFIG,
             "gemma4_mtp_draft_block requires both full-attention and sliding-attention shared KV views");
     }
+    if (drafter->native_model == nullptr || drafter->target_native_model == nullptr) {
+        *inout_count = 0;
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_mtp_draft_block requires a native target graph and loaded native MTP assistant tensors");
+    }
 
-    (void)out_tokens;
-    *inout_count = 0;
-    return fail(
-        GEMMA4_ERR_UNSUPPORTED_CONFIG,
-        "native MTP drafter execution is not implemented for materialized last target hidden/shared views");
+    std::string native_error;
+    if (!drafter->native_model->draft_block(
+            *drafter->target_native_model,
+            *cache->last_hidden,
+            cache->native_tokens,
+            block_size,
+            out_tokens,
+            inout_count,
+            &native_error)) {
+        *inout_count = 0;
+        return fail(GEMMA4_ERR_RUNTIME, native_error);
+    }
+    return ok();
 }
 
 Gemma4Status gemma4_verify_tokens(
