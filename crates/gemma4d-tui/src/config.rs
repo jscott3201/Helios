@@ -271,11 +271,43 @@ fn validate_model_table(table: &toml::Table, diagnostics: &mut Vec<ConfigDiagnos
         ));
     }
 
-    let revision = table.get("target_revision").and_then(toml::Value::as_str);
-    if revision == Some("PIN_ME") {
+    validate_revision_pin(
+        table.get("target_revision").and_then(toml::Value::as_str),
+        "[model].target_revision",
+        diagnostics,
+    );
+    if table
+        .get("drafter")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|drafter| !drafter.is_empty())
+    {
+        validate_revision_pin(
+            table.get("drafter_revision").and_then(toml::Value::as_str),
+            "[model].drafter_revision",
+            diagnostics,
+        );
+    }
+}
+
+fn validate_revision_pin(
+    revision: Option<&str>,
+    path: &str,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let Some(revision) = revision
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+    else {
         diagnostics.push(ConfigDiagnostic::warning(
-            "[model].target_revision",
-            "revision should be pinned before release evidence",
+            path,
+            "revision or local artifact hash should be pinned before release evidence",
+        ));
+        return;
+    };
+    if revision == "PIN_ME" || revision.starts_with("unavailable:") {
+        diagnostics.push(ConfigDiagnostic::warning(
+            path,
+            "revision is not pinned; use a real revision or local-artifact-sha256 from the P11 manifest",
         ));
     }
 }

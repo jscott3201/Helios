@@ -19,7 +19,13 @@
 | Rust | |
 | MLX | |
 | Model | |
-| Model revision/hash | |
+| Model revision | |
+| Revision source | |
+| Local artifact SHA-256 | |
+| Config SHA-256 | |
+| Tokenizer SHA-256 | |
+| Chat template SHA-256 | |
+| Safetensors inventory SHA-256 | |
 | Adapter | |
 
 ## Commands

@@ -17,7 +17,7 @@ use gemma4d_server::http::{ServerConfig, ServerRuntime, serve_listener};
 use gemma4d_tui::{
     TuiError,
     app::{Action, AppState, BenchmarkStatus, PageId, reduce},
-    config::{ValidationStatus, validate_config_path},
+    config::{ValidationStatus, validate_config_path, validate_config_source},
     profile_render,
     provider::{HttpProvider, MockProvider, RuntimeProvider},
     seed_state,
@@ -98,6 +98,53 @@ fn invalid_tiny16_fixture_is_caught() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.path == "[model].target")
+    );
+}
+
+#[test]
+fn pinned_tiny16_config_has_no_revision_pin_warnings() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tiny16.toml");
+    let validation = validate_config_path(&path);
+
+    assert_eq!(validation.status, ValidationStatus::Valid);
+    assert!(
+        validation
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("revision is not pinned")),
+        "unexpected revision warning: {:?}",
+        validation.diagnostics
+    );
+}
+
+#[test]
+fn pin_me_revisions_warn_as_unpinned() {
+    let source = r#"
+[runtime]
+hard_memory_limit_mb = 12288
+leave_system_headroom_mb = 3072
+
+[model]
+target = "mlx-community/gemma-4-12B-it-4bit"
+target_revision = "PIN_ME"
+drafter = "mlx-community/gemma-4-12B-it-qat-assistant-4bit"
+drafter_revision = "PIN_ME"
+
+[tui]
+tick_ms = 250
+confirm_destructive_actions = true
+"#;
+    let validation = validate_config_source(Path::new("fixture.toml"), source);
+
+    assert_eq!(validation.status, ValidationStatus::Valid);
+    assert!(
+        validation
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("revision is not pinned"))
+            .count()
+            >= 2
     );
 }
 

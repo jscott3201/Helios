@@ -1,5 +1,7 @@
 #![doc = "Reference-parity benchmark harness and report generation."]
 
+pub mod manifest;
+
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Write},
@@ -43,6 +45,13 @@ pub struct ReportOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestCliOptions {
+    pub model_path: PathBuf,
+    pub drafter_path: Option<PathBuf>,
+    pub out_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliError {
     Usage(String),
     Runtime(String),
@@ -73,13 +82,6 @@ struct BenchEnvironment {
     arch: String,
     rustc: String,
     git_commit: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelRevision {
-    path: String,
-    config_hash: String,
-    tokenizer_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,12 +145,63 @@ where
             let options = parse_report_options(args)?;
             generate_report_file(&options)
         }
+        "manifest" => {
+            let options = parse_manifest_options(args)?;
+            manifest::write_manifest_artifacts(&manifest::ManifestOptions {
+                model_path: options.model_path,
+                drafter_path: options.drafter_path,
+                out_dir: options.out_dir,
+            })
+        }
         "-h" | "--help" | "help" => Ok(usage()),
         other => Err(CliError::Usage(format!(
             "unknown command '{other}'\n{}",
             usage()
         ))),
     }
+}
+
+pub fn parse_manifest_options<I, S>(args: I) -> Result<ManifestCliOptions, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).peekable();
+    let mut model_path = PathBuf::from("artifacts/models/gemma-4-12B-it-4bit");
+    let mut drafter_path = Some(PathBuf::from(
+        "artifacts/models/gemma-4-12B-it-qat-assistant-4bit",
+    ));
+    let mut out_dir = PathBuf::from("benchmarks/out/P11-manifest-pinning");
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--model-path" => {
+                model_path = PathBuf::from(required_value(&mut args, "--model-path")?);
+            }
+            "--drafter-path" => {
+                drafter_path = Some(PathBuf::from(required_value(&mut args, "--drafter-path")?));
+            }
+            "--no-drafter" => {
+                drafter_path = None;
+            }
+            "--out-dir" => {
+                out_dir = PathBuf::from(required_value(&mut args, "--out-dir")?);
+            }
+            "-h" | "--help" => return Err(CliError::Usage(manifest_usage())),
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown manifest option '{other}'\n{}",
+                    manifest_usage()
+                )));
+            }
+        }
+    }
+
+    Ok(ManifestCliOptions {
+        model_path,
+        drafter_path,
+        out_dir,
+    })
 }
 
 pub fn parse_run_options<I, S>(args: I) -> Result<RunOptions, CliError>
@@ -385,7 +438,8 @@ pub fn run_benchmarks(options: &RunOptions) -> Result<String, CliError> {
 
     let run_id = run_id();
     let environment = capture_environment();
-    let model_revision = capture_model_revision(&options.model_path);
+    let model_identity =
+        manifest::capture_artifact_identity(&options.model_path, "GEMMA4D_MODEL_REVISION");
     let mut writer = File::create(&records_path)
         .map_err(|error| CliError::Runtime(format!("failed to create JSONL: {error}")))?;
 
@@ -400,7 +454,7 @@ pub fn run_benchmarks(options: &RunOptions) -> Result<String, CliError> {
                 &run_id,
                 prompt,
                 &environment,
-                &model_revision,
+                &model_identity,
                 &candidate,
                 &reference,
                 &diff,
@@ -418,7 +472,7 @@ pub fn run_benchmarks(options: &RunOptions) -> Result<String, CliError> {
                 &run_id,
                 prompt,
                 &environment,
-                &model_revision,
+                &model_identity,
                 &candidate,
                 &reference,
                 &diff,
@@ -438,7 +492,7 @@ pub fn run_benchmarks(options: &RunOptions) -> Result<String, CliError> {
                 &run_id,
                 prompt,
                 &environment,
-                &model_revision,
+                &model_identity,
                 &candidate,
                 &reference,
                 &diff,
@@ -508,11 +562,34 @@ pub fn generate_report(input_path: &Path) -> Result<String, CliError> {
         if model_summary.is_none() {
             let model_path =
                 extract_json_string(line, "model_path").unwrap_or_else(|| "unknown".to_owned());
-            let config_hash =
-                extract_json_string(line, "config_hash").unwrap_or_else(|| "unknown".to_owned());
-            let tokenizer_hash =
-                extract_json_string(line, "tokenizer_hash").unwrap_or_else(|| "unknown".to_owned());
-            model_summary = Some((model_path, config_hash, tokenizer_hash));
+            let revision =
+                extract_json_string(line, "revision").unwrap_or_else(|| "unavailable".to_owned());
+            let revision_source = extract_json_string(line, "revision_source")
+                .unwrap_or_else(|| "unknown".to_owned());
+            let local_artifact_sha256 = extract_json_string(line, "local_artifact_sha256")
+                .unwrap_or_else(|| "unknown".to_owned());
+            let config_sha256 =
+                extract_json_string(line, "config_sha256").unwrap_or_else(|| "unknown".to_owned());
+            let tokenizer_sha256 = extract_json_string(line, "tokenizer_sha256")
+                .unwrap_or_else(|| "unknown".to_owned());
+            let tokenizer_config_sha256 = extract_json_string(line, "tokenizer_config_sha256")
+                .unwrap_or_else(|| "unknown".to_owned());
+            let chat_template_sha256 = extract_json_string(line, "chat_template_sha256")
+                .unwrap_or_else(|| "unknown".to_owned());
+            let safetensors_inventory_sha256 =
+                extract_json_string(line, "safetensors_inventory_sha256")
+                    .unwrap_or_else(|| "unknown".to_owned());
+            model_summary = Some((
+                model_path,
+                revision,
+                revision_source,
+                local_artifact_sha256,
+                config_sha256,
+                tokenizer_sha256,
+                tokenizer_config_sha256,
+                chat_template_sha256,
+                safetensors_inventory_sha256,
+            ));
         }
 
         match status.as_str() {
@@ -542,17 +619,52 @@ pub fn generate_report(input_path: &Path) -> Result<String, CliError> {
             markdown_escape(&git_commit)
         ));
     }
-    if let Some((model_path, config_hash, tokenizer_hash)) = model_summary {
+    if let Some((
+        model_path,
+        revision,
+        revision_source,
+        local_artifact_sha256,
+        config_sha256,
+        tokenizer_sha256,
+        tokenizer_config_sha256,
+        chat_template_sha256,
+        safetensors_inventory_sha256,
+    )) = model_summary
+    {
         report.push_str("## Model\n\n");
         report.push_str("| Item | Value |\n|---|---|\n");
         report.push_str(&format!("| Path | `{}` |\n", markdown_escape(&model_path)));
         report.push_str(&format!(
-            "| config.json FNV64 | `{}` |\n",
-            markdown_escape(&config_hash)
+            "| Revision | `{}` |\n",
+            markdown_escape(&revision)
         ));
         report.push_str(&format!(
-            "| tokenizer.json FNV64 | `{}` |\n\n",
-            markdown_escape(&tokenizer_hash)
+            "| Revision source | `{}` |\n",
+            markdown_escape(&revision_source)
+        ));
+        report.push_str(&format!(
+            "| Local artifact SHA-256 | `{}` |\n",
+            markdown_escape(&local_artifact_sha256)
+        ));
+        report.push_str(&format!(
+            "| Config SHA-256 | `{}` |\n",
+            markdown_escape(&config_sha256)
+        ));
+        report.push_str(&format!(
+            "| Tokenizer SHA-256 | `{}` |\n",
+            markdown_escape(&tokenizer_sha256)
+        ));
+        report.push_str(&format!(
+            "| Tokenizer config SHA-256 | `{}` |\n",
+            markdown_escape(&tokenizer_config_sha256)
+        ));
+        report.push_str(&format!(
+            "| Chat template SHA-256 | `{}` |\n",
+            markdown_escape(&chat_template_sha256)
+        ));
+        report.push_str(&format!(
+            "| Safetensors inventory SHA-256 | `{}` |\n\n",
+            markdown_escape(&safetensors_inventory_sha256)
         ));
     }
     report.push_str("## Results\n\n");
@@ -946,13 +1058,13 @@ fn jsonl_record(
     run_id: &str,
     prompt: &PromptCase,
     environment: &BenchEnvironment,
-    model_revision: &ModelRevision,
+    model_identity: &manifest::ArtifactIdentity,
     candidate: &RunResult,
     reference: &RunResult,
     diff: &TokenDiff,
 ) -> String {
     format!(
-        "{{\"schema_version\":1,\"run_id\":\"{}\",\"prompt_id\":\"{}\",\"prompt\":\"{}\",\"token_ids\":{},\"max_new_tokens\":{},\"environment\":{{\"os\":\"{}\",\"arch\":\"{}\",\"rustc\":\"{}\",\"git_commit\":\"{}\"}},\"model_revision\":{{\"model_path\":\"{}\",\"config_hash\":\"{}\",\"tokenizer_hash\":\"{}\"}},\"candidate_name\":\"{}\",\"candidate_status\":\"{}\",\"candidate_command\":\"{}\",\"candidate_generated_tokens\":{},\"candidate_metrics\":{},\"candidate_stdout\":\"{}\",\"candidate_stderr\":\"{}\",\"reference_name\":\"{}\",\"reference_status\":\"{}\",\"reference_command\":\"{}\",\"reference_generated_tokens\":{},\"reference_metrics\":{},\"reference_stdout\":\"{}\",\"reference_stderr\":\"{}\",\"comparison_status\":\"{}\",\"comparison_summary\":\"{}\",\"comparison_detail\":\"{}\"}}",
+        "{{\"schema_version\":1,\"run_id\":\"{}\",\"prompt_id\":\"{}\",\"prompt\":\"{}\",\"token_ids\":{},\"max_new_tokens\":{},\"environment\":{{\"os\":\"{}\",\"arch\":\"{}\",\"rustc\":\"{}\",\"git_commit\":\"{}\"}},\"model_identity\":{{\"model_path\":\"{}\",\"exists\":{},\"revision\":\"{}\",\"revision_source\":\"{}\",\"local_artifact_sha256\":\"{}\",\"config_sha256\":\"{}\",\"tokenizer_sha256\":\"{}\",\"tokenizer_config_sha256\":\"{}\",\"chat_template_sha256\":\"{}\",\"safetensors_inventory_sha256\":\"{}\",\"safetensors_file_count\":{},\"safetensors_total_bytes\":{}}},\"candidate_name\":\"{}\",\"candidate_status\":\"{}\",\"candidate_command\":\"{}\",\"candidate_generated_tokens\":{},\"candidate_metrics\":{},\"candidate_stdout\":\"{}\",\"candidate_stderr\":\"{}\",\"reference_name\":\"{}\",\"reference_status\":\"{}\",\"reference_command\":\"{}\",\"reference_generated_tokens\":{},\"reference_metrics\":{},\"reference_stdout\":\"{}\",\"reference_stderr\":\"{}\",\"comparison_status\":\"{}\",\"comparison_summary\":\"{}\",\"comparison_detail\":\"{}\"}}",
         json_escape(run_id),
         json_escape(&prompt.id),
         json_escape(&prompt.prompt),
@@ -962,9 +1074,18 @@ fn jsonl_record(
         json_escape(&environment.arch),
         json_escape(&environment.rustc),
         json_escape(&environment.git_commit),
-        json_escape(&model_revision.path),
-        json_escape(&model_revision.config_hash),
-        json_escape(&model_revision.tokenizer_hash),
+        json_escape(&model_identity.path),
+        model_identity.exists,
+        json_escape(model_identity.revision.as_deref().unwrap_or("unavailable")),
+        json_escape(&model_identity.revision_source),
+        json_escape(&model_identity.local_artifact_sha256),
+        json_escape(&model_identity.config_sha256),
+        json_escape(&model_identity.tokenizer_sha256),
+        json_escape(&model_identity.tokenizer_config_sha256),
+        json_escape(&model_identity.chat_template_sha256),
+        json_escape(&model_identity.safetensors_inventory_sha256),
+        model_identity.safetensors_file_count,
+        model_identity.safetensors_total_bytes,
         json_escape(&candidate.name),
         json_escape(&candidate.status),
         json_escape(&candidate.command),
@@ -1055,14 +1176,6 @@ fn capture_environment() -> BenchEnvironment {
     }
 }
 
-fn capture_model_revision(model_path: &Path) -> ModelRevision {
-    ModelRevision {
-        path: model_path.display().to_string(),
-        config_hash: file_hash(&model_path.join("config.json")),
-        tokenizer_hash: file_hash(&model_path.join("tokenizer.json")),
-    }
-}
-
 fn command_stdout(program: &str, args: &[&str]) -> String {
     match Command::new(program).args(args).output() {
         Ok(output) if output.status.success() => {
@@ -1074,22 +1187,6 @@ fn command_stdout(program: &str, args: &[&str]) -> String {
         ),
         Err(error) => format!("unavailable: {error}"),
     }
-}
-
-fn file_hash(path: &Path) -> String {
-    match fs::read(path) {
-        Ok(bytes) => format!("{:016x}", fnv1a64(&bytes)),
-        Err(error) => format!("unavailable:{error}"),
-    }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn run_id() -> String {
@@ -1287,9 +1384,10 @@ fn decode_tps(max_new_tokens: usize, decode: Duration) -> Option<f64> {
 
 fn usage() -> String {
     format!(
-        "usage: gemma4d-bench <command>\n\n{}\n\n{}",
+        "usage: gemma4d-bench <command>\n\n{}\n\n{}\n\n{}",
         run_usage(),
-        report_usage()
+        report_usage(),
+        manifest_usage()
     )
 }
 
@@ -1299,6 +1397,10 @@ fn run_usage() -> String {
 
 fn report_usage() -> String {
     "usage: gemma4d-bench report --input records.jsonl --output report.md".to_owned()
+}
+
+fn manifest_usage() -> String {
+    "usage: gemma4d-bench manifest [--model-path PATH] [--drafter-path PATH|--no-drafter] [--out-dir DIR]".to_owned()
 }
 
 #[cfg(test)]
@@ -1363,13 +1465,37 @@ mod tests {
         let records = dir.join("records.jsonl");
         fs::write(
             &records,
-            "{\"prompt_id\":\"hello\",\"reference_name\":\"none\",\"comparison_status\":\"inconclusive\",\"comparison_summary\":\"no reference configured\",\"candidate_command\":\"gemma4d generate\",\"reference_command\":\"\",\"os\":\"test-os\",\"rustc\":\"rustc test\",\"git_commit\":\"abc\",\"model_path\":\"model\",\"config_hash\":\"hash\",\"tokenizer_hash\":\"tokhash\"}\n",
+            "{\"prompt_id\":\"hello\",\"reference_name\":\"none\",\"comparison_status\":\"inconclusive\",\"comparison_summary\":\"no reference configured\",\"candidate_command\":\"gemma4d generate\",\"reference_command\":\"\",\"os\":\"test-os\",\"rustc\":\"rustc test\",\"git_commit\":\"abc\",\"model_path\":\"model\",\"revision\":\"unavailable\",\"revision_source\":\"local-artifact\",\"local_artifact_sha256\":\"artifacthash\",\"config_sha256\":\"confighash\",\"tokenizer_sha256\":\"tokhash\",\"tokenizer_config_sha256\":\"tokconfighash\",\"chat_template_sha256\":\"templatehash\",\"safetensors_inventory_sha256\":\"inventoryhash\"}\n",
         )
         .expect("write");
         let report = generate_report(&records).expect("report");
         assert!(report.contains("Inconclusive: 1"));
+        assert!(report.contains("artifacthash"));
         assert!(report.contains("tokhash"));
+        assert!(report.contains("inventoryhash"));
         assert!(report.contains("no reference configured"));
+    }
+
+    #[test]
+    fn parses_manifest_options_defaults_and_overrides() {
+        let defaults = parse_manifest_options(std::iter::empty::<&str>()).expect("defaults");
+        assert_eq!(
+            defaults.model_path,
+            PathBuf::from("artifacts/models/gemma-4-12B-it-4bit")
+        );
+        assert_eq!(
+            defaults.drafter_path,
+            Some(PathBuf::from(
+                "artifacts/models/gemma-4-12B-it-qat-assistant-4bit"
+            ))
+        );
+
+        let no_drafter =
+            parse_manifest_options(["--model-path", "model", "--no-drafter", "--out-dir", "out"])
+                .expect("overrides");
+        assert_eq!(no_drafter.model_path, PathBuf::from("model"));
+        assert_eq!(no_drafter.drafter_path, None);
+        assert_eq!(no_drafter.out_dir, PathBuf::from("out"));
     }
 
     #[test]

@@ -8,9 +8,9 @@ leave_system_headroom_mb = 3072
 
 [model]
 target = "mlx-community/gemma-4-12B-it-4bit"
-target_revision = "PIN_ME"
+target_revision = "local-artifact-sha256:d8b821776d41a61dad4f23f9b85cc8c6b09df2be04e5e4583f73c48739d8535c"
 drafter = "mlx-community/gemma-4-12B-it-qat-assistant-4bit"
-drafter_revision = "PIN_ME"
+drafter_revision = "local-artifact-sha256:6b31aa79ef7fce128572671b3890b55477694b52e24c75f48168f34770f85f2b"
 
 [speculative]
 enabled = false

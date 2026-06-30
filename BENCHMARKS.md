@@ -33,6 +33,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P08 real KV compression gates | Passed | `5993b86` | `native_kv_prefix_payload_compression` | `benchmarks/out/P08-kv-compression/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p08-1782855932`; q8 full-attention payload compression passed continued-decode quality gates at 4K/8K/16K, q4 reduced payload bytes but failed greedy agreement, and compressed active decode remains disabled. |
 | 2026-06-30 | P09 real LoRA adapter hot path | Passed | `8723d50` | `native_lora_adapter_hot_path` | `benchmarks/out/P09-real-lora-adapter/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p09-1782857770747`; trusted local rank-16 q_proj/v_proj LoRA fixture loaded into real native inference, changed greedy-logit output, rejected wrong manifests, isolated adapter KV namespace, measured load/hotswap/residency, and disabled MTP while active. |
 | 2026-06-30 | P10 TUI live optimization console | Passed | `4ee1ccd` plus local P10 harness changes | `localhost_http_server_tui_provider_stub_backend` | `benchmarks/out/P10-tui-live-console/{tui-report.md,metrics.json,snapshots/}` | Command `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`; 18 snapshots, render p95 `1731 us` below `20000 us`, server health `ok`, latest benchmark report surfaced from the provider. |
+| 2026-06-30 | P11 model revision and manifest pinning | Passed | final SHA recorded in generated manifest | `manifest_capture_local_artifact_identity` | `benchmarks/out/P11-manifest-pinning/{manifest.json,report.md}` | Command `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; target and drafter revisions are explicitly pinned in `tiny16.toml` to local artifact SHA-256s because local revision metadata is unavailable. |
 
 ## P00 Baseline Snapshot
 
@@ -333,6 +334,24 @@ benchmark harness owns server startup and shutdown.
 | Cache / MTP | cache `stub`, active KV `0`, MTP `disabled` with adapter gate shown |
 | Adapter residency | `1` loaded adapter, `2551` resident bytes |
 
+## P11 Manifest Pinning Snapshot
+
+P11 records reproducible artifact identity for the local target and drafter
+model directories. The downloaded local artifacts do not contain a pinned
+upstream revision, so `references/configs/tiny16.toml` pins explicit local
+artifact SHA-256 values instead.
+
+| Field | Value |
+|---|---|
+| Command | `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning` |
+| Manifest | `benchmarks/out/P11-manifest-pinning/manifest.json` |
+| Report | `benchmarks/out/P11-manifest-pinning/report.md` |
+| Target local artifact SHA-256 | `d8b821776d41a61dad4f23f9b85cc8c6b09df2be04e5e4583f73c48739d8535c` |
+| Target safetensors inventory SHA-256 | `4af9af81c81dcba1edb5290573e58efc28f71c887ab25a871d3917f4240459af` |
+| Drafter local artifact SHA-256 | `6b31aa79ef7fce128572671b3890b55477694b52e24c75f48168f34770f85f2b` |
+| Drafter safetensors inventory SHA-256 | `7a5d3a9eabd8ec983c4ef5139badf2da187a455133446be21b3c3dc0006b70bd` |
+| Versions | Rust `1.95.0`, MLX `0.31.2`, mlx-lm `0.31.3` |
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -357,6 +376,7 @@ benchmark harness owns server startup and shutdown.
 | 2026-06-30 | Added native PEFT LoRA adapter load/activate/clear/free through the narrow C ABI and safe Rust wrappers. The native graph applies active LoRA deltas inside target `quantized_linear`, shape-validates adapter A/B tensors against loaded Gemma 4 weights, and fails MTP closed while an adapter is active. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P09 benchmark run. |
 | 2026-06-30 | Added P09 real LoRA adapter benchmark harness and goal contract. The harness creates a trusted local deterministic rank-16 adapter fixture with real Gemma 4 q_proj/v_proj shapes, imports it through the adapter registry, runs base/adapter/post-clear native generation, records load/hotswap/residency latency, checks manifest rejection, KV namespace isolation, and MTP-disabled behavior. | `crates/gemma4d-bench/examples/p09_real_lora_adapter.rs`, `codex/goals/P09-real-lora-adapter-hot-path.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p09_real_lora_adapter -- --out-dir benchmarks/out/P09-real-lora-adapter --model-path artifacts/models/gemma-4-12B-it-4bit`. |
 | 2026-06-30 | Added P10 TUI live optimization console metrics, report writer, and benchmark harness. The TUI parses provider-only HTTP metrics for load/prefill/decode timing, throughput, memory, cache, MTP, adapters, server health, and latest benchmark report; the harness starts a localhost server and writes `tui-report.md`, `metrics.json`, and snapshots. | `crates/gemma4d-tui/src/{app.rs,provider.rs,ui.rs,lib.rs}`, `crates/gemma4d-tui/tests/m05_acceptance.rs`, `crates/gemma4d-bench/examples/p10_tui_live_console.rs`, `crates/gemma4d-bench/Cargo.toml` | `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`. |
+| 2026-06-30 | Added `gemma4d-bench manifest`, reusable manifest capture structs, SHA-256 model identity in generic benchmark reports, P00 local artifact identity fields, and config validation that accepts local-artifact pins while warning on `PIN_ME` or unavailable revisions. | `crates/gemma4d-bench/src/manifest.rs`, `crates/gemma4d-bench/src/lib.rs`, `crates/gemma4d-bench/examples/p00_performance_baseline.rs`, `crates/gemma4d-tui/src/config.rs`, `references/configs/tiny16.toml`, `references/templates/benchmark-report.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets --no-run`; `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; `make verify`. |
 
 ## Verification Gates
 
@@ -401,6 +421,10 @@ benchmark harness owns server startup and shutdown.
 | 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed after P09 changes. |
 | 2026-06-30 | `cargo test -p gemma4d-tui --all-targets` | Passed | Focused P10 TUI coverage for live HTTP metrics, required page snapshots, render p95 reporting, and terminal lifecycle tests. |
 | 2026-06-30 | `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console` | Passed | Spawned localhost server, drove the TUI over `HttpProvider`, wrote `tui-report.md`, `metrics.json`, and 18 snapshots; render p95 `1731 us` under `20000 us`. |
+| 2026-06-30 | `cargo test -p gemma4d-bench --lib` | Passed | Unit coverage for manifest CLI parsing and generic benchmark report manifest identity rendering. |
+| 2026-06-30 | `cargo test -p gemma4d-bench --all-targets --no-run` | Passed | Compile coverage for benchmark examples after the manifest module and dependency changes. |
+| 2026-06-30 | `cargo test -p gemma4d-tui --all-targets` | Passed | Config validation coverage for local-artifact pins and `PIN_ME` warning behavior. |
+| 2026-06-30 | `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning` | Passed | Wrote manifest and report with target/drafter hashes, safetensor inventories, Rust/MLX/mlx-lm versions, git SHA, and machine summary. |
 
 ## Current Claim Boundaries
 
@@ -460,3 +484,8 @@ benchmark harness owns server startup and shutdown.
 - P10 render latency is for deterministic 120x40 snapshot rendering in the
   artifact run. It does not measure interactive terminal overhead or long-running
   operator sessions.
+- P11 records local artifact identity because the local downloaded model
+  directories do not include upstream revision metadata. The target and drafter
+  are pinned by `local-artifact-sha256:*` values in `tiny16.toml`; this is
+  reproducible for the local artifact set but is not a claim about an upstream
+  Hugging Face commit.

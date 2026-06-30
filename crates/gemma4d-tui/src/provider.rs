@@ -423,10 +423,10 @@ impl RuntimeProvider for HttpProvider {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if !entries.iter().any(|entry| entry.active) {
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.loaded) {
-                entry.active = true;
-            }
+        if !entries.iter().any(|entry| entry.active)
+            && let Some(entry) = entries.iter_mut().find(|entry| entry.loaded)
+        {
+            entry.active = true;
         }
         let loaded = entries.iter().filter(|entry| entry.loaded).count();
         let pinned = entries.iter().filter(|entry| entry.pinned).count();

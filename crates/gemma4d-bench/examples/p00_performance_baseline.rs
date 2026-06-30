@@ -187,6 +187,8 @@ struct ModelIdentity {
     model_path: String,
     exists: bool,
     configured_revision: String,
+    revision_source: String,
+    local_artifact_sha256: String,
     config_sha256: String,
     tokenizer_sha256: String,
     tokenizer_config_sha256: String,
@@ -504,17 +506,39 @@ fn capture_environment() -> Environment {
 
 fn capture_model_identity(model_path: &Path) -> ModelIdentity {
     let safetensors = safetensors_inventory(model_path);
+    let configured_revision = env::var("GEMMA4D_MODEL_REVISION")
+        .unwrap_or_else(|_| "unavailable:GEMMA4D_MODEL_REVISION not set".to_owned());
+    let revision_source = if configured_revision.starts_with("unavailable:") {
+        "local_artifact_hash".to_owned()
+    } else {
+        "env:GEMMA4D_MODEL_REVISION".to_owned()
+    };
+    let config_sha256 = sha256_file_or_unavailable(&model_path.join("config.json"));
+    let tokenizer_sha256 = sha256_file_or_unavailable(&model_path.join("tokenizer.json"));
+    let tokenizer_config_sha256 =
+        sha256_file_or_unavailable(&model_path.join("tokenizer_config.json"));
+    let chat_template_sha256 = if model_path.join("chat_template.json").exists() {
+        sha256_file_or_unavailable(&model_path.join("chat_template.json"))
+    } else {
+        sha256_file_or_unavailable(&model_path.join("tokenizer_config.json"))
+    };
+    let local_artifact_sha256 = sha256_hex(
+        format!(
+            "gemma4d:artifact:v1\nconfig={config_sha256}\ntokenizer={tokenizer_sha256}\ntokenizer_config={tokenizer_config_sha256}\nchat_template={chat_template_sha256}\nsafetensors={}\n",
+            safetensors.inventory_sha256
+        )
+        .as_bytes(),
+    );
     ModelIdentity {
         model_path: model_path.display().to_string(),
         exists: model_path.exists(),
-        configured_revision: env::var("GEMMA4D_MODEL_REVISION")
-            .unwrap_or_else(|_| "unavailable:GEMMA4D_MODEL_REVISION not set".to_owned()),
-        config_sha256: sha256_file_or_unavailable(&model_path.join("config.json")),
-        tokenizer_sha256: sha256_file_or_unavailable(&model_path.join("tokenizer.json")),
-        tokenizer_config_sha256: sha256_file_or_unavailable(
-            &model_path.join("tokenizer_config.json"),
-        ),
-        chat_template_sha256: sha256_file_or_unavailable(&model_path.join("chat_template.json")),
+        configured_revision,
+        revision_source,
+        local_artifact_sha256,
+        config_sha256,
+        tokenizer_sha256,
+        tokenizer_config_sha256,
+        chat_template_sha256,
         safetensors_inventory_sha256: safetensors.inventory_sha256,
         safetensors_file_count: safetensors.file_count,
         safetensors_total_bytes: safetensors.total_bytes,
@@ -683,6 +707,14 @@ fn render_report(summary: &BaselineSummary) -> String {
     out.push_str(&format!(
         "| Configured revision | `{}` |\n",
         escape_md(&summary.model_identity.configured_revision)
+    ));
+    out.push_str(&format!(
+        "| Revision source | `{}` |\n",
+        escape_md(&summary.model_identity.revision_source)
+    ));
+    out.push_str(&format!(
+        "| Local artifact SHA-256 | `{}` |\n",
+        escape_md(&summary.model_identity.local_artifact_sha256)
     ));
     out.push_str(&format!(
         "| Config SHA-256 | `{}` |\n",
