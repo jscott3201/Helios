@@ -1,16 +1,23 @@
 use std::{
     cell::RefCell,
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use gemma4d_server::http::{ServerConfig, ServerRuntime, serve_listener};
 use gemma4d_tui::{
     TuiError,
     app::{Action, AppState, BenchmarkStatus, PageId, reduce},
     config::{ValidationStatus, validate_config_path},
     profile_render,
-    provider::{MockProvider, RuntimeProvider},
+    provider::{HttpProvider, MockProvider, RuntimeProvider},
     seed_state,
     terminal::{TerminalLifecycle, TerminalOps, key_to_action},
     ui::render_snapshot,
@@ -120,6 +127,7 @@ fn snapshots_render_required_pages_at_required_sizes() {
         PageId::Dashboard,
         PageId::Config,
         PageId::Benchmarks,
+        PageId::Chat,
         PageId::Adapters,
         PageId::Logs,
         PageId::Help,
@@ -138,7 +146,7 @@ fn snapshots_render_required_pages_at_required_sizes() {
 }
 
 #[test]
-fn chat_page_renders_dependency_message() {
+fn chat_page_renders_streaming_status() {
     let mut provider = MockProvider::default();
     let config_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
@@ -147,8 +155,10 @@ fn chat_page_renders_dependency_message() {
     let mut state = base.clone();
     reduce(&mut state, Action::Navigate(PageId::Chat));
     let snapshot = render_snapshot(&state, 80, 24).unwrap();
-    assert!(snapshot.contains("Disabled until"));
     assert!(snapshot.contains("Chat"));
+    assert!(snapshot.contains("streaming-smoke-ready"));
+    assert!(snapshot.contains("Streaming yes"));
+    assert!(snapshot.contains("stub adapter rust-coding-r16-v1"));
 }
 
 #[test]
@@ -206,6 +216,32 @@ fn adapter_page_renders_registry_summary_and_mtp_gate() {
 }
 
 #[test]
+fn http_provider_attaches_to_live_server_and_streams_chat() {
+    let (addr, shutdown, handle) = spawn_stub_server();
+    let mut provider = HttpProvider::new(format!("http://{addr}"));
+    let config_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
+    let mut state = seed_state(&mut provider, config_path);
+
+    assert_eq!(state.dashboard.runtime_state, "http-ok");
+    assert!(state.dashboard.provider.contains("http://"));
+    assert_eq!(state.adapters.loaded, 1);
+    assert_eq!(state.chat.status, "streaming-smoke-ok");
+    assert!(state.chat.stream_enabled);
+    assert!(state.chat.stream_events >= 4);
+    assert!(state.chat.last_response_preview.contains("hello from TUI"));
+
+    reduce(&mut state, Action::Navigate(PageId::Chat));
+    let snapshot = render_snapshot(&state, 80, 24).unwrap();
+    assert!(snapshot.contains("streaming-smoke-ok"));
+    assert!(snapshot.contains("hello from TUI"));
+
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(addr);
+    handle.join().expect("server thread");
+}
+
+#[test]
 fn render_profile_reports_p50_and_p95() {
     let mut provider = MockProvider::default();
     let config_path =
@@ -255,6 +291,22 @@ fn terminal_lifecycle_restores_after_controlled_error() {
         events.borrow().as_slice(),
         ["enable_raw", "enter_alt", "leave_alt", "disable_raw"]
     );
+}
+
+fn spawn_stub_server() -> (
+    std::net::SocketAddr,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
+    let runtime = ServerRuntime::new(ServerConfig::default().with_bind_addr(addr));
+    let handle = thread::spawn(move || {
+        serve_listener(listener, runtime, server_shutdown).expect("serve listener");
+    });
+    (addr, shutdown, handle)
 }
 
 #[derive(Clone)]

@@ -700,6 +700,7 @@ version = "0.1.0"
 dependencies = [
  "gemma4d-adapters",
  "gemma4d-ffi",
+ "serde",
  "serde_json",
 ]
 
@@ -721,6 +722,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "gemma4d-kv",
+ "gemma4d-server",
  "ratatui",
  "serde",
  "serde_json",

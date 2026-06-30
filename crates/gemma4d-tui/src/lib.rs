@@ -15,7 +15,7 @@ use std::{
 
 use app::{Action, AppState, PageId, ProviderKind, reduce};
 use clap::{Parser, Subcommand};
-use provider::{RuntimeProvider, create_provider};
+use provider::{RuntimeProvider, create_provider_with_server};
 
 pub const CRATE_NAME: &str = "gemma4d-tui";
 
@@ -37,6 +37,9 @@ pub struct Cli {
 
     #[arg(long, default_value = "benchmarks/out/M05")]
     pub out_dir: PathBuf,
+
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    pub server_url: String,
 
     #[arg(long, hide = true)]
     pub fail_after_init: bool,
@@ -109,7 +112,8 @@ impl From<io::Error> for TuiError {
 }
 
 pub async fn run(cli: Cli) -> Result<RunOutcome, TuiError> {
-    let mut provider = create_provider(cli.provider, PathBuf::from("."));
+    let mut provider =
+        create_provider_with_server(cli.provider, PathBuf::from("."), cli.server_url.clone());
     let mut state = seed_state(provider.as_mut(), cli.config.clone());
 
     match &cli.command {
@@ -197,6 +201,7 @@ pub fn seed_state(provider: &mut dyn RuntimeProvider, config_path: PathBuf) -> A
         &mut state,
         Action::AdaptersUpdated(provider.adapter_snapshot()),
     );
+    reduce(&mut state, Action::ChatUpdated(provider.chat_snapshot()));
     reduce(&mut state, Action::MtpUpdated(provider.mtp_snapshot()));
     for event in provider.backend_events() {
         reduce(&mut state, Action::BackendEvent(event));

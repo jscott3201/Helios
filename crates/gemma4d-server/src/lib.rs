@@ -1,4 +1,6 @@
-#![doc = "Local Gemma4D command and future OpenAI-compatible server entrypoints."]
+#![doc = "Local Gemma4D command and OpenAI-compatible server entrypoints."]
+
+pub mod http;
 
 use std::{
     io::Write,
@@ -12,11 +14,12 @@ use gemma4d_adapters::{
     AdapterCompatibility, AdapterRegistry, AdapterSummary, ImportedAdapter, TrustedPathPolicy,
 };
 use gemma4d_ffi::{self as ffi, KvCache, KvPolicy, LoadConfig, Target};
+use http::{ServerConfig, parse_bind_addr, serve_blocking};
 
 pub const CRATE_NAME: &str = "gemma4d-server";
 
 pub fn bootstrap_status() -> &'static str {
-    "m10-adapter-cli"
+    "m11-openai-server"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +68,13 @@ pub struct AdapterIdOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterListOptions {
     pub registry_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeOptions {
+    pub bind_addr: std::net::SocketAddr,
+    pub max_context_tokens: usize,
+    pub memory_budget_mb: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +136,11 @@ where
             let command = parse_adapter_command(args)?;
             run_adapter_command(command)
         }
+        "serve" => {
+            let options = parse_serve_options(args)?;
+            serve(options)?;
+            Ok("server stopped".to_owned())
+        }
         "generate" => {
             let options = parse_generate_options(args)?;
             let output_json = options.output_json;
@@ -142,6 +157,65 @@ where
             usage()
         ))),
     }
+}
+
+pub fn parse_serve_options<I, S>(args: I) -> Result<ServeOptions, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).peekable();
+    let mut bind_addr = ServerConfig::default().bind_addr;
+    let mut max_context_tokens = ServerConfig::default().max_context_tokens;
+    let mut memory_budget_mb = ServerConfig::default().memory_budget_bytes / (1024 * 1024);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bind" => {
+                let value = required_value(&mut args, "--bind")?;
+                bind_addr = parse_bind_addr(&value).map_err(CliError::Usage)?;
+            }
+            "--max-context-tokens" => {
+                max_context_tokens = parse_positive_usize(
+                    &required_value(&mut args, "--max-context-tokens")?,
+                    "--max-context-tokens",
+                )?;
+            }
+            "--memory-budget-mb" => {
+                memory_budget_mb = required_value(&mut args, "--memory-budget-mb")?
+                    .parse::<u64>()
+                    .map_err(|error| {
+                        CliError::Usage(format!("--memory-budget-mb must be an integer: {error}"))
+                    })?;
+                if memory_budget_mb == 0 {
+                    return Err(CliError::Usage(
+                        "--memory-budget-mb must be greater than zero".to_owned(),
+                    ));
+                }
+            }
+            "-h" | "--help" => return Err(CliError::Usage(serve_usage())),
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown serve option '{other}'\n{}",
+                    serve_usage()
+                )));
+            }
+        }
+    }
+
+    Ok(ServeOptions {
+        bind_addr,
+        max_context_tokens,
+        memory_budget_mb,
+    })
+}
+
+pub fn serve(options: ServeOptions) -> Result<(), CliError> {
+    let mut config = ServerConfig::localhost_default().with_bind_addr(options.bind_addr);
+    config.max_context_tokens = options.max_context_tokens;
+    config.memory_budget_bytes = options.memory_budget_mb.saturating_mul(1024 * 1024);
+    serve_blocking(config)
+        .map_err(|error| CliError::Runtime(format!("OpenAI-compatible server failed: {error}")))
 }
 
 pub fn parse_adapter_command<I, S>(args: I) -> Result<AdapterCommand, CliError>
@@ -625,10 +699,16 @@ fn parse_token_json(value: &str) -> Result<Vec<i32>, CliError> {
 
 fn usage() -> String {
     format!(
-        "usage: gemma4d <command>\n\n{}\n\n{}",
+        "usage: gemma4d <command>\n\n{}\n\n{}\n\n{}",
+        serve_usage(),
         generate_usage(),
         adapter_usage()
     )
+}
+
+fn serve_usage() -> String {
+    "usage: gemma4d serve [--bind 127.0.0.1:8080] [--max-context-tokens N] [--memory-budget-mb N]"
+        .to_owned()
 }
 
 fn generate_usage() -> String {
@@ -724,7 +804,22 @@ mod tests {
     #[test]
     fn reports_placeholder_status() {
         assert_eq!(CRATE_NAME, "gemma4d-server");
-        assert_eq!(bootstrap_status(), "m10-adapter-cli");
+        assert_eq!(bootstrap_status(), "m11-openai-server");
+    }
+
+    #[test]
+    fn serve_parse_defaults_to_localhost() {
+        let options = parse_serve_options(std::iter::empty::<&str>()).expect("serve options");
+        assert_eq!(options.bind_addr.to_string(), "127.0.0.1:8080");
+        assert_eq!(options.max_context_tokens, 32_768);
+        assert!(options.memory_budget_mb > 0);
+    }
+
+    #[test]
+    fn serve_parse_rejects_non_localhost_bind() {
+        let err = parse_serve_options(["--bind", "0.0.0.0:8080"]).expect_err("non-local bind");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("localhost"));
     }
 
     #[test]

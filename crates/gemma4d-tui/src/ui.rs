@@ -71,7 +71,7 @@ fn render_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         PageId::Mtp => render_mtp(frame, area, state),
         PageId::Logs => render_logs(frame, area, state),
         PageId::Help => render_help(frame, area),
-        PageId::Chat => render_placeholder(frame, area, state.current_page),
+        PageId::Chat => render_chat(frame, area, state),
     }
 }
 
@@ -227,6 +227,47 @@ fn render_benchmarks(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title("Benchmarks"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_chat(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let chat = &state.chat;
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Status ", Style::default().fg(Color::Gray)),
+            Span::raw(chat.status.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Server ", Style::default().fg(Color::Gray)),
+            Span::raw(chat.server_url.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Model ", Style::default().fg(Color::Gray)),
+            Span::raw(chat.model.clone()),
+        ]),
+        Line::from(format!(
+            "Streaming {} | events {} | adapter {}",
+            yes_no(chat.stream_enabled),
+            chat.stream_events,
+            chat.active_adapter_id.as_deref().unwrap_or("none")
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Prompt ", Style::default().fg(Color::Gray)),
+            Span::raw(chat.last_prompt.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Preview ", Style::default().fg(Color::Gray)),
+            Span::raw(chat.last_response_preview.clone()),
+        ]),
+        Line::from(""),
+        Line::from(chat.note.clone()),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Chat"))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -496,25 +537,6 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title("Help"))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn render_placeholder(frame: &mut Frame<'_>, area: Rect, page: PageId) {
-    let message = page
-        .dependency_message()
-        .unwrap_or("Disabled until its provider is implemented.");
-    let lines = vec![
-        Line::from(format!("{} disabled", page.title())),
-        Line::from(""),
-        Line::from(message),
-        Line::from(""),
-        Line::from("The M05 TUI exposes this page as a dependency-aware placeholder only."),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(page.title()))
             .wrap(Wrap { trim: true }),
         area,
     );

@@ -11,6 +11,7 @@ use crate::config::ConfigValidation;
 pub enum ProviderKind {
     Mock,
     File,
+    Http,
 }
 
 impl std::fmt::Display for ProviderKind {
@@ -18,6 +19,7 @@ impl std::fmt::Display for ProviderKind {
         f.write_str(match self {
             Self::Mock => "mock",
             Self::File => "file",
+            Self::Http => "http",
         })
     }
 }
@@ -78,10 +80,7 @@ impl PageId {
     }
 
     pub fn dependency_message(self) -> Option<&'static str> {
-        match self {
-            Self::Chat => Some("Disabled until M11 provides the local server/control provider."),
-            _ => None,
-        }
+        None
     }
 
     pub fn from_digit(ch: char) -> Option<Self> {
@@ -360,6 +359,49 @@ impl AdapterSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSnapshot {
+    pub status: String,
+    pub server_url: String,
+    pub model: String,
+    pub stream_enabled: bool,
+    pub active_adapter_id: Option<String>,
+    pub last_prompt: String,
+    pub last_response_preview: String,
+    pub stream_events: usize,
+    pub note: String,
+}
+
+impl ChatSnapshot {
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: "disabled".to_owned(),
+            server_url: "none".to_owned(),
+            model: "none".to_owned(),
+            stream_enabled: false,
+            active_adapter_id: None,
+            last_prompt: String::new(),
+            last_response_preview: String::new(),
+            stream_events: 0,
+            note: reason.into(),
+        }
+    }
+
+    pub fn mock_m11() -> Self {
+        Self {
+            status: "streaming-smoke-ready".to_owned(),
+            server_url: "mock://provider".to_owned(),
+            model: "mlx-community/gemma-4-12B-it-4bit".to_owned(),
+            stream_enabled: true,
+            active_adapter_id: Some("rust-coding-r16-v1".to_owned()),
+            last_prompt: "hello from TUI".to_owned(),
+            last_response_preview: "stub adapter rust-coding-r16-v1: hello from TUI".to_owned(),
+            stream_events: 4,
+            note: "mock provider mirrors M11 streaming chat status".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MtpStatus {
     Disabled,
@@ -538,6 +580,7 @@ pub enum BackendEvent {
     Dashboard(DashboardSnapshot),
     Cache(CacheSnapshot),
     Adapters(AdapterSnapshot),
+    Chat(ChatSnapshot),
     Log(LogEntry),
     Benchmark(BenchmarkRecord),
     Mtp(MtpSnapshot),
@@ -557,6 +600,7 @@ pub enum Action {
     BenchmarkRecorded(BenchmarkRecord),
     CacheUpdated(CacheSnapshot),
     AdaptersUpdated(AdapterSnapshot),
+    ChatUpdated(ChatSnapshot),
     MtpUpdated(MtpSnapshot),
     BackendEvent(BackendEvent),
     DashboardUpdated(DashboardSnapshot),
@@ -576,6 +620,7 @@ pub struct AppState {
     pub dashboard: DashboardSnapshot,
     pub cache: CacheSnapshot,
     pub adapters: AdapterSnapshot,
+    pub chat: ChatSnapshot,
     pub benchmark: BenchmarkRecord,
     pub mtp: MtpSnapshot,
     pub logs: Vec<LogEntry>,
@@ -597,6 +642,7 @@ impl AppState {
             dashboard: DashboardSnapshot::offline(&provider_name),
             cache: CacheSnapshot::disabled("cache provider snapshot pending"),
             adapters: AdapterSnapshot::disabled("adapter registry snapshot pending"),
+            chat: ChatSnapshot::disabled("chat provider snapshot pending"),
             benchmark,
             mtp: MtpSnapshot::disabled("MTP provider snapshot pending"),
             logs: vec![LogEntry::info(
@@ -665,6 +711,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             BackendEvent::Dashboard(snapshot) => reduce(state, Action::DashboardUpdated(snapshot)),
             BackendEvent::Cache(snapshot) => reduce(state, Action::CacheUpdated(snapshot)),
             BackendEvent::Adapters(snapshot) => reduce(state, Action::AdaptersUpdated(snapshot)),
+            BackendEvent::Chat(snapshot) => reduce(state, Action::ChatUpdated(snapshot)),
             BackendEvent::Log(entry) => reduce(state, Action::AppendLog(entry)),
             BackendEvent::Benchmark(record) => reduce(state, Action::BenchmarkRecorded(record)),
             BackendEvent::Mtp(snapshot) => reduce(state, Action::MtpUpdated(snapshot)),
@@ -679,6 +726,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::AdaptersUpdated(snapshot) => {
             state.status_line = format!("adapters {}", snapshot.status);
             state.adapters = snapshot;
+        }
+        Action::ChatUpdated(snapshot) => {
+            state.status_line = format!("chat {}", snapshot.status);
+            state.chat = snapshot;
         }
         Action::MtpUpdated(snapshot) => {
             state.status_line = format!("MTP {}", snapshot.status.label());
