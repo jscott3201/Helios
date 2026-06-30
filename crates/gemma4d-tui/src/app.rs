@@ -104,6 +104,62 @@ pub struct DashboardSnapshot {
     pub ttft_p50_ms: Option<f64>,
     pub decode_tps_p50: Option<f64>,
     pub cache_hit_rate: Option<f64>,
+    pub live: LiveMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveMetricsSnapshot {
+    pub server_health: String,
+    pub model_loaded: bool,
+    pub requests_total: u64,
+    pub active_generations: u64,
+    pub model_load_ms: Option<f64>,
+    pub prefill_ms: Option<f64>,
+    pub decode_ms: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+    pub prefill_tokens_total: u64,
+    pub decode_tokens_total: u64,
+    pub process_rss_bytes: u64,
+    pub peak_mlx_bytes: u64,
+}
+
+impl LiveMetricsSnapshot {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            server_health: reason.into(),
+            model_loaded: false,
+            requests_total: 0,
+            active_generations: 0,
+            model_load_ms: None,
+            prefill_ms: None,
+            decode_ms: None,
+            ttft_ms: None,
+            tokens_per_second: None,
+            prefill_tokens_total: 0,
+            decode_tokens_total: 0,
+            process_rss_bytes: 0,
+            peak_mlx_bytes: 0,
+        }
+    }
+
+    pub fn mock() -> Self {
+        Self {
+            server_health: "mock-ok".to_owned(),
+            model_loaded: true,
+            requests_total: 4,
+            active_generations: 0,
+            model_load_ms: Some(1.2),
+            prefill_ms: Some(22.4),
+            decode_ms: Some(41.6),
+            ttft_ms: Some(23.6),
+            tokens_per_second: Some(31.7),
+            prefill_tokens_total: 512,
+            decode_tokens_total: 128,
+            process_rss_bytes: 512 * 1024 * 1024,
+            peak_mlx_bytes: 6 * 1024 * 1024 * 1024,
+        }
+    }
 }
 
 impl DashboardSnapshot {
@@ -118,6 +174,7 @@ impl DashboardSnapshot {
             ttft_p50_ms: None,
             decode_tps_p50: None,
             cache_hit_rate: None,
+            live: LiveMetricsSnapshot::unavailable("offline"),
         }
     }
 }

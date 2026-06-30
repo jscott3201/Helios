@@ -8,7 +8,8 @@ use std::{
 use crate::{
     app::{
         AdapterEntrySnapshot, AdapterSnapshot, BackendEvent, BenchmarkRecord, BenchmarkStatus,
-        CacheSnapshot, ChatSnapshot, DashboardSnapshot, LogEntry, MtpSnapshot, ProviderKind,
+        CacheSnapshot, ChatSnapshot, DashboardSnapshot, LiveMetricsSnapshot, LogEntry, MtpSnapshot,
+        MtpStatus, ProviderKind,
     },
     config::{ConfigValidation, validate_config_path},
 };
@@ -63,6 +64,7 @@ impl RuntimeProvider for MockProvider {
             ttft_p50_ms: Some(118.4),
             decode_tps_p50: Some(31.7),
             cache_hit_rate: Some(0.0),
+            live: LiveMetricsSnapshot::mock(),
         }
     }
 
@@ -146,6 +148,7 @@ impl RuntimeProvider for FileProvider {
             ttft_p50_ms: None,
             decode_tps_p50: None,
             cache_hit_rate: None,
+            live: LiveMetricsSnapshot::unavailable("file-offline"),
         }
     }
 
@@ -260,6 +263,14 @@ impl HttpProvider {
         }
         Ok(response)
     }
+
+    fn request_metrics(&mut self) -> std::collections::BTreeMap<String, f64> {
+        self.client
+            .request("GET", "/metrics", None)
+            .ok()
+            .map(|response| parse_prometheus_metrics(&response.body))
+            .unwrap_or_default()
+    }
 }
 
 impl RuntimeProvider for HttpProvider {
@@ -281,23 +292,19 @@ impl RuntimeProvider for HttpProvider {
                     ttft_p50_ms: None,
                     decode_tps_p50: None,
                     cache_hit_rate: None,
+                    live: LiveMetricsSnapshot::unavailable("http-disconnected"),
                 };
             }
         };
-        let metrics = self
-            .client
-            .request("GET", "/metrics", None)
-            .ok()
-            .map(|response| parse_prometheus_metrics(&response.body))
-            .unwrap_or_default();
+        let metrics = self.request_metrics();
+        let server_health = string_at(&health, "status", "unknown");
+        let model_loaded = bool_at(&health, "model_loaded", false);
+        let process_rss_bytes = metric_u64(&metrics, "gemma4d_memory_process_rss_bytes");
+        let peak_mlx_bytes = metric_u64(&metrics, "gemma4d_memory_peak_mlx_bytes");
+        let ttft_ms = metric_seconds_ms(&metrics, "gemma4d_ttft_seconds");
+        let decode_tps = metric_option(&metrics, "gemma4d_tokens_per_second");
         DashboardSnapshot {
-            runtime_state: format!(
-                "http-{}",
-                health
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-            ),
+            runtime_state: format!("http-{server_health}"),
             provider: format!("http {}", self.client.base_url()),
             model_target: health
                 .get("server")
@@ -306,28 +313,31 @@ impl RuntimeProvider for HttpProvider {
                 .to_owned(),
             context_window: "live control provider".to_owned(),
             memory_pressure: format!(
-                "rss {} bytes",
-                metrics
-                    .get("gemma4d_memory_process_rss_bytes")
-                    .copied()
-                    .unwrap_or(0.0) as u64
+                "rss {process_rss_bytes} bytes | peak mlx {peak_mlx_bytes} bytes"
             ),
             active_task: format!(
                 "requests {} | active {}",
-                metrics
-                    .get("gemma4d_requests_total")
-                    .copied()
-                    .unwrap_or(0.0) as u64,
-                metrics
-                    .get("gemma4d_active_generations")
-                    .copied()
-                    .unwrap_or(0.0) as u64
+                metric_u64(&metrics, "gemma4d_requests_total"),
+                metric_u64(&metrics, "gemma4d_active_generations")
             ),
-            ttft_p50_ms: metrics
-                .get("gemma4d_ttft_seconds")
-                .map(|seconds| seconds * 1000.0),
-            decode_tps_p50: metrics.get("gemma4d_tokens_per_second").copied(),
+            ttft_p50_ms: ttft_ms,
+            decode_tps_p50: decode_tps,
             cache_hit_rate: None,
+            live: LiveMetricsSnapshot {
+                server_health,
+                model_loaded,
+                requests_total: metric_u64(&metrics, "gemma4d_requests_total"),
+                active_generations: metric_u64(&metrics, "gemma4d_active_generations"),
+                model_load_ms: metric_seconds_ms(&metrics, "gemma4d_model_load_seconds"),
+                prefill_ms: metric_seconds_ms(&metrics, "gemma4d_prefill_seconds"),
+                decode_ms: metric_seconds_ms(&metrics, "gemma4d_decode_seconds"),
+                ttft_ms,
+                tokens_per_second: decode_tps,
+                prefill_tokens_total: metric_u64(&metrics, "gemma4d_prefill_tokens_total"),
+                decode_tokens_total: metric_u64(&metrics, "gemma4d_decode_tokens_total"),
+                process_rss_bytes,
+                peak_mlx_bytes,
+            },
         }
     }
 
@@ -336,17 +346,39 @@ impl RuntimeProvider for HttpProvider {
             Ok(value) => value,
             Err(error) => return CacheSnapshot::disabled(error),
         };
+        let metrics = self.request_metrics();
         let mut snapshot = CacheSnapshot::disabled("live HTTP cache summary");
         snapshot.status = string_at(&value, "status", "stub");
         snapshot.cache_mode = string_at(&value, "cache_mode", "bf16");
-        snapshot.active_kv_bytes = u64_at(&value, "active_kv_bytes", 0);
+        snapshot.namespace_hash = value
+            .get("namespace_hash")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        snapshot.active_kv_bytes = u64_at(
+            &value,
+            "active_kv_bytes",
+            metric_u64(&metrics, "gemma4d_kv_active_bytes"),
+        );
         snapshot.note = format!("live cache summary from {}", self.client.base_url());
         if let Some(ram) = value.get("ram") {
             snapshot.ram.resident_bytes = u64_at(ram, "resident_bytes", 0);
             snapshot.ram.resident_blocks = u64_at(ram, "resident_blocks", 0) as usize;
-            snapshot.ram.hits = u64_at(ram, "hits", 0);
-            snapshot.ram.misses = u64_at(ram, "misses", 0);
-            snapshot.ram.restore_failures = u64_at(ram, "restore_failures", 0);
+            snapshot.ram.hits = u64_at(
+                ram,
+                "hits",
+                metric_u64(&metrics, "gemma4d_prefix_cache_hits_total"),
+            );
+            snapshot.ram.misses = u64_at(
+                ram,
+                "misses",
+                metric_u64(&metrics, "gemma4d_prefix_cache_misses_total"),
+            );
+            snapshot.ram.restore_failures = u64_at(
+                ram,
+                "restore_failures",
+                metric_u64(&metrics, "gemma4d_cache_restore_failures_total"),
+            );
+            snapshot.ram.hit_rate = hit_rate(snapshot.ram.hits, snapshot.ram.misses);
         }
         if let Some(ssd) = value.get("ssd") {
             snapshot.ssd.stored_bytes = u64_at(ssd, "stored_bytes", 0);
@@ -355,6 +387,9 @@ impl RuntimeProvider for HttpProvider {
             snapshot.ssd.writes = u64_at(ssd, "writes", 0);
             snapshot.ssd.restore_failures = u64_at(ssd, "restore_failures", 0);
             snapshot.ssd.namespace_rejections = u64_at(ssd, "namespace_rejections", 0);
+            snapshot.ssd.bytes_read = metric_u64(&metrics, "gemma4d_ssd_cache_read_bytes_total");
+            snapshot.ssd.bytes_written =
+                metric_u64(&metrics, "gemma4d_ssd_cache_write_bytes_total");
         }
         snapshot
     }
@@ -364,7 +399,8 @@ impl RuntimeProvider for HttpProvider {
             Ok(value) => value,
             Err(error) => return AdapterSnapshot::disabled(error),
         };
-        let entries = value
+        let metrics = self.request_metrics();
+        let mut entries = value
             .get("data")
             .and_then(serde_json::Value::as_array)
             .map(|items| {
@@ -377,7 +413,7 @@ impl RuntimeProvider for HttpProvider {
                         source_path: PathBuf::from(string_at(item, "source", "trusted-local")),
                         loaded: bool_at(item, "loaded", false),
                         pinned: bool_at(item, "pinned", false),
-                        active: false,
+                        active: bool_at(item, "active", false),
                         resident_bytes: u64_at(item, "resident_bytes", 0),
                         load_latency_us: 0,
                         target_modules: Vec::new(),
@@ -387,9 +423,19 @@ impl RuntimeProvider for HttpProvider {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        if !entries.iter().any(|entry| entry.active) {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.loaded) {
+                entry.active = true;
+            }
+        }
         let loaded = entries.iter().filter(|entry| entry.loaded).count();
         let pinned = entries.iter().filter(|entry| entry.pinned).count();
         let total_resident_bytes = entries.iter().map(|entry| entry.resident_bytes).sum();
+        let last_load_latency_us =
+            metric_option(&metrics, "gemma4d_adapter_load_seconds").map(|seconds| {
+                let micros = seconds * 1_000_000.0;
+                micros.max(0.0).round() as u128
+            });
         AdapterSnapshot {
             status: "live".to_owned(),
             registry_root: PathBuf::from(self.client.base_url()),
@@ -398,10 +444,10 @@ impl RuntimeProvider for HttpProvider {
             pinned,
             active_adapter_id: entries
                 .iter()
-                .find(|entry| entry.loaded)
+                .find(|entry| entry.active)
                 .map(|entry| entry.adapter_id.clone()),
             total_resident_bytes,
-            last_load_latency_us: None,
+            last_load_latency_us,
             mtp_disabled_active: loaded > 0,
             entries,
             note: format!("live adapter list from {}", self.client.base_url()),
@@ -461,7 +507,45 @@ impl RuntimeProvider for HttpProvider {
     }
 
     fn mtp_snapshot(&mut self) -> MtpSnapshot {
-        MtpSnapshot::disabled("HTTP provider exposes MTP metrics through /metrics in M11")
+        let metrics = self.request_metrics();
+        let attempted = metric_u64(&metrics, "gemma4d_mtp_attempted_tokens_total");
+        let accepted = metric_u64(&metrics, "gemma4d_mtp_accepted_tokens_total");
+        let auto_disabled = metric_u64(&metrics, "gemma4d_mtp_auto_disabled_total");
+        let rollbacks = metric_u64(&metrics, "gemma4d_mtp_rollbacks_total");
+        let acceptance_rate = metric_option(&metrics, "gemma4d_mtp_acceptance_rate")
+            .unwrap_or_else(|| hit_rate(accepted, attempted.saturating_sub(accepted)));
+        let loaded_adapters = metric_u64(&metrics, "gemma4d_adapters_loaded");
+        let active_kv_bytes = metric_u64(&metrics, "gemma4d_kv_active_bytes");
+        let status = if auto_disabled > 0 {
+            MtpStatus::AutoDisabled
+        } else if attempted > 0 {
+            MtpStatus::Enabled
+        } else {
+            MtpStatus::Disabled
+        };
+        MtpSnapshot {
+            status,
+            target: "server /metrics target".to_owned(),
+            drafter: "server /metrics drafter".to_owned(),
+            compatibility: "reported by provider metrics; no TUI native calls".to_owned(),
+            exactness: "not asserted by TUI; see MTP benchmark artifacts".to_owned(),
+            draft_block_size: 0,
+            attempted_draft_tokens: attempted,
+            accepted_draft_tokens: accepted,
+            acceptance_rate,
+            accepted_tokens_per_verify: 0.0,
+            target_verify_passes: 0,
+            rollback_count: rollbacks,
+            auto_disable_reason: (auto_disabled > 0)
+                .then(|| format!("{auto_disabled} provider auto-disable events")),
+            failing_fixture: None,
+            adapter_state: if loaded_adapters > 0 {
+                format!("{loaded_adapters} loaded adapter(s); MTP gated")
+            } else {
+                "no loaded adapters reported".to_owned()
+            },
+            active_kv_mode: format!("provider active KV {active_kv_bytes} bytes"),
+        }
     }
 
     fn backend_events(&mut self) -> Vec<BackendEvent> {
@@ -478,6 +562,7 @@ impl RuntimeProvider for HttpProvider {
             BackendEvent::Cache(self.cache_snapshot()),
             BackendEvent::Adapters(self.adapter_snapshot()),
             BackendEvent::Chat(self.chat_snapshot()),
+            BackendEvent::Mtp(self.mtp_snapshot()),
         ]
     }
 
@@ -605,18 +690,41 @@ fn parse_http_response(raw: &str) -> Result<HttpClientResponse, String> {
 }
 
 fn parse_prometheus_metrics(body: &str) -> std::collections::BTreeMap<String, f64> {
-    body.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let mut parts = line.split_whitespace();
-            let name = parts.next()?.split('{').next()?.to_owned();
-            let value = parts.next()?.parse::<f64>().ok()?;
-            Some((name, value))
-        })
-        .collect()
+    let mut metrics = std::collections::BTreeMap::<String, f64>::new();
+    for (name, value) in body.lines().filter_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let mut parts = line.split_whitespace();
+        let name = parts.next()?.split('{').next()?.to_owned();
+        let value = parts.next()?.parse::<f64>().ok()?;
+        Some((name, value))
+    }) {
+        *metrics.entry(name).or_insert(0.0) += value;
+    }
+    metrics
+}
+
+fn metric_option(metrics: &std::collections::BTreeMap<String, f64>, name: &str) -> Option<f64> {
+    metrics.get(name).copied()
+}
+
+fn metric_u64(metrics: &std::collections::BTreeMap<String, f64>, name: &str) -> u64 {
+    metrics.get(name).copied().unwrap_or(0.0).max(0.0).round() as u64
+}
+
+fn metric_seconds_ms(metrics: &std::collections::BTreeMap<String, f64>, name: &str) -> Option<f64> {
+    metric_option(metrics, name).map(|seconds| seconds * 1000.0)
+}
+
+fn hit_rate(hits: u64, misses: u64) -> f64 {
+    let total = hits.saturating_add(misses);
+    if total == 0 {
+        0.0
+    } else {
+        hits as f64 / total as f64
+    }
 }
 
 fn parse_sse_events(body: &str) -> Vec<String> {

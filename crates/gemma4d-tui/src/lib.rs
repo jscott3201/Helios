@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use provider::{RuntimeProvider, create_provider_with_server};
 
 pub const CRATE_NAME: &str = "gemma4d-tui";
+pub const P10_RENDER_P95_THRESHOLD_US: u128 = 20_000;
 
 pub fn bootstrap_status() -> &'static str {
     "ratatui-operator-console"
@@ -77,6 +78,12 @@ pub enum CliCommand {
     /// Run the M12 non-interactive TUI release walkthrough and write evidence.
     ReleaseWalkthrough {
         #[arg(long, default_value = "benchmarks/out/M12/tui-walkthrough")]
+        out_dir: PathBuf,
+    },
+    /// Run the P10 live optimization console walkthrough and write evidence.
+    #[command(name = "p10-live-console")]
+    P10LiveConsole {
+        #[arg(long, default_value = "benchmarks/out/P10-tui-live-console")]
         out_dir: PathBuf,
     },
 }
@@ -169,6 +176,15 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, TuiError> {
         }
         Some(CliCommand::ReleaseWalkthrough { out_dir }) => {
             let outcome = write_release_walkthrough(
+                &mut state,
+                provider.as_mut(),
+                cli.config.clone(),
+                out_dir,
+            )?;
+            Ok(outcome)
+        }
+        Some(CliCommand::P10LiveConsole { out_dir }) => {
+            let outcome = write_p10_live_console_walkthrough(
                 &mut state,
                 provider.as_mut(),
                 cli.config.clone(),
@@ -339,6 +355,136 @@ pub fn write_release_walkthrough(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct P10LiveConsoleReport {
+    pub schema_version: u32,
+    pub goal: &'static str,
+    pub provider: String,
+    pub config_status: String,
+    pub server_health: String,
+    pub model_loaded: bool,
+    pub benchmark_status: String,
+    pub latest_benchmark_report: PathBuf,
+    pub snapshot_count: usize,
+    pub render_profile: RenderProfile,
+    pub render_p95_threshold_us: u128,
+    pub render_p95_within_threshold: bool,
+    pub live_metrics: app::LiveMetricsSnapshot,
+    pub cache_status: String,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
+    pub active_kv_bytes: u64,
+    pub mtp_status: String,
+    pub mtp_acceptance_rate: f64,
+    pub mtp_attempted_tokens: u64,
+    pub mtp_accepted_tokens: u64,
+    pub adapter_status: String,
+    pub adapters_loaded: usize,
+    pub adapter_resident_bytes: u64,
+    pub chat_status: String,
+    pub report_path: PathBuf,
+    pub metrics_json_path: PathBuf,
+    pub snapshot_dir: PathBuf,
+}
+
+pub fn write_p10_live_console_walkthrough(
+    state: &mut AppState,
+    provider: &mut dyn RuntimeProvider,
+    config_path: PathBuf,
+    out_dir: &std::path::Path,
+) -> Result<RunOutcome, TuiError> {
+    fs::create_dir_all(out_dir)?;
+
+    let validation = provider.validate_config(&config_path);
+    reduce(state, Action::ConfigValidated(validation.clone()));
+
+    let chat = provider.chat_snapshot();
+    reduce(state, Action::ChatUpdated(chat.clone()));
+
+    let benchmark_dir = out_dir.join("benchmark-launch");
+    let benchmark = provider.start_benchmark(&benchmark_dir);
+    reduce(state, Action::BenchmarkRecorded(benchmark.clone()));
+
+    reduce(
+        state,
+        Action::DashboardUpdated(provider.dashboard_snapshot()),
+    );
+    reduce(state, Action::CacheUpdated(provider.cache_snapshot()));
+    reduce(state, Action::AdaptersUpdated(provider.adapter_snapshot()));
+    reduce(state, Action::MtpUpdated(provider.mtp_snapshot()));
+
+    let snapshot_dir = out_dir.join("snapshots");
+    let snapshots = write_snapshots(state, &snapshot_dir)?;
+    let render_profile = profile_render(state, 120, 120, 40)?;
+
+    let report_path = out_dir.join("tui-report.md");
+    let metrics_json_path = out_dir.join("metrics.json");
+    let report = P10LiveConsoleReport {
+        schema_version: 1,
+        goal: "P10-tui-live-optimization-console",
+        provider: state.provider_name.clone(),
+        config_status: validation.status.label().to_owned(),
+        server_health: state.dashboard.live.server_health.clone(),
+        model_loaded: state.dashboard.live.model_loaded,
+        benchmark_status: benchmark.status.label().to_owned(),
+        latest_benchmark_report: benchmark.report_path.clone(),
+        snapshot_count: snapshots.len(),
+        render_profile,
+        render_p95_threshold_us: P10_RENDER_P95_THRESHOLD_US,
+        render_p95_within_threshold: false,
+        live_metrics: state.dashboard.live.clone(),
+        cache_status: state.cache.status.clone(),
+        cache_hits_total: state.cache.ram.hits.saturating_add(state.cache.ssd.hits),
+        cache_misses_total: state
+            .cache
+            .ram
+            .misses
+            .saturating_add(state.cache.ssd.misses),
+        active_kv_bytes: state.cache.active_kv_bytes,
+        mtp_status: state.mtp.status.label().to_owned(),
+        mtp_acceptance_rate: state.mtp.acceptance_rate,
+        mtp_attempted_tokens: state.mtp.attempted_draft_tokens,
+        mtp_accepted_tokens: state.mtp.accepted_draft_tokens,
+        adapter_status: state.adapters.status.clone(),
+        adapters_loaded: state.adapters.loaded,
+        adapter_resident_bytes: state.adapters.total_resident_bytes,
+        chat_status: chat.status.clone(),
+        report_path: report_path.clone(),
+        metrics_json_path: metrics_json_path.clone(),
+        snapshot_dir: snapshot_dir.clone(),
+    };
+    let mut report = report;
+    report.render_p95_within_threshold =
+        report.render_profile.p95_us <= report.render_p95_threshold_us;
+
+    fs::write(
+        &metrics_json_path,
+        serde_json::to_vec_pretty(&report).map_err(|error| TuiError::Render(error.to_string()))?,
+    )?;
+    fs::write(
+        &report_path,
+        render_p10_live_console_markdown(P10Markdown {
+            report: &report,
+            validation: &validation,
+            benchmark: &benchmark,
+            dashboard: &state.dashboard,
+            cache: &state.cache,
+            adapters: &state.adapters,
+            mtp: &state.mtp,
+            chat: &state.chat,
+            snapshots: &snapshots,
+        }),
+    )?;
+
+    Ok(RunOutcome {
+        message: format!(
+            "wrote P10 TUI live console report to {}",
+            report_path.display()
+        ),
+        evidence_paths: vec![report_path, metrics_json_path, snapshot_dir, benchmark_dir],
+    })
+}
+
 struct WalkthroughMarkdown<'a> {
     report: &'a ReleaseWalkthroughReport,
     validation: &'a config::ConfigValidation,
@@ -348,6 +494,152 @@ struct WalkthroughMarkdown<'a> {
     adapters: &'a app::AdapterSnapshot,
     chat: &'a app::ChatSnapshot,
     snapshots: &'a [PathBuf],
+}
+
+struct P10Markdown<'a> {
+    report: &'a P10LiveConsoleReport,
+    validation: &'a config::ConfigValidation,
+    benchmark: &'a app::BenchmarkRecord,
+    dashboard: &'a app::DashboardSnapshot,
+    cache: &'a app::CacheSnapshot,
+    adapters: &'a app::AdapterSnapshot,
+    mtp: &'a app::MtpSnapshot,
+    chat: &'a app::ChatSnapshot,
+    snapshots: &'a [PathBuf],
+}
+
+fn render_p10_live_console_markdown(input: P10Markdown<'_>) -> String {
+    let P10Markdown {
+        report,
+        validation,
+        benchmark,
+        dashboard,
+        cache,
+        adapters,
+        mtp,
+        chat,
+        snapshots,
+    } = input;
+    let live = &dashboard.live;
+    let mut out = String::new();
+    out.push_str("# P10 TUI Live Optimization Console\n\n");
+    out.push_str("## Summary\n\n");
+    out.push_str("| Item | Value |\n|---|---|\n");
+    out.push_str(&format!(
+        "| Provider | `{}` |\n",
+        markdown_escape(&report.provider)
+    ));
+    out.push_str(&format!(
+        "| Config validation | `{}` ({}) |\n",
+        markdown_escape(&report.config_status),
+        markdown_escape(&validation.summary)
+    ));
+    out.push_str(&format!(
+        "| Server health | `{}` model_loaded=`{}` |\n",
+        markdown_escape(&report.server_health),
+        report.model_loaded
+    ));
+    out.push_str(&format!(
+        "| Live timing | load `{}` ms, prefill `{}` ms, TTFT `{}` ms, decode `{}` ms |\n",
+        option_number(live.model_load_ms),
+        option_number(live.prefill_ms),
+        option_number(live.ttft_ms),
+        option_number(live.decode_ms)
+    ));
+    out.push_str(&format!(
+        "| Live throughput | `{}` tok/s over prefill `{}` and decode `{}` tokens |\n",
+        option_number(live.tokens_per_second),
+        live.prefill_tokens_total,
+        live.decode_tokens_total
+    ));
+    out.push_str(&format!(
+        "| Live memory | RSS `{}` bytes, peak MLX `{}` bytes, active KV `{}` bytes |\n",
+        live.process_rss_bytes, live.peak_mlx_bytes, report.active_kv_bytes
+    ));
+    out.push_str(&format!(
+        "| Cache | `{}` hits `{}` misses `{}` |\n",
+        markdown_escape(&report.cache_status),
+        report.cache_hits_total,
+        report.cache_misses_total
+    ));
+    out.push_str(&format!(
+        "| MTP | `{}` attempted `{}` accepted `{}` acceptance `{:.3}` |\n",
+        markdown_escape(&report.mtp_status),
+        report.mtp_attempted_tokens,
+        report.mtp_accepted_tokens,
+        report.mtp_acceptance_rate
+    ));
+    out.push_str(&format!(
+        "| Adapters | `{}` loaded `{}` resident `{}` bytes active `{:?}` |\n",
+        markdown_escape(&report.adapter_status),
+        report.adapters_loaded,
+        report.adapter_resident_bytes,
+        adapters.active_adapter_id
+    ));
+    out.push_str(&format!(
+        "| Latest benchmark report | `{}` status `{}` |\n",
+        report.latest_benchmark_report.display(),
+        markdown_escape(&report.benchmark_status)
+    ));
+    out.push_str(&format!(
+        "| Render p50/p95 | `{}` us / `{}` us, threshold `{}` us, passed `{}` |\n\n",
+        report.render_profile.p50_us,
+        report.render_profile.p95_us,
+        report.render_p95_threshold_us,
+        report.render_p95_within_threshold
+    ));
+
+    out.push_str("## Provider Evidence\n\n");
+    out.push_str("| Surface | Evidence |\n|---|---|\n");
+    out.push_str(&format!(
+        "| Dashboard | `{}` / `{}` / `{}` |\n",
+        markdown_escape(&dashboard.runtime_state),
+        markdown_escape(&dashboard.memory_pressure),
+        markdown_escape(&dashboard.active_task)
+    ));
+    out.push_str(&format!(
+        "| Chat smoke | `{}` events `{}` preview `{}` |\n",
+        markdown_escape(&chat.status),
+        chat.stream_events,
+        markdown_escape(&chat.last_response_preview)
+    ));
+    out.push_str(&format!(
+        "| Cache page | mode `{}` active_kv `{}` ram hit_rate `{:.3}` note `{}` |\n",
+        markdown_escape(&cache.cache_mode),
+        cache.active_kv_bytes,
+        cache.ram.hit_rate,
+        markdown_escape(&cache.note)
+    ));
+    out.push_str(&format!(
+        "| MTP page | status `{}` rollbacks `{}` adapter_state `{}` active_kv `{}` |\n",
+        mtp.status.label(),
+        mtp.rollback_count,
+        markdown_escape(&mtp.adapter_state),
+        markdown_escape(&mtp.active_kv_mode)
+    ));
+    out.push_str(&format!(
+        "| Adapter page | loaded `{}` pinned `{}` resident `{}` last_load `{:?}` |\n",
+        adapters.loaded,
+        adapters.pinned,
+        adapters.total_resident_bytes,
+        adapters.last_load_latency_us
+    ));
+    out.push_str(&format!(
+        "| Benchmark page | `{}` -> `{}` ({}) |\n",
+        markdown_escape(&benchmark.command),
+        benchmark.report_path.display(),
+        markdown_escape(&benchmark.note)
+    ));
+    out.push_str(&format!(
+        "| Metrics JSON | `{}` |\n\n",
+        report.metrics_json_path.display()
+    ));
+
+    out.push_str("## Snapshot Artifacts\n\n");
+    for path in snapshots {
+        out.push_str(&format!("- `{}`\n", path.display()));
+    }
+    out
 }
 
 fn render_release_walkthrough_markdown(input: WalkthroughMarkdown<'_>) -> String {
@@ -493,4 +785,10 @@ fn percentile_index(len: usize, percentile: usize) -> usize {
 
 fn markdown_escape(value: &str) -> String {
     value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn option_number(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "n/a".to_owned())
 }

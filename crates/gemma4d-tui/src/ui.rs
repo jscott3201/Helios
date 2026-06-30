@@ -79,18 +79,26 @@ fn render_dashboard(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9),
+            Constraint::Length(11),
             Constraint::Length(3),
             Constraint::Min(0),
         ])
         .split(area);
 
     let snapshot = &state.dashboard;
+    let live = &snapshot.live;
     let lines = vec![
         Line::from(vec![
             Span::styled("Runtime ", Style::default().fg(Color::Gray)),
             Span::raw(snapshot.runtime_state.clone()),
         ]),
+        Line::from(format!(
+            "Health {} | model loaded {} | requests {} | active {}",
+            live.server_health,
+            yes_no(live.model_loaded),
+            live.requests_total,
+            live.active_generations
+        )),
         Line::from(vec![
             Span::styled("Provider ", Style::default().fg(Color::Gray)),
             Span::raw(snapshot.provider.clone()),
@@ -111,6 +119,12 @@ fn render_dashboard(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             Span::styled("Task ", Style::default().fg(Color::Gray)),
             Span::raw(snapshot.active_task.clone()),
         ]),
+        Line::from(format!(
+            "Tokens prefill {} | decode {} | tok/s {}",
+            live.prefill_tokens_total,
+            live.decode_tokens_total,
+            option_tps(live.tokens_per_second)
+        )),
         Line::from(vec![
             Span::styled("MTP ", Style::default().fg(Color::Gray)),
             Span::raw(format!(
@@ -144,9 +158,13 @@ fn render_dashboard(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 
     let perf = format!(
-        "TTFT p50: {} | Decode p50: {} | redraw tick: {}",
-        option_ms(snapshot.ttft_p50_ms),
-        option_tps(snapshot.decode_tps_p50),
+        "Live load {} | Prefill {} | TTFT {} | Decode {} | RSS {} | Peak MLX {} | redraw tick {}",
+        option_ms(live.model_load_ms),
+        option_ms(live.prefill_ms),
+        option_ms(live.ttft_ms.or(snapshot.ttft_p50_ms)),
+        option_ms(live.decode_ms),
+        bytes(live.process_rss_bytes),
+        bytes(live.peak_mlx_bytes),
         state.tick_count
     );
     frame.render_widget(
@@ -205,6 +223,7 @@ fn render_config(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_benchmarks(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let record = &state.benchmark;
+    let live = &state.dashboard.live;
     let lines = vec![
         Line::from(vec![
             Span::styled("Status ", Style::default().fg(Color::Gray)),
@@ -218,6 +237,19 @@ fn render_benchmarks(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             Span::styled("Report ", Style::default().fg(Color::Gray)),
             Span::raw(record.report_path.display().to_string()),
         ]),
+        Line::from(format!(
+            "Live load {} | prefill {} | decode {} | tok/s {}",
+            option_ms(live.model_load_ms),
+            option_ms(live.prefill_ms),
+            option_ms(live.decode_ms),
+            option_tps(live.tokens_per_second)
+        )),
+        Line::from(format!(
+            "Live memory RSS {} | peak MLX {} | server {}",
+            bytes(live.process_rss_bytes),
+            bytes(live.peak_mlx_bytes),
+            live.server_health
+        )),
         Line::from(""),
         Line::from("Exact command"),
         Line::from(record.command.clone()),

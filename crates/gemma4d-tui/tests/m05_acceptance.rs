@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    fs,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     rc::Rc,
@@ -8,6 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -21,6 +23,7 @@ use gemma4d_tui::{
     seed_state,
     terminal::{TerminalLifecycle, TerminalOps, key_to_action},
     ui::render_snapshot,
+    write_p10_live_console_walkthrough,
 };
 
 #[test]
@@ -128,7 +131,9 @@ fn snapshots_render_required_pages_at_required_sizes() {
         PageId::Config,
         PageId::Benchmarks,
         PageId::Chat,
+        PageId::Cache,
         PageId::Adapters,
+        PageId::Mtp,
         PageId::Logs,
         PageId::Help,
     ] {
@@ -235,6 +240,79 @@ fn http_provider_attaches_to_live_server_and_streams_chat() {
     let snapshot = render_snapshot(&state, 80, 24).unwrap();
     assert!(snapshot.contains("streaming-smoke-ok"));
     assert!(snapshot.contains("hello from TUI"));
+
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(addr);
+    handle.join().expect("server thread");
+}
+
+#[test]
+fn http_provider_renders_live_optimization_metrics() {
+    let (addr, shutdown, handle) = spawn_stub_server();
+    let mut provider = HttpProvider::new(format!("http://{addr}"));
+    let config_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
+    let mut state = seed_state(&mut provider, config_path);
+
+    assert_eq!(state.dashboard.live.server_health, "ok");
+    assert!(state.dashboard.live.model_loaded);
+    assert!(state.dashboard.live.prefill_tokens_total > 0);
+    assert!(state.dashboard.live.decode_tokens_total > 0);
+    assert_eq!(state.mtp.status.label(), "disabled");
+    assert!(state.adapters.total_resident_bytes > 0);
+
+    let dashboard = render_snapshot(&state, 120, 40).unwrap();
+    assert!(dashboard.contains("Health ok"));
+    assert!(dashboard.contains("Live load"));
+    assert!(dashboard.contains("Peak MLX"));
+
+    reduce(&mut state, Action::Navigate(PageId::Benchmarks));
+    let benchmarks = render_snapshot(&state, 120, 40).unwrap();
+    assert!(benchmarks.contains("Live load"));
+    assert!(benchmarks.contains("Live memory RSS"));
+
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(addr);
+    handle.join().expect("server thread");
+}
+
+#[test]
+fn p10_live_console_walkthrough_writes_required_artifacts() {
+    let (addr, shutdown, handle) = spawn_stub_server();
+    let mut provider = HttpProvider::new(format!("http://{addr}"));
+    let config_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
+    let mut state = seed_state(&mut provider, config_path.clone());
+    let out_dir = std::env::temp_dir().join(format!(
+        "gemma4d-p10-tui-live-console-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+
+    let outcome =
+        write_p10_live_console_walkthrough(&mut state, &mut provider, config_path, &out_dir)
+            .expect("p10 walkthrough");
+    let report_path = out_dir.join("tui-report.md");
+    let metrics_path = out_dir.join("metrics.json");
+    let snapshot_dir = out_dir.join("snapshots");
+
+    assert!(outcome.evidence_paths.contains(&report_path));
+    assert!(outcome.evidence_paths.contains(&metrics_path));
+    assert!(outcome.evidence_paths.contains(&snapshot_dir));
+    assert!(report_path.exists());
+    assert!(metrics_path.exists());
+    assert!(snapshot_dir.join("dashboard-80x24.snap").exists());
+    assert!(snapshot_dir.join("cache-120x40.snap").exists());
+    assert!(snapshot_dir.join("mtp-120x40.snap").exists());
+    assert!(snapshot_dir.join("adapters-120x40.snap").exists());
+    assert!(snapshot_dir.join("benchmarks-120x40.snap").exists());
+
+    let metrics_json = fs::read_to_string(metrics_path).expect("metrics json");
+    assert!(metrics_json.contains("\"goal\": \"P10-tui-live-optimization-console\""));
+    assert!(metrics_json.contains("\"render_p95_within_threshold\": true"));
+    assert!(metrics_json.contains("\"server_health\": \"ok\""));
 
     shutdown.store(true, Ordering::SeqCst);
     let _ = TcpStream::connect(addr);
