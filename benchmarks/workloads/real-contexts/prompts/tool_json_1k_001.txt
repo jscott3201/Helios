@@ -1,0 +1,131 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `tool_json_1k_001`
+Family: `tool_json`
+Target context tokens: `1024`
+Deterministic seed: `20260635`
+Source files: `crates/gemma4d-server/src/http.rs`
+
+## Corpus Instruction
+
+Use the local HTTP server code context to infer stable endpoint names and response fields. The answer must be JSON only.
+
+## Repo Context
+
+
+## Source Round 1 for tool_json_1k_001
+
+### BEGIN crates/gemma4d-server/src/http.rs
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    num::NonZeroU32,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use crate::{GenerateOptions, GenerateSummary, detokenize_tokens, generate};
+
+pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+const SERVER_NAME: &str = "gemma4d";
+
+pub type HttpResult<T> = std::result::Result<T, HttpError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpError {
+    Io(String),
+    Json(String),
+    BadRequest(String),
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(message) | Self::Json(message) | Self::BadRequest(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+impl From<std::io::Error> for HttpError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source.to_string())
+    }
+}
+
+impl From<serde_json::Error> for HttpError {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Json(source.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub bind_addr: SocketAddr,
+    pub model_id: String,
+    pub backend: ServerBackend,
+    pub model_path: Option<PathBuf>,
+    pub max_context_tokens: usize,
+    pub memory_budget_bytes: u64,
+    pub queue_capacity: usize,
+    pub adapters: Vec<ServerAdapter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerBackend {
+    Stub,
+    RealHelper,
+}
+
+impl ServerBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stub => "stub",
+            Self::RealHelper => "real_helper",
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: DEFAULT_BIND_ADDR
+                .parse()
+                .expect("default bind address is valid"),
+            model_id: "mlx-community/gemma-4-12B-it-4bit".to_owned(),
+            backend: ServerBackend::Stub,
+            model_path: None,
+            max_context_tokens: 32_768,
+            memory_budget_bytes: 12 * 1024 * 1024 * 1024,
+            queue_capacity: 0,
+            adapters: vec![ServerAdapter::stub_loaded("rust-coding-r16-v1")],
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn localhost_default() -> Self {
+        Self::default()
+    }
+
+    pub fn with_bind_addr
+
+## Final User Task
+
+Return a JSON object with keys endpoints, metrics, risks, and verification_commands. Do not include Markdown.
+
+## Expected Output Style
+
+strict_json

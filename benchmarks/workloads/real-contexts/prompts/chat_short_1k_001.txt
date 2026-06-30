@@ -1,0 +1,94 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `chat_short_1k_001`
+Family: `chat_short`
+Target context tokens: `1024`
+Deterministic seed: `20260630`
+Source files: `AGENTS.md, docs/evidence/M12.md`
+
+## Corpus Instruction
+
+Simulate a short operator chat about Helios release evidence. Preserve concrete file paths, status words, and constraints from the context.
+
+## Repo Context
+
+
+## Source Round 1 for chat_short_1k_001
+
+### BEGIN AGENTS.md
+# Gemma4D Codex Agent Instructions
+
+You are working on `gemma4d`, a Rust + MLX inference runtime for Gemma 4 12B on Apple Silicon.
+
+## Primary objective
+
+Implement the milestone currently selected by the user. Do not jump ahead unless the selected milestone explicitly requires a stub for a later one.
+
+## Hard constraints
+
+- Target Rust toolchain: `1.95.0` unless a later milestone intentionally changes it.
+- Target platform: macOS Apple Silicon.
+- Backend: MLX through a narrow C/C++ native boundary; Rust must not expose broad raw MLX internals.
+- Model scope: Gemma 4 12B first. Do not add broad multi-model abstractions unless a milestone requires a stable trait boundary.
+- First runtime path: text-only inference. Multimodal is deferred.
+- DiffusionGemma is out of scope for this package.
+- Optimize for a 16GB MacBook profile before expanding to larger machines.
+- Do not load arbitrary remote adapters or code from untrusted client requests.
+- TUI scope: Ratatui UI is a local operator console over provider/client APIs; do not call MLX/native execution directly from TUI MVP.
+
+## Implementation discipline
+
+1. Read the selected milestone file and its linked spec files.
+2. Use the matching `codex/goals/*.goal.md` goal contract when running a long task.
+3. Establish a baseline before changing performance-critical code.
+4. Preserve correctness before optimizing.
+5. Record exact commands and outputs for every benchmark/profiling claim.
+6. Keep generated artifacts in predictable paths under `target/`, `benchmarks/out/`, or `artifacts/`.
+7. Keep unsafe Rust and FFI isolated, documented, and tested.
+8. Prefer small reviewable commits/patches.
+
+## Subagent policy
+
+Use subagents for isolated research, verification, profiling, and review. Do not spawn subagents for simple edits.
+
+Recommended custom agents:
+
+- `codebase-mapper` — read-only exploration.
+- `external-researcher` — source/API/version research.
+- `mlx_ffi_engineer` — native MLX/C++/C ABI design and implementation.
+- `gemma4_correctness_reviewer` — tokenizer/config/logit/cache parity checks.
+- `mtp_kv_engineer` — MTP, KV rollback, prefix-cache design.
+- `adapter_runtime_engineer` — LoRA/QLoRA/aLoRA adapter import and routing.
+- `tui_ux_engineer` — Ratatui operator console design, event loop, provider boundary, terminal lifecycle, and UX review.
+- `performance-analyst` — benchmark/profiling and variance interpretation.
+- `test-verifier` — independent build/test/lint verification.
+- `security-reliability-reviewer` — unsafe/FFI, cache, adapter, server, and TUI terminal-state risk review.
+
+Subagents must return evidence, not opinions. Parent agent must synthesize and resolve conflicts.
+
+## Skills
+
+Use repo skills from `.agents/skills/`. Project-specific skills include:
+
+- `$gemma4d-rust-mlx-ffi`
+- `$gemma4d-model-correctness`
+- `$gemma4d-tui-operator-ux`
+- `$gemma4d-mtp-speculative-decoding`
+- `$gemma4d-kv-cache-offload`
+- `$gemma4d-dynamic-adapters`
+- `$gemma4d-16gb-mac-profiling`
+- `$gemma4d-milestone-execution`
+
+General review skills from the uploaded package remain available, especially `$performance-ab-benchmark-review`, `$spec-contract-compliance-review`, and `$release-readiness-review`.
+
+## Completion rule
+
+A milestone is complete only when the
+
+## Final User Task
+
+Answer as the local operator console assistant. Give the next safe action and cite the relevant evidence file names.
+
+## Expected Output Style
+
+concise_operator_answer

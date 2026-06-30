@@ -1,6 +1,7 @@
 #![doc = "Reference-parity benchmark harness and report generation."]
 
 pub mod manifest;
+pub mod workload_corpus;
 
 use std::{
     fs::{self, File},
@@ -153,6 +154,10 @@ where
                 out_dir: options.out_dir,
             })
         }
+        "workload-corpus" => {
+            let options = parse_workload_corpus_options(args)?;
+            workload_corpus::write_workload_corpus_artifacts(&options)
+        }
         "-h" | "--help" | "help" => Ok(usage()),
         other => Err(CliError::Usage(format!(
             "unknown command '{other}'\n{}",
@@ -201,6 +206,62 @@ where
         model_path,
         drafter_path,
         out_dir,
+    })
+}
+
+pub fn parse_workload_corpus_options<I, S>(
+    args: I,
+) -> Result<workload_corpus::WorkloadCorpusOptions, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).peekable();
+    let mut model_path = PathBuf::from(workload_corpus::DEFAULT_MODEL_PATH);
+    let mut workload_dir = PathBuf::from(workload_corpus::DEFAULT_WORKLOAD_DIR);
+    let mut out_dir = PathBuf::from(workload_corpus::DEFAULT_OUT_DIR);
+    let mut python = PathBuf::from(
+        std::env::var("GEMMA4D_MLX_LM_PYTHON")
+            .unwrap_or_else(|_| "/opt/homebrew/opt/mlx-lm/libexec/bin/python".to_owned()),
+    );
+    let mut seed = workload_corpus::DEFAULT_SEED;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--model-path" => {
+                model_path = PathBuf::from(required_value(&mut args, "--model-path")?);
+            }
+            "--workload-dir" => {
+                workload_dir = PathBuf::from(required_value(&mut args, "--workload-dir")?);
+            }
+            "--out-dir" => {
+                out_dir = PathBuf::from(required_value(&mut args, "--out-dir")?);
+            }
+            "--python" => {
+                python = PathBuf::from(required_value(&mut args, "--python")?);
+            }
+            "--seed" => {
+                let value = required_value(&mut args, "--seed")?;
+                seed = value
+                    .parse::<u64>()
+                    .map_err(|error| CliError::Usage(format!("--seed must be u64: {error}")))?;
+            }
+            "-h" | "--help" => return Err(CliError::Usage(workload_corpus_usage())),
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown workload-corpus option '{other}'\n{}",
+                    workload_corpus_usage()
+                )));
+            }
+        }
+    }
+
+    Ok(workload_corpus::WorkloadCorpusOptions {
+        model_path,
+        workload_dir,
+        out_dir,
+        python,
+        seed,
     })
 }
 
@@ -1384,10 +1445,11 @@ fn decode_tps(max_new_tokens: usize, decode: Duration) -> Option<f64> {
 
 fn usage() -> String {
     format!(
-        "usage: gemma4d-bench <command>\n\n{}\n\n{}\n\n{}",
+        "usage: gemma4d-bench <command>\n\n{}\n\n{}\n\n{}\n\n{}",
         run_usage(),
         report_usage(),
-        manifest_usage()
+        manifest_usage(),
+        workload_corpus_usage()
     )
 }
 
@@ -1401,6 +1463,10 @@ fn report_usage() -> String {
 
 fn manifest_usage() -> String {
     "usage: gemma4d-bench manifest [--model-path PATH] [--drafter-path PATH|--no-drafter] [--out-dir DIR]".to_owned()
+}
+
+fn workload_corpus_usage() -> String {
+    "usage: gemma4d-bench workload-corpus [--model-path PATH] [--workload-dir DIR] [--out-dir DIR] [--python PATH] [--seed N]".to_owned()
 }
 
 #[cfg(test)]
@@ -1496,6 +1562,43 @@ mod tests {
         assert_eq!(no_drafter.model_path, PathBuf::from("model"));
         assert_eq!(no_drafter.drafter_path, None);
         assert_eq!(no_drafter.out_dir, PathBuf::from("out"));
+    }
+
+    #[test]
+    fn parses_workload_corpus_options_defaults_and_overrides() {
+        let defaults = parse_workload_corpus_options(std::iter::empty::<&str>()).expect("defaults");
+        assert_eq!(
+            defaults.model_path,
+            PathBuf::from(workload_corpus::DEFAULT_MODEL_PATH)
+        );
+        assert_eq!(
+            defaults.workload_dir,
+            PathBuf::from(workload_corpus::DEFAULT_WORKLOAD_DIR)
+        );
+        assert_eq!(
+            defaults.out_dir,
+            PathBuf::from(workload_corpus::DEFAULT_OUT_DIR)
+        );
+        assert_eq!(defaults.seed, workload_corpus::DEFAULT_SEED);
+
+        let overridden = parse_workload_corpus_options([
+            "--model-path",
+            "model",
+            "--workload-dir",
+            "workloads",
+            "--out-dir",
+            "out",
+            "--python",
+            "python3",
+            "--seed",
+            "42",
+        ])
+        .expect("overrides");
+        assert_eq!(overridden.model_path, PathBuf::from("model"));
+        assert_eq!(overridden.workload_dir, PathBuf::from("workloads"));
+        assert_eq!(overridden.out_dir, PathBuf::from("out"));
+        assert_eq!(overridden.python, PathBuf::from("python3"));
+        assert_eq!(overridden.seed, 42);
     }
 
     #[test]

@@ -1,0 +1,673 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `code_review_rust_8k_001`
+Family: `code_review_rust`
+Target context tokens: `8192`
+Deterministic seed: `20260632`
+Source files: `native/gemma4_mlx/src/native_model.cc, native/gemma4_mlx/src/runtime.cc`
+
+## Corpus Instruction
+
+Review the native MLX text graph and KV path for correctness and measurement risks. Separate real bugs from missing future optimizations.
+
+## Repo Context
+
+
+## Source Round 1 for code_review_rust_8k_001
+
+### BEGIN native/gemma4_mlx/src/native_model.cc
+#include "native_model.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#ifdef GEMMA4D_MLX_AVAILABLE
+#include <mlx/array.h>
+#include <mlx/fast.h>
+#include <mlx/io.h>
+#include <mlx/memory.h>
+#include <mlx/ops.h>
+#include <mlx/transforms.h>
+#endif
+
+namespace gemma4d {
+
+struct NativeHiddenState::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    mlx::core::array hidden;
+    std::optional<mlx::core::array> full_attention_key;
+    std::optional<mlx::core::array> full_attention_value;
+    std::optional<mlx::core::array> sliding_attention_key;
+    std::optional<mlx::core::array> sliding_attention_value;
+#endif
+    uint64_t sequence_len = 0;
+    uint32_t hidden_size = 0;
+};
+
+struct NativeKvState::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    struct Layer {
+        bool full_attention = false;
+        std::optional<mlx::core::array> key;
+        std::optional<mlx::core::array> value;
+    };
+    std::vector<Layer> layers;
+#endif
+    uint64_t sequence_len = 0;
+    uint64_t active_bytes = 0;
+};
+
+struct NativeLoraAdapter::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    struct Module {
+        std::string prefix;
+        std::string target_module;
+        mlx::core::array a_transposed;
+        mlx::core::array b_transposed;
+        float scale = 1.0f;
+        uint64_t resident_bytes = 0;
+    };
+    std::vector<Module> modules;
+#endif
+    std::string adapter_id;
+    std::string adapter_weight_hash;
+    std::vector<std::string> target_modules;
+    uint32_t rank = 0;
+    float alpha = 0.0f;
+    uint64_t resident_bytes = 0;
+};
+
+struct NativeTextModel::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    std::unordered_map<std::string, mlx::core::array> tensors;
+    std::shared_ptr<const NativeLoraAdapter> active_adapter;
+#endif
+    QuantizationSpec default_quantization;
+    std::unordered_map<std::string, QuantizationSpec> quantization_overrides;
+    size_t safetensor_file_count = 0;
+    size_t language_tensor_count = 0;
+    size_t total_tensor_count_seen = 0;
+    std::string manifest_summary;
+};
+
+struct NativeMtpAssistantModel::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    std::unordered_map<std::string, mlx::core::array> tensors;
+#endif
+    QuantizationSpec default_quantization;
+    std::unordered_map<std::string, QuantizationSpec> quantization_overrides;
+    size_t safetensor_file_count = 0;
+    size_t assistant_tensor_count = 0;
+    size_t total_tensor_count_seen = 0;
+    std::string manifest_summary;
+};
+
+namespace {
+
+std::vector<std::filesystem::path> safetensor_files(const std::filesystem::path& model_path) {
+    std::vector<std::filesystem::path> files;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(model_path)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
+            files.push_back(entry.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+bool is_language_tensor(const std::string& key) {
+    return key.rfind("language_model.model.", 0) == 0;
+}
+
+bool is_assistant_tensor(const std::string& key) {
+    return key.rfind("model.", 0) == 0 || key.rfind("pre_projection.", 0) == 0 ||
+        key.rfind("post_projection.", 0) == 0;
+}
+
+#ifdef GEMMA4D_MLX_AVAILABLE
+
+using mlx::core::array;
+
+array model_dtype(array value);
+array model_scalar(float value);
+
+array to_float32(array value) {
+    return mlx::core::astype(std::move(value), mlx::core::float32);
+}
+
+template <typename Impl>
+const array& tensor_or_throw(const Impl& impl, const std::string& key) {
+    const auto found = impl.tensors.find(key);
+    if (found == impl.tensors.end()) {
+        throw std::runtime_error("missing loaded tensor " + key);
+    }
+    return found->second;
+}
+
+template <typename Impl>
+QuantizationSpec quantization_for(const Impl& impl, const std::string& prefix) {
+    const auto found = impl.quantization_overrides.find(prefix);
+    if (found != impl.quantization_overrides.end()) {
+        return found->second;
+    }
+    return impl.default_quantization;
+}
+
+bool starts_with(const std::string& value, const std::string& prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+
+bool ends_with(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string trim_ascii(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+        ++start;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+    return value.substr(start, end - start);
+}
+
+std::string canonical_lora_prefix(std::string prefix) {
+    if (starts_with(prefix, "base_model.model.model.")) {
+        return "language_model.model." + prefix.substr(std::string("base_model.model.model.").size());
+    }
+    if (starts_with(prefix, "base_model.model.")) {
+        return "language_model.model." + prefix.substr(std::string("base_model.model.").size());
+    }
+    if (starts_with(prefix, "model.")) {
+        return "language_model.model." + prefix.substr(std::string("model.").size());
+    }
+    return prefix;
+}
+
+std::optional<std::string> lora_tensor_prefix(const std::string& name, const char* suffix) {
+    const std::string suffix_value(suffix);
+    if (!ends_with(name, suffix_value)) {
+        return std::nullopt;
+    }
+    return canonical_lora_prefix(name.substr(0, name.size() - suffix_value.size()));
+}
+
+std::string target_module_for_prefix(const std::string& prefix) {
+    const size_t last_dot = prefix.rfind('.');
+    if (last_dot == std::string::npos || last_dot + 1 >= prefix.size()) {
+        return prefix;
+    }
+    return prefix.substr(last_dot + 1);
+}
+
+bool target_module_allowed(const std::string& prefix, const std::vector<std::string>& target_modules) {
+    const std::string leaf = target_module_for_prefix(prefix);
+    for (const std::string& module : target_modules) {
+        const std::string trimmed = trim_ascii(module);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (leaf == trimmed || prefix == trimmed || ends_with(prefix, "." + trimmed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t quantized_linear_input_dim(const QuantizationSpec& spec, const array& weight) {
+    const auto& shape = weight.shape();
+    if (shape.size() != 2 || spec.bits == 0 || 32 % spec.bits != 0) {
+        throw std::runtime_error("unsupported quantized weight shape for LoRA validation");
+    }
+    return static_cast<uint64_t>(shape[1]) * static_cast<uint64_t>(32 / spec.bits);
+}
+
+const NativeLoraAdapter::Impl::Module* active_lora_module(
+    const NativeTextModel::Impl& impl,
+    const std::string& prefix) {
+    if (!impl.active_adapter) {
+        return nullptr;
+    }
+    const NativeLoraAdapter::Impl* adapter = impl.active_adapter->impl();
+    if (adapter == nullptr) {
+        return nullptr;
+    }
+    for (const NativeLoraAdapter::Impl::Module& module : adapter->modules) {
+        if (module.prefix == prefix) {
+            return &module;
+        }
+    }
+    return nullptr;
+}
+
+template <typename Impl>
+array add_lora_delta_if_active(
+    const Impl&,
+    const array&,
+    const std::string&,
+    array base_output) {
+    return base_output;
+}
+
+array add_lora_delta_if_active(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    const std::string& prefix,
+    array base_output) {
+    const NativeLoraAdapter::Impl::Module* module = active_lora_module(impl, prefix);
+    if (module == nullptr) {
+        return base_output;
+    }
+    array low_rank = mlx::core::matmul(to_float32(x), module->a_transposed);
+    array delta = mlx::core::matmul(low_rank, module->b_transposed) * model_scalar(module->scale);
+    return model_dtype(base_output + model_dtype(delta));
+}
+
+bool force_float32_enabled() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_FORCE_FLOAT32");
+    return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
+array model_dtype(array value) {
+    if (force_float32_enabled()) {
+        return value;
+    }
+    return mlx::core::astype(std::move(value), mlx::core::bfloat16);
+}
+
+array model_scalar(float value) {
+    if (force_float32_enabled()) {
+        return array(value);
+    }
+    return array(value, mlx::core::bfloat16);
+}
+
+template <typename Impl>
+array quantized_linear(const Impl& impl, const array& x, const std::string& prefix) {
+    const QuantizationSpec spec = quantization_for(impl, prefix);
+    array output = model_dtype(mlx::core::quantized_matmul(
+        x,
+        tensor_or_throw(impl, prefix + ".weight"),
+        tensor_or_throw(impl, prefix + ".scales"),
+        std::optional<array>(tensor_or_throw(impl, prefix + ".biases")),
+        true,
+        static_cast<int>(spec.group_size),
+        static_cast<int>(spec.bits),
+        "affine"));
+    return add_lora_delta_if_active(impl, x, prefix, output);
+}
+
+array quantized_embedding(const NativeTextModel::Impl& impl, const array& token_ids) {
+    const QuantizationSpec spec = quantization_for(impl, "language_model.model.embed_tokens");
+    return model_dtype(mlx::core::dequantize(
+        mlx::core::take(tensor_or_throw(impl, "language_model.model.embed_tokens.weight"), token_ids, 0),
+        mlx::core::take(tensor_or_throw(impl, "language_model.model.embed_tokens.scales"), token_ids, 0),
+        std::optional<array>(mlx::core::take(
+            tensor_or_throw(impl, "language_model.model.embed_tokens.biases"),
+            token_ids,
+            0)),
+        static_cast<int>(spec.group_size),
+        static_cast<int>(spec.bits),
+        "affine"));
+}
+
+array geglu(const array& gate, const array& x) {
+    constexpr float kTanhApprox = 0.7978845608028654f;
+    constexpr float kGeluCubic = 0.044715f;
+    const array gate_cubed = mlx::core::power(gate, model_scalar(3.0f));
+    const array gelu = model_scalar(0.5f) * gate *
+        (model_scalar(1.0f) + mlx::core::tanh(
+            model_scalar(kTanhApprox) * (gate + model_scalar(kGeluCubic) * gate_cubed)));
+    return model_dtype(gelu * x);
+}
+
+array proportional_rope_freqs(int head_dim, int rotated_dims, float base) {
+    const array exponents =
+        mlx::core::arange(0, rotated_dims, 2, mlx::core::float32) / static_cast<double>(head_dim);
+    const array rotated = mlx::core::power(array(base), exponents);
+    const int unrotated_pairs = (head_dim - rotated_dims) / 2;
+    if (unrotated_pairs <= 0) {
+        return rotated;
+    }
+    return mlx::core::concatenate(
+        {rotated, mlx::core::full({unrotated_pairs}, std::numeric_limits<float>::infinity(), mlx::core::float32)},
+        0);
+}
+
+array apply_rope(const array& x, bool full_attention, int head_dim, int offset) {
+    if (!full_attention) {
+        return mlx::core::fast::rope(
+            x,
+            head_dim,
+            false,
+            std::optional<float>(10000.0f),
+            1.0f,
+            offset);
+    }
+    const array freqs = proportional_rope_freqs(head_dim, static_cast<int>(head_dim * 0.25f), 1000000.0f);
+    return mlx::core::fast::rope(
+        x,
+        head_dim,
+        false,
+        std::nullopt,
+        1.0f,
+        offset,
+        std::optional<array>(freqs));
+}
+
+std::optional<array> sliding_causal_mask(int sequence_len, int window_size) {
+    if (sequence_len <= 1 || sequence_len <= window_size) {
+        return std::nullopt;
+    }
+    const array rinds = mlx::core::expand_dims(mlx::core::arange(sequence_len), 0);
+    const array linds = mlx::core::expand_dims(mlx::core::arange(sequence_len), 1);
+    return (linds >= rinds) && (linds < (rinds + window_size));
+}
+
+struct SharedKvArrays {
+    std::optional<array> full_attention_key;
+    std::optional<array> full_attention_value;
+    std::optional<array> sliding_attention_key;
+    std::optional<array> sliding_attention_value;
+};
+
+constexpr int kTargetLayerCount = 48;
+constexpr int kHiddenSize = 3840;
+constexpr int kSlidingWindowSize = 1024;
+constexpr uint64_t kBf16Bytes = 2;
+
+bool target_layer_full_attention(uint32_t layer_idx) {
+    return ((layer_idx + 1) % 6) == 0;
+}
+
+uint64_t estimate_target_kv_bytes(uint64_t sequence_len) {
+    const uint64_t full_layer_count = 8;
+    const uint64_t sliding_layer_count = kTargetLayerCount - full_layer_count;
+    const uint64_t sliding_len = std::min<uint64_t>(sequence_len, kSlidingWindowSize);
+    const uint64_t full_layer_bytes = sequence_len * 1 * 512 * kBf16Bytes * 2;
+    const uint64_t sliding_layer_bytes = sliding_len * 8 * 256 * kBf16Bytes * 2;
+    return full_layer_count * full_layer_bytes + sliding_layer_count * sliding_layer_bytes;
+}
+
+void store_target_layer_kv(
+    NativeKvState::Impl::Layer* layer,
+    bool full_attention,
+    const array& keys,
+    const array& values,
+    int sequence_len,
+    int n_kv_heads,
+    int head_dim) {
+    if (layer == nullptr) {
+        return;
+    }
+    layer->full_attention = full_attention;
+    if (full_attention || sequence_len <= kSlidingWindowSize) {
+        layer->key = keys;
+        layer->value = values;
+    } else {
+        const int start = sequence_len - kSlidingWindowSize;
+        layer->key = mlx::core::slice(keys, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
+        layer->value = mlx::core::slice(values, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
+    }
+    mlx::core::eval({*layer->key, *layer->value});
+}
+
+bool should_capture_shared_kv(uint32_t layer_idx, bool full_attention) {
+    if (full_attention) {
+        return layer_idx == 47;
+    }
+    return layer_idx == 46;
+}
+
+void capture_shared_kv(
+    SharedKvArrays* shared_kv,
+    uint32_t layer_idx,
+    bool full_attention,
+    const array& keys,
+    const array& values) {
+    if (shared_kv == nullptr || !should_capture_shared_kv(layer_idx, full_attention)) {
+        return;
+    }
+    if (full_attention) {
+        shared_kv->full_attention_key = keys;
+        shared_kv->full_attention_value = values;
+    } else {
+        shared_kv->sliding_attention_key = keys;
+        shared_kv->sliding_attention_value = values;
+    }
+}
+
+bool trace_layer0_detail_enabled();
+bool dump_selected_layer(uint32_t layer_idx);
+void trace_feature_stats(const char* label, const array& h, int sequence_len, int feature_dim, bool enabled);
+void trace_head_stats(const char* label, const array& h, int sequence_len, int head_dim, bool enabled);
+void dump_layer0_tensor(const char* label, const array& h);
+void dump_hidden_tensor(const char* label, const array& h);
+
+array attention_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    int sequence_len,
+    SharedKvArrays* shared_kv,
+    NativeKvState::Impl::Layer* target_kv = nullptr) {
+    const bool full_attention = target_layer_full_attention(layer_idx);
+    const int head_dim = full_attention ? 512 : 256;
+    const int n_heads = 16;
+    const int n_kv_heads = full_attention ? 1 : 8;
+    const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
+    const bool trace_layer0 = layer_idx == 0 && trace_layer0_detail_enabled();
+
+    array queries = quantized_linear(impl, x, base + ".self_attn.q_proj");
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("q_proj", queries);
+    }
+    trace_feature_stats("layer0.q_proj", queries, sequence_len, n_heads * head_dim, trace_layer0);
+    queries = mlx::core::reshape(queries, {1, sequence_len, n_heads, head_dim});
+    queries = model_dtype(mlx::core::fast::rms_norm(
+        queries,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.q_norm.weight")),
+        1e-6f));
+
+    array keys = quantized_linear(impl, x, base + ".self_attn.k_proj");
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("k_proj", keys);
+    }
+    trace_feature_stats("layer0.k_proj", keys, sequence_len, n_kv_heads * head_dim, trace_layer0);
+    keys = mlx::core::reshape(keys, {1, sequence_len, n_kv_heads, head_dim});
+    array values = keys;
+    if (!full_attention) {
+        values = quantized_linear(impl, x, base + ".self_attn.v_proj");
+        if (dump_selected_layer(layer_idx)) {
+            dump_layer0_tensor("v_proj", values);
+        }
+        trace_feature_stats("layer0.v_proj", values, sequence_len, n_kv_heads * head_dim, trace_layer0);
+        values = mlx::core::reshape(values, {1, sequence_len, n_kv_heads, head_dim});
+    }
+
+    keys = model_dtype(mlx::core::fast::rms_norm(
+        keys,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.k_norm.weight")),
+        1e-6f));
+    keys = mlx::core::transpose(keys, {0, 2, 1, 3});
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("k_norm", keys);
+    }
+    trace_head_stats("layer0.k_norm", keys, sequence_len, head_dim, trace_layer0);
+    keys = apply_rope(keys, full_attention, head_dim, 0);
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("k_rope", keys);
+    }
+    trace_head_stats("layer0.k_rope", keys, sequence_len, head_dim, trace_layer0);
+
+    values = model_dtype(mlx::core::fast::rms_norm(values, std::nullopt, 1e-6f));
+    values = mlx::core::transpose(values, {0, 2, 1, 3});
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("v_norm", values);
+    }
+    trace_head_stats("layer0.v_norm", values, sequence_len, head_dim, trace_layer0);
+
+    queries = mlx::core::transpose(queries, {0, 2, 1, 3});
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("q_norm", queries);
+    }
+    trace_head_stats("layer0.q_norm", queries, sequence_len, head_dim, trace_layer0);
+    queries = apply_rope(queries, full_attention, head_dim, 0);
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("q_rope", queries);
+    }
+    trace_head_stats("layer0.q_rope", queries, sequence_len, head_dim, trace_layer0);
+    capture_shared_kv(shared_kv, layer_idx, full_attention, keys, values);
+    store_target_layer_kv(target_kv, full_attention, keys, values, sequence_len, n_kv_heads, head_dim);
+
+    const std::optional<array> mask = full_attention ? std::nullopt : sliding_causal_mask(sequence_len, 1024);
+    const std::string mask_mode = sequence_len == 1 || mask.has_value() ? "" : "causal";
+    array output = mlx::core::fast::scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        1.0f,
+        mask_mode,
+        mask);
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("sdpa", output);
+    }
+    trace_head_stats("layer0.sdpa", output, sequence_len, head_dim, trace_layer0);
+    output = mlx::core::transpose(output, {0, 2, 1, 3});
+    output = mlx::core::reshape(output, {1, sequence_len, n_heads * head_dim});
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("attn_merge", output);
+    }
+    trace_feature_stats("layer0.attn_merge", output, sequence_len, n_heads * head_dim, trace_layer0);
+    array attn = quantized_linear(impl, output, base + ".self_attn.o_proj");
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("attn_out", attn);
+    }
+    return attn;
+}
+
+array layer_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    int sequence_len,
+    SharedKvArrays* shared_kv,
+    NativeKvState::Impl::Layer* target_kv = nullptr) {
+    const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
+    const array residual = x;
+    const bool trace_layer0 = layer_idx == 0 && trace_layer0_detail_enabled();
+
+    array h = model_dtype(mlx::core::fast::rms_norm(
+        x,
+        std::optional<array>(tensor_or_throw(impl, base + ".input_layernorm.weight")),
+        1e-6f));
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("input_norm", h);
+    }
+    trace_feature_stats("layer0.input_norm", h, sequence_len, 3840, trace_layer0);
+    h = attention_forward(impl, h, layer_idx, sequence_len, shared_kv, target_kv);
+    trace_feature_stats("layer0.attn_out", h, sequence_len, 3840, trace_layer0);
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
+        1e-6f));
+    trace_feature_stats("layer0.post_attn_norm", h, sequence_len, 3840, trace_layer0);
+    h = model_dtype(residual + h);
+    trace_feature_stats("layer0.attn_residual", h, sequence_len, 3840, trace_layer0);
+
+    const array mlp_residual = h;
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".pre_feedforward_layernorm.weight")),
+        1e-6f));
+    trace_feature_stats("layer0.pre_ff_norm", h, sequence_len, 3840, trace_layer0);
+    array gate = quantized_linear(impl, h, base + ".mlp.gate_proj");
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("gate_proj", gate);
+    }
+    trace_feature_stats("layer0.gate_proj", gate, sequence_len, 15360, trace_layer0);
+    array up = quantized_linear(impl, h, base + ".mlp.up_proj");
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("up_proj", up);
+    }
+    trace_feature_stats("layer0.up_proj", up, sequence_len, 15360, trace_layer0);
+    h = model_dtype(geglu(gate, up));
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("geglu", h);
+    }
+    trace_feature_stats("layer0.geglu", h, sequence_len, 15360, trace_layer0);
+    h = quantized_linear(impl, h, base + ".mlp.down_proj");
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("down_proj", h);
+    }
+    trace_feature_stats("layer0.down_proj", h, sequence_len, 3840, trace_layer0);
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_feedforward_layernorm.weight")),
+        1e-6f));
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("post_ff_norm", h);
+    }
+    trace_feature_stats("layer0.post_ff_norm", h, sequence_len, 3840, trace_layer0);
+    h = model_dtype(mlp_residual + h);
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("ff_residual", h);
+    }
+    trace_feature_stats("layer0.ff_residual", h, sequence_len, 3840, trace_layer0);
+
+    h = model_dtype(h * tensor_or_throw(impl, base + ".layer_scalar"));
+    if (dump_selected_layer(layer_idx)) {
+        dump_layer0_tensor("layer_scalar", h);
+    }
+    trace_feature_stats("layer0.layer_scalar", h, sequence_len, 3840, trace_layer0);
+    return h;
+}
+
+array target_attention_decode_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    uint64_t previous_sequence_len,
+    NativeKvState::Impl::Layer* target_kv,
+    SharedKvArrays* shared_kv) {
+    if (target_kv == nullptr || !target_kv->key.has_value() || !target_kv->value.has_value()) {
+        throw std::runtime_error("native incremental decode requires materialized per-layer KV state");
+    }
+    const bool full_attention = target_layer_full_attention(layer_idx);
+    const int head_dim = full_attention ? 512 : 256;
+    const int n_heads = 16;
+    const int n_kv_heads = full_attention ? 1 : 8;
+    const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
+
+    array queries = quantized_linear(impl, x, base + ".self_attn.q_proj");
+    queries = mlx::core::reshape(queries, {1, 1, n_heads, head_dim});
+    queries = model_dtype(mlx::core::fast::rms_norm(
+        queries,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.q_norm.weight")),
+        1e-6f));
+    queries = mlx::core::transpose(queries, {0, 2, 1, 3});
+    queries = apply_rope(queries, full
+
+## Final User Task
+
+Return only high-signal findings, grouped by correctness, memory, and benchmark validity.
+
+## Expected Output Style
+
+deep_code_review

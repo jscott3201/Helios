@@ -1,3 +1,92 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `long_repo_pack_16k_001`
+Family: `long_repo_pack`
+Target context tokens: `16384`
+Deterministic seed: `20260639`
+Source files: `AGENTS.md, BENCHMARKS.md, native/gemma4_mlx/src/native_model.cc, crates/gemma4d-server/src/http.rs, crates/gemma4d-bench/examples/p10_tui_live_console.rs`
+
+## Corpus Instruction
+
+Use the mixed repo context to identify the safest next benchmark goal. Separate runtime, server, TUI, and evidence-ledger concerns.
+
+## Repo Context
+
+
+## Source Round 1 for long_repo_pack_16k_001
+
+### BEGIN AGENTS.md
+# Gemma4D Codex Agent Instructions
+
+You are working on `gemma4d`, a Rust + MLX inference runtime for Gemma 4 12B on Apple Silicon.
+
+## Primary objective
+
+Implement the milestone currently selected by the user. Do not jump ahead unless the selected milestone explicitly requires a stub for a later one.
+
+## Hard constraints
+
+- Target Rust toolchain: `1.95.0` unless a later milestone intentionally changes it.
+- Target platform: macOS Apple Silicon.
+- Backend: MLX through a narrow C/C++ native boundary; Rust must not expose broad raw MLX internals.
+- Model scope: Gemma 4 12B first. Do not add broad multi-model abstractions unless a milestone requires a stable trait boundary.
+- First runtime path: text-only inference. Multimodal is deferred.
+- DiffusionGemma is out of scope for this package.
+- Optimize for a 16GB MacBook profile before expanding to larger machines.
+- Do not load arbitrary remote adapters or code from untrusted client requests.
+- TUI scope: Ratatui UI is a local operator console over provider/client APIs; do not call MLX/native execution directly from TUI MVP.
+
+## Implementation discipline
+
+1. Read the selected milestone file and its linked spec files.
+2. Use the matching `codex/goals/*.goal.md` goal contract when running a long task.
+3. Establish a baseline before changing performance-critical code.
+4. Preserve correctness before optimizing.
+5. Record exact commands and outputs for every benchmark/profiling claim.
+6. Keep generated artifacts in predictable paths under `target/`, `benchmarks/out/`, or `artifacts/`.
+7. Keep unsafe Rust and FFI isolated, documented, and tested.
+8. Prefer small reviewable commits/patches.
+
+## Subagent policy
+
+Use subagents for isolated research, verification, profiling, and review. Do not spawn subagents for simple edits.
+
+Recommended custom agents:
+
+- `codebase-mapper` — read-only exploration.
+- `external-researcher` — source/API/version research.
+- `mlx_ffi_engineer` — native MLX/C++/C ABI design and implementation.
+- `gemma4_correctness_reviewer` — tokenizer/config/logit/cache parity checks.
+- `mtp_kv_engineer` — MTP, KV rollback, prefix-cache design.
+- `adapter_runtime_engineer` — LoRA/QLoRA/aLoRA adapter import and routing.
+- `tui_ux_engineer` — Ratatui operator console design, event loop, provider boundary, terminal lifecycle, and UX review.
+- `performance-analyst` — benchmark/profiling and variance interpretation.
+- `test-verifier` — independent build/test/lint verification.
+- `security-reliability-reviewer` — unsafe/FFI, cache, adapter, server, and TUI terminal-state risk review.
+
+Subagents must return evidence, not opinions. Parent agent must synthesize and resolve conflicts.
+
+## Skills
+
+Use repo skills from `.agents/skills/`. Project-specific skills include:
+
+- `$gemma4d-rust-mlx-ffi`
+- `$gemma4d-model-correctness`
+- `$gemma4d-tui-operator-ux`
+- `$gemma4d-mtp-speculative-decoding`
+- `$gemma4d-kv-cache-offload`
+- `$gemma4d-dynamic-adapters`
+- `$gemma4d-16gb-mac-profiling`
+- `$gemma4d-milestone-execution`
+
+General review skills from the uploaded package remain available, especially `$performance-ab-benchmark-review`, `$spec-contract-compliance-review`, and `$release-readiness-review`.
+
+## Completion rule
+
+A milestone is complete only when the milestone's acceptance criteria are satisfied by concrete evidence: tests, benchmark output, generated artifacts, source diffs, or documented blockers. If blocked, stop with the attempted paths, evidence gathered, blocker, and next required input.
+### END AGENTS.md
+
+### BEGIN BENCHMARKS.md
 # Helios Benchmark Ledger
 
 This file tracks benchmark runs and measurement changes that matter for Helios
@@ -34,7 +123,6 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P09 real LoRA adapter hot path | Passed | `8723d50` | `native_lora_adapter_hot_path` | `benchmarks/out/P09-real-lora-adapter/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p09-1782857770747`; trusted local rank-16 q_proj/v_proj LoRA fixture loaded into real native inference, changed greedy-logit output, rejected wrong manifests, isolated adapter KV namespace, measured load/hotswap/residency, and disabled MTP while active. |
 | 2026-06-30 | P10 TUI live optimization console | Passed | `4ee1ccd` plus local P10 harness changes | `localhost_http_server_tui_provider_stub_backend` | `benchmarks/out/P10-tui-live-console/{tui-report.md,metrics.json,snapshots/}` | Command `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`; 18 snapshots, render p95 `1731 us` below `20000 us`, server health `ok`, latest benchmark report surfaced from the provider. |
 | 2026-06-30 | P11 model revision and manifest pinning | Passed | final SHA recorded in generated manifest | `manifest_capture_local_artifact_identity` | `benchmarks/out/P11-manifest-pinning/{manifest.json,report.md}` | Command `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; target and drafter revisions are explicitly pinned in `tiny16.toml` to local artifact SHA-256s because local revision metadata is unavailable. |
-| 2026-06-30 | XR00 real-context workload corpus | Passed | final SHA recorded in generated summary | `real_context_corpus_tokenizer_count_only` | `benchmarks/workloads/real-contexts/{workloads.jsonl,prompts/*.txt}` and `benchmarks/out/XR00-real-workload-corpus/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630`; no model execution or runtime optimization. |
 
 ## P00 Baseline Snapshot
 
@@ -353,24 +441,6 @@ artifact SHA-256 values instead.
 | Drafter safetensors inventory SHA-256 | `7a5d3a9eabd8ec983c4ef5139badf2da187a455133446be21b3c3dc0006b70bd` |
 | Versions | Rust `1.95.0`, MLX `0.31.2`, mlx-lm `0.31.3` |
 
-## XR00 Real-Context Corpus Snapshot
-
-XR00 creates deterministic repo-local prompt workloads for later A/B goals. It
-only generates prompts and token metadata; it does not run model inference.
-
-| Field | Value |
-|---|---|
-| Command | `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630` |
-| Workload manifest | `benchmarks/workloads/real-contexts/workloads.jsonl` |
-| Evidence | `benchmarks/out/XR00-real-workload-corpus/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
-| Workloads | `13` |
-| Families | `adapter_expert`, `benchmark_qa`, `chat_short`, `code_review_rust`, `long_repo_pack`, `mtp_candidate`, `prefix_reuse_edit`, `tool_json` |
-| Target context tokens | `1024`, `4096`, `8192`, `16384`, `24576` |
-| Actual context tokens | exact target match for every workload using `mlx_lm.utils.load_tokenizer:TokenizerWrapper` |
-| Seed base | `20260630`; per-record seeds `20260630` through `20260642` |
-| Decision | `accept_candidate` |
-| Blockers | none recorded |
-
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -390,126 +460,12 @@ only generates prompts and token metadata; it does not run model inference.
 | 2026-06-30 | Added P06 real RAM prefix-cache benchmark harness and goal contract. The harness validates namespace-gated restore, imports real native snapshots, compares restored last-step and continued decode parity, and records warm TTFT/cache accounting for 4K/8K/16K. | `crates/gemma4d-bench/examples/p06_real_ram_prefix_cache.rs`, `codex/goals/P06-real-ram-prefix-cache.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p06_real_ram_prefix_cache -- --out-dir benchmarks/out/P06-real-ram-prefix-cache --model-path artifacts/models/gemma-4-12B-it-4bit`. |
 | 2026-06-30 | Added native SSD KV snapshot payload save/load through the narrow C ABI using safetensors-compatible files and safe Rust `KvSnapshot` wrappers. The payload path is failure-closed for non-MLX builds. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P07 benchmark run. |
 | 2026-06-30 | Added P07 real SSD prefix-cache benchmark harness and goal contract. The harness writes SSD metadata plus real native safetensors payloads, restores before prefill only, verifies restored last-step and continued decode parity, records IO/latency metrics, and exercises namespace, corruption, and mid-decode rejection paths. | `crates/gemma4d-bench/examples/p07_real_ssd_prefix_cache.rs`, `codex/goals/P07-real-ssd-prefix-cache.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `make verify`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p07_real_ssd_prefix_cache -- --out-dir benchmarks/out/P07-real-ssd-prefix-cache --cache-dir benchmarks/out/P07-real-ssd-prefix-cache/ssd-cache --model-path artifacts/models/gemma-4-12B-it-4bit`. |
-| 2026-06-30 | Added native compressed KV snapshot payload save through the narrow C ABI. The writer applies MLX affine q8 or packed q4 to selected KV tensors, records per-tensor min/scale metadata, keeps hidden/sliding tensors BF16 for P08 full-attention-only mode, and transparently reconstructs BF16 tensors on snapshot load. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P08 benchmark run. |
-| 2026-06-30 | Added P08 real KV compression benchmark harness and goal contract. The harness compares BF16/q8/q4 real native prefix payloads at 4K/8K/16K, records payload memory reduction, warm restore latency, continued-decode greedy agreement/logit delta, active KV memory, and Planar/Iso disabled status. | `crates/gemma4d-bench/examples/p08_kv_compression.rs`, `codex/goals/P08-kv-compression.goal.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit`. |
-| 2026-06-30 | Added native PEFT LoRA adapter load/activate/clear/free through the narrow C ABI and safe Rust wrappers. The native graph applies active LoRA deltas inside target `quantized_linear`, shape-validates adapter A/B tensors against loaded Gemma 4 weights, and fails MTP closed while an adapter is active. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P09 benchmark run. |
-| 2026-06-30 | Added P09 real LoRA adapter benchmark harness and goal contract. The harness creates a trusted local deterministic rank-16 adapter fixture with real Gemma 4 q_proj/v_proj shapes, imports it through the adapter registry, runs base/adapter/post-clear native generation, records load/hotswap/residency latency, checks manifest rejection, KV namespace isolation, and MTP-disabled behavior. | `crates/gemma4d-bench/examples/p09_real_lora_adapter.rs`, `codex/goals/P09-real-lora-adapter-hot-path.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p09_real_lora_adapter -- --out-dir benchmarks/out/P09-real-lora-adapter --model-path artifacts/models/gemma-4-12B-it-4bit`. |
-| 2026-06-30 | Added P10 TUI live optimization console metrics, report writer, and benchmark harness. The TUI parses provider-only HTTP metrics for load/prefill/decode timing, throughput, memory, cache, MTP, adapters, server health, and latest benchmark report; the harness starts a localhost server and writes `tui-report.md`, `metrics.json`, and snapshots. | `crates/gemma4d-tui/src/{app.rs,provider.rs,ui.rs,lib.rs}`, `crates/gemma4d-tui/tests/m05_acceptance.rs`, `crates/gemma4d-bench/examples/p10_tui_live_console.rs`, `crates/gemma4d-bench/Cargo.toml` | `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`. |
-| 2026-06-30 | Added `gemma4d-bench manifest`, reusable manifest capture structs, SHA-256 model identity in generic benchmark reports, P00 local artifact identity fields, and config validation that accepts local-artifact pins while warning on `PIN_ME` or unavailable revisions. | `crates/gemma4d-bench/src/manifest.rs`, `crates/gemma4d-bench/src/lib.rs`, `crates/gemma4d-bench/examples/p00_performance_baseline.rs`, `crates/gemma4d-tui/src/config.rs`, `references/configs/tiny16.toml`, `references/templates/benchmark-report.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets --no-run`; `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; `make verify`. |
-| 2026-06-30 | Added XR00 real-context workload corpus generation: copied XR methodology docs/goal into root paths, added `gemma4d-bench workload-corpus`, generated deterministic prompt files and `workloads.jsonl`, and wrote XR00 decision/evidence artifacts. | `docs/xr-*.md`, `codex/goals/XR00-real-workload-corpus.goal.md`, `crates/gemma4d-bench/src/workload_corpus.rs`, `crates/gemma4d-bench/src/lib.rs`, `benchmarks/workloads/real-contexts/` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630`. |
+| 2026-06-30 | Added native compressed KV snapshot payload save through the narrow C ABI. The writer applies MLX affine q8 or packed q4 to selected KV tensors, records per-tensor min/scale metadata, keeps hidden/sliding tensors BF16 for P08 full-attention-only mode, and transparently reconstructs BF16 tensors on snapshot load. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets`; `GEMMA4D_REQUIRE_ML
 
-## Verification Gates
+## Final User Task
 
-| Date | Command | Status | Notes |
-|---|---|---|---|
-| 2026-06-30 | `cargo test -p gemma4d-server -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for changed server and benchmark code. |
-| 2026-06-30 | `cargo run -p gemma4d-bench --example p00_performance_baseline -- --out-dir benchmarks/out/P00-performance-baseline --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Wrote P00 records, summary, report, and blocker report. |
-| 2026-06-30 | `cargo run -p gemma4d-bench --example m12_real_tiny16_matrix -- --out-dir benchmarks/out/M12/real-matrix --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Confirms existing M12 matrix still runs after P00 JSON additions. |
-| 2026-06-30 | `cargo run -p gemma4d-bench --example p01_persistent_helper_session -- --out-dir benchmarks/out/P01-persistent-helper-session --model-path artifacts/models/gemma-4-12B-it-4bit --cold-records benchmarks/out/M12/real-matrix/records.jsonl` | Passed | Wrote warm-session records, summary, report, and blocker report. |
-| 2026-06-30 | `make verify` | Passed | Sandboxed attempt failed at localhost bind with `Operation not permitted`; escalated rerun passed. |
-| 2026-06-30 | `cargo test -p gemma4d-server -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P02 server and benchmark changes. |
-| 2026-06-30 | `cargo run -p gemma4d-bench --example p02_real_server_inference -- --out-dir benchmarks/out/P02-real-server-inference --model-path artifacts/models/gemma-4-12B-it-4bit --p01-summary benchmarks/out/P01-persistent-helper-session/summary.json` | Passed | Wrote P02 records, summary, report, blocker report, and curl fixtures. |
-| 2026-06-30 | `curl -sS -i -X POST http://127.0.0.1:18082/v1/chat/completions ... "max_tokens":8` | Passed | Non-streaming smoke returned HTTP 200, `object:"chat.completion"`, `gemma4d_metrics`, and usage `prompt_tokens=11`, `completion_tokens=8`. Required escalated local networking after sandboxed curl could not connect. |
-| 2026-06-30 | `curl -sS -i -N -X POST http://127.0.0.1:18082/v1/chat/completions ... "stream":true` | Passed | Streaming smoke returned HTTP 200 `text/event-stream`, content chunk, stop chunk, and `data: [DONE]`. Required escalated local networking after sandboxed curl could not connect. |
-| 2026-06-30 | `curl -sS http://127.0.0.1:18082/metrics` | Passed | Metrics after two real smoke generations showed `gemma4d_model_load_seconds 3.090923`, `gemma4d_prefill_tokens_total 22`, `gemma4d_decode_tokens_total 16`, and non-zero RSS/peak MLX memory counters. |
-| 2026-06-30 | `make verify` | Passed | Sandboxed rerun reached tests but failed at localhost bind with `Operation not permitted`; escalated rerun passed. |
-| 2026-06-30 | `cargo test -p gemma4d-server -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P03 diagnostic JSON and benchmark harness. |
-| 2026-06-30 | `cargo run -p gemma4d-bench --example p03_native_graph_triage -- --out-dir benchmarks/out/P03-native-graph-triage --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Wrote P03 records, summary, report, and blocker report; no blockers recorded. |
-| 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed. |
-| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P04 native KV and benchmark changes. |
-| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-server -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P04 FFI/server metrics and benchmark harness. |
-| 2026-06-30 | `cargo run -p gemma4d-bench --example p04_incremental_native_kv -- --out-dir benchmarks/out/P04-incremental-native-kv --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P04 records, summary, report, and blocker report with no blockers. |
-| 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed. |
-| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P05 FFI and benchmark changes. |
-| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P05 FFI committed-token metadata and benchmark harness. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p05_native_mtp -- --out-dir benchmarks/out/P05-native-mtp --model-path artifacts/models/gemma-4-12B-it-4bit --assistant-model-path artifacts/models/gemma-4-12B-it-qat-assistant-4bit` | Passed | Required escalated Metal access; wrote P05 records, summary, report, and blocker report with no blockers. |
-| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P06 native snapshot ABI and benchmark changes. |
-| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P06 FFI wrappers and benchmark harness. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p06_real_ram_prefix_cache -- --out-dir benchmarks/out/P06-real-ram-prefix-cache --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P06 records, summary, report, and blocker report with no blockers at clean SHA `e5e61ad`. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_FULL_MODEL_TESTS=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo test -p gemma4d-ffi native_graph_prefills_one_token_when_explicitly_enabled -- --nocapture` | Passed | Required escalated Metal access; covers real native target/assistant FFI path and committed-token metadata assertions. |
-| 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed. |
-| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P08 compressed snapshot API and benchmark changes. |
-| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P08 FFI wrappers and benchmark harness. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Required MLX build gate for compressed native snapshot payload API. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P08 records, summary, report, and blocker report with no blockers at clean SHA `5993b86`. |
-| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P09 native adapter ABI and benchmark changes. |
-| 2026-06-30 | `cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Focused FFI compile gate for native adapter load/activate/clear wrappers. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Required MLX build gate for native LoRA adapter loading and delta application code. |
-| 2026-06-30 | `cargo test -p gemma4d-bench --all-targets --no-run` | Passed | Focused compile coverage for the P09 benchmark harness and adapter-registry dependency. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p09_real_lora_adapter -- --out-dir benchmarks/out/P09-real-lora-adapter --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P09 records, summary, report, and blocker report with no blockers at clean SHA `8723d50`. |
-| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused post-P09 test coverage for FFI wrappers and benchmark harness after ledger update. |
-| 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed after P09 changes. |
-| 2026-06-30 | `cargo test -p gemma4d-tui --all-targets` | Passed | Focused P10 TUI coverage for live HTTP metrics, required page snapshots, render p95 reporting, and terminal lifecycle tests. |
-| 2026-06-30 | `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console` | Passed | Spawned localhost server, drove the TUI over `HttpProvider`, wrote `tui-report.md`, `metrics.json`, and 18 snapshots; render p95 `1731 us` under `20000 us`. |
-| 2026-06-30 | `cargo test -p gemma4d-bench --lib` | Passed | Unit coverage for manifest CLI parsing and generic benchmark report manifest identity rendering. |
-| 2026-06-30 | `cargo test -p gemma4d-bench --all-targets --no-run` | Passed | Compile coverage for benchmark examples after the manifest module and dependency changes. |
-| 2026-06-30 | `cargo test -p gemma4d-tui --all-targets` | Passed | Config validation coverage for local-artifact pins and `PIN_ME` warning behavior. |
-| 2026-06-30 | `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning` | Passed | Wrote manifest and report with target/drafter hashes, safetensor inventories, Rust/MLX/mlx-lm versions, git SHA, and machine summary. |
-| 2026-06-30 | `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630` | Passed | Wrote 13 workload records, prompt files, and XR00 evidence artifacts; local tokenizer measured exact 1K/4K/8K/16K/24K context lengths with no blockers. |
+Return a short implementation plan with non-goals and verification gates.
 
-## Current Claim Boundaries
+## Expected Output Style
 
-- M12 and P00 broad throughput claims are helper-backed through the Rust C ABI
-  and MLX-LM helper.
-- The hand-written native Gemma 4 graph remains opt-in and is not represented by
-  M12 or P00 helper-backed throughput numbers.
-- `mlx_active_memory_gb` and `mlx_cache_memory_gb` are tracked as nullable P00
-  fields until the helper/native boundary exposes those measurements.
-- P02 real-helper server inference is opt-in. The default server backend remains
-  the M11 stub, and P02 does not apply adapters or MTP on the real server path.
-- P02 server benchmark measurements include HTTP route overhead but still pay
-  model load per request. They should not be interpreted as persistent
-  server-session latency until a later goal keeps a loaded target inside the
-  server runtime.
-- P03 confirms native graph parity only for the tokenizer-controlled probes in
-  the P03 report. It does not justify switching defaults, server use, adapter
-  use, MTP use, or unmeasured prompt/context shapes.
-- P03 native RSS is not yet measured; native memory claims rely on MLX peak
-  memory until native RSS reporting is added.
-- P04 confirms incremental native KV decode only for text-only greedy probes in
-  the P04 report. The native graph remains opt-in; helper/default fallback
-  remains available.
-- P04 steady-state decode growth excludes the first four native decode_one
-  samples to separate MLX/JIT/cache warmup from sustained decode latency. Raw
-  samples remain in `records.jsonl` and `summary.json`.
-- P04 long-context greedy-logit deltas are diagnostic because generated token
-  IDs matched helper outputs. They should not be used as proof of broad
-  numerical parity outside the measured probes.
-- P05 proves real native MTP correctness only for the measured text-only greedy
-  probes and block sizes `1` and `2`.
-- P05 does not justify enabling MTP by default: the measured assistant acceptance
-  rate was `0.000`, and the benchmark recommends `keep_disabled_by_default`.
-- P05 excludes adapter-active MTP, compressed active KV, and sampling MTP.
-- P06 proves RAM-only native snapshot restore for measured 4K/8K/16K
-  text-only greedy prefixes. It does not prove SSD payload persistence,
-  adapter-active snapshot reuse, compressed active KV, server integration, or
-  sampling behavior.
-- P06 warm TTFT measures namespace restore plus native snapshot import and
-  cached last-step retrieval. Snapshot export cost is reported separately and is
-  paid when the prefix is first cached, not on the warm restore path.
-- P07 proves SSD-backed native snapshot payload restore only before prefill for
-  the measured 4K/8K/16K text-only greedy prefixes. SSD remains disabled by
-  default pending broader variance data.
-- P08 proves q8/q4 prefix-payload compression only for full-attention KV tensors
-  restored back into BF16 active decode state. It does not enable compressed
-  active decode; q4 failed greedy agreement in the measured run.
-- P09 proves one trusted local deterministic rank-16 PEFT LoRA adapter fixture
-  on the opt-in native graph. It does not enable remote adapter loading, aLoRA,
-  adapter fusion, default server adapter routing, or adapter-active MTP.
-- P09 adapter output evidence is a greedy-logit delta on the measured 128-token
-  deterministic prompt; generated token IDs did not differ in the final default
-  run, though the shorter smoke run changed the prefill greedy token.
-- P10 validates the TUI live optimization console against a localhost HTTP
-  server with the stub backend. It is a provider/API and render-latency claim,
-  not a native model throughput claim.
-- P10 render latency is for deterministic 120x40 snapshot rendering in the
-  artifact run. It does not measure interactive terminal overhead or long-running
-  operator sessions.
-- P11 records local artifact identity because the local downloaded model
-  directories do not include upstream revision metadata. The target and drafter
-  are pinned by `local-artifact-sha256:*` values in `tiny16.toml`; this is
-  reproducible for the local artifact set but is not a claim about an upstream
-  Hugging Face commit.
-- XR00 is a corpus and token-metadata claim only. It does not execute Gemma 4
-  inference, measure latency, compare backends, enable MTP, enable cache
-  policies, or optimize runtime code.
+long_context_project_synthesis

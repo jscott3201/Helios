@@ -1,0 +1,420 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `mtp_candidate_4k_001`
+Family: `mtp_candidate`
+Target context tokens: `4096`
+Deterministic seed: `20260642`
+Source files: `crates/gemma4d-bench/examples/p05_native_mtp.rs, docs/xr-current-state-review.md`
+
+## Corpus Instruction
+
+Use the MTP benchmark code and XR state review to design trace evidence before proposing fixes.
+
+## Repo Context
+
+
+## Source Round 1 for mtp_candidate_4k_001
+
+### BEGIN crates/gemma4d-bench/examples/p05_native_mtp.rs
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    io::Write,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use gemma4d_ffi::{
+    Drafter, KvCache, KvPolicy, LoadConfig, StepResult, Target, decode_one, draft_block, prefill,
+    verify_tokens,
+};
+use serde::Serialize;
+
+const DEFAULT_MODEL: &str = "artifacts/models/gemma-4-12B-it-4bit";
+const DEFAULT_ASSISTANT_MODEL: &str = "artifacts/models/gemma-4-12B-it-qat-assistant-4bit";
+const DEFAULT_OUT_DIR: &str = "benchmarks/out/P05-native-mtp";
+const MODE: &str = "native_target_and_native_mtp_ffi";
+const MIN_ACCEPTANCE_RATE: f64 = 0.35;
+const MEMORY_CLIFF_GB: f64 = 14.0;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse()?;
+    fs::create_dir_all(&args.out_dir)?;
+
+    let run_id = run_id();
+    let records_path = args.out_dir.join("records.jsonl");
+    let summary_path = args.out_dir.join("summary.json");
+    let report_path = args.out_dir.join("report.md");
+    let blockers_path = args.out_dir.join("blockers.md");
+    let environment = capture_environment();
+    let probes = probes(args.max_new_tokens);
+    let mut records = Vec::new();
+    let mut blockers = startup_blockers(&args);
+
+    if blockers.is_empty() {
+        for probe in &probes {
+            let baseline = run_baseline(&args, probe)?;
+            for block_size in &args.block_sizes {
+                records.push(run_record(
+                    &args,
+                    &run_id,
+                    probe,
+                    *block_size,
+                    baseline.clone(),
+                )?);
+            }
+        }
+    }
+
+    blockers.extend(blockers_for_records(&records));
+    let status = if blockers.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    };
+    let default_recommendation = default_recommendation(&records);
+
+    let summary = P05Summary {
+        schema_version: 1,
+        goal: "P05-native-mtp",
+        status,
+        run_id,
+        timestamp_unix: unix_now(),
+        mode: MODE,
+        model_path: args.model_path.display().to_string(),
+        assistant_model_path: args.assistant_model_path.display().to_string(),
+        records_path: records_path.display().to_string(),
+        summary_path: summary_path.display().to_string(),
+        report_path: report_path.display().to_string(),
+        blockers_path: blockers_path.display().to_string(),
+        environment,
+        relevant_environment: capture_relevant_environment(),
+        max_context_tokens: args.max_context_tokens,
+        block_sizes: args.block_sizes.clone(),
+        min_acceptance_rate: MIN_ACCEPTANCE_RATE,
+        memory_cliff_gb: MEMORY_CLIFF_GB,
+        default_recommendation,
+        claims: claim_inventory(&records),
+        records,
+        blockers,
+        measurement_notes: vec![
+            "This harness requires GEMMA4D_REQUIRE_MLX=1 at build time and GEMMA4D_USE_NATIVE_GRAPH=1 at runtime.",
+            "Baseline and MTP runs both use gemma4d-ffi safe wrappers over the native C ABI.",
+            "MTP runs load the real Gemma 4 assistant artifact through Drafter::load and draft through gemma4_mtp_draft_block.",
+            "Verification and rollback use gemma4_verify_tokens; emitted tokens are reconstructed from committed-token metadata returned by the verifier.",
+            "If acceptance or memory gates fail, the harness auto-disables MTP for the rest of that run and fills the tail with native non-MTP decode_one.",
+            "Peak memory is the maximum peak_memory_gb surfaced by native target prefill/decode/verify StepResult values.",
+        ],
+    };
+
+    write_jsonl(&records_path, &summary.records)?;
+    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+    fs::write(&report_path, render_report(&summary))?;
+    fs::write(&blockers_path, render_blockers(&summary))?;
+
+    println!("P05 native MTP: {}", summary.status);
+    println!("records: {}", records_path.display());
+    println!("summary: {}", summary_path.display());
+    println!("report: {}", report_path.display());
+    println!("blockers: {}", blockers_path.display());
+
+    if summary.status == "failed" {
+        Err("P05 native MTP checks failed".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Args {
+    out_dir: PathBuf,
+    model_path: PathBuf,
+    assistant_model_path: PathBuf,
+    max_context_tokens: usize,
+    max_new_tokens: usize,
+    block_sizes: Vec<usize>,
+}
+
+impl Args {
+    fn parse() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut out_dir = PathBuf::from(DEFAULT_OUT_DIR);
+        let mut model_path = PathBuf::from(DEFAULT_MODEL);
+        let mut assistant_model_path = PathBuf::from(DEFAULT_ASSISTANT_MODEL);
+        let mut max_context_tokens = 8192;
+        let mut max_new_tokens = 8;
+        let mut block_sizes = vec![1, 2];
+
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--out-dir" => {
+                    out_dir = args
+                        .next()
+                        .map(PathBuf::from)
+                        .ok_or("--out-dir requires a path")?;
+                }
+                "--model-path" => {
+                    model_path = args
+                        .next()
+                        .map(PathBuf::from)
+                        .ok_or("--model-path requires a path")?;
+                }
+                "--assistant-model-path" => {
+                    assistant_model_path = args
+                        .next()
+                        .map(PathBuf::from)
+                        .ok_or("--assistant-model-path requires a path")?;
+                }
+                "--max-context-tokens" => {
+                    let value = args.next().ok_or("--max-context-tokens requires a value")?;
+                    max_context_tokens = parse_positive_usize(&value, "--max-context-tokens")?;
+                }
+                "--max-new-tokens" => {
+                    let value = args.next().ok_or("--max-new-tokens requires a value")?;
+                    max_new_tokens = parse_positive_usize(&value, "--max-new-tokens")?;
+                }
+                "--block-sizes" => {
+                    let value = args.next().ok_or("--block-sizes requires a comma list")?;
+                    block_sizes = parse_contexts(&value)?;
+                }
+                "-h" | "--help" => {
+                    println!(
+                        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p05_native_mtp -- [--out-dir PATH] [--model-path PATH] [--assistant-model-path PATH] [--max-new-tokens N] [--block-sizes 1,2]"
+                    );
+                    std::process::exit(0);
+                }
+                other => return Err(format!("unknown option '{other}'").into()),
+            }
+        }
+
+        if block_sizes.is_empty() {
+            return Err("--block-sizes must include at least one value".into());
+        }
+        block_sizes.sort_unstable();
+        block_sizes.dedup();
+        if block_sizes.iter().any(|size| *size > 2) {
+            return Err("P05 native MTP currently supports --block-sizes up to 2".into());
+        }
+
+        Ok(Self {
+            out_dir,
+            model_path,
+            assistant_model_path,
+            max_context_tokens,
+            max_new_tokens,
+            block_sizes,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Probe {
+    id: &'static str,
+    description: &'static str,
+    prompt_tokens: Vec<i32>,
+    max_new_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct P05Summary {
+    schema_version: u32,
+    goal: &'static str,
+    status: &'static str,
+    run_id: String,
+    timestamp_unix: u64,
+    mode: &'static str,
+    model_path: String,
+    assistant_model_path: String,
+    records_path: String,
+    summary_path: String,
+    report_path: String,
+    blockers_path: String,
+    environment: Environment,
+    relevant_environment: BTreeMap<String, Option<String>>,
+    max_context_tokens: usize,
+    block_sizes: Vec<usize>,
+    min_acceptance_rate: f64,
+    memory_cliff_gb: f64,
+    default_recommendation: String,
+    claims: ClaimInventory,
+    records: Vec<P05Record>,
+    blockers: Vec<String>,
+    measurement_notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct P05Record {
+    schema_version: u32,
+    goal: &'static str,
+    run_id: String,
+    timestamp_unix: u64,
+    probe_id: String,
+    description: String,
+    prompt_tokens: Vec<i32>,
+    max_new_tokens: usize,
+    block_size: usize,
+    mode: &'static str,
+    baseline: NativeGreedyRun,
+    mtp: NativeMtpRun,
+    comparison: Comparison,
+    gate: GateOutcome,
+    blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NativeGreedyRun {
+    generated_tokens: Vec<i32>,
+    model_load_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    total_ms: f64,
+    decode_tps: f64,
+    peak_memory_gb: f32,
+    active_kv_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NativeMtpRun {
+    generated_tokens: Vec<i32>,
+    model_load_ms: f64,
+    drafter_load_ms: f64,
+    prefill_ms: f64,
+    draft_ms: f64,
+    verify_ms: f64,
+    fallback_decode_ms: f64,
+    total_ms: f64,
+    decode_tps: f64,
+    draft_block_size: usize,
+    attempted_draft_tokens: u64,
+    accepted_draft_tokens: u64,
+    acceptance_rate: f64,
+    accepted_tokens_per_verify: f64,
+    target_verify_passes: u64,
+    rollback_count: u64,
+    auto_disabled: bool,
+    auto_disable_reason: Option<String>,
+    peak_memory_gb: f32,
+    active_kv_bytes: u64,
+    events: Vec<MtpEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MtpEvent {
+    pass_index: u64,
+    draft_tokens: Vec<i32>,
+    committed_tokens: Vec<i32>,
+    accepted_draft_count: u32,
+    rejected: bool,
+    sequence_len: u64,
+    verify_ms: f64,
+    peak_memory_gb: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Comparison {
+    byte_identical: bool,
+    first_mismatch: Option<TokenMismatch>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TokenMismatch {
+    index: usize,
+    baseline_token: Option<i32>,
+    mtp_token: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GateOutcome {
+    correctness_passed: bool,
+    acceptance_gate_passed: bool,
+    memory_gate_passed: bool,
+    default_enabled: bool,
+    recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClaimInventory {
+    exactness: Vec<String>,
+    acceptance: Vec<String>,
+    speed: Vec<String>,
+    memory: Vec<String>,
+    auto_disable: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Environment {
+    machine: String,
+    macos: String,
+    rustc: String,
+    cargo: String,
+    mlx_version: String,
+    git_commit: String,
+    git_status_short: String,
+    hw_memsize_bytes: Option<u64>,
+}
+
+fn probes(max_new_tokens: usize) -> Vec<Probe> {
+    vec![
+        Probe {
+            id: "hello_smoke",
+            description: "M04 tokenizer-controlled Hello prompt.",
+            prompt_tokens: vec![9259],
+            max_new_tokens,
+        },
+        Probe {
+            id: "hello_reference_prefix",
+            description: "Hello plus two reference target tokens.",
+            prompt_tokens: vec![9259, 236772, 236772],
+            max_new_tokens,
+        },
+    ]
+}
+
+fn startup_blockers(args: &Args) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !args.model_path.exists() {
+        blockers.push(format!(
+            "target model path does not exist: {}",
+            args.model_path.display()
+        ));
+    }
+    if !args.assistant_model_path.exists() {
+        blockers.push(format!(
+            "assistant model path does not exist: {}",
+            args.assistant_model_path.display()
+        ));
+    }
+    if env::var_os("GEMMA4D_USE_NATIVE_GRAPH").is_none() {
+        blockers.push("GEMMA4D_USE_NATIVE_GRAPH=1 is required for P05 native MTP".to_owned());
+    }
+    if env::var_os("GEMMA4D_REQUIRE_MLX").is_none() {
+        blockers
+            .push("GEMMA4D_REQUIRE_MLX=1 is required so gemma4d-ffi builds with MLX".to_owned());
+    }
+    blockers
+}
+
+fn run_record(
+    args: &Args,
+    run_id: &str,
+    probe: &Probe,
+    block_size: usize,
+    baseline: NativeGreedyRun,
+) -> Result<P05Record, Box<dyn std::error::Error>> {
+    let mtp = run_mtp(args, probe, block_size)?;
+    let comparison = compare_tokens(&baseline.generated_tokens, &mtp.generated_tokens);
+    let gate = gate_outcome(&comparison, &mtp);
+    let mut blockers = Vec::new();
+    if !comparison.byte_identical {
+        blockers.push(format!(
+            "{} block_size={} native MTP
+
+## Final User Task
+
+Return a trace plan with fields draft_token, target_token, accepted_count, rollback, verify_latency, and suspected_root_cause.
+
+## Expected Output Style
+
+mtp_trace_plan

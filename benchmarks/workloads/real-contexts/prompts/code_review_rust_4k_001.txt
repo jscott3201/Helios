@@ -1,0 +1,332 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `code_review_rust_4k_001`
+Family: `code_review_rust`
+Target context tokens: `4096`
+Deterministic seed: `20260631`
+Source files: `native/gemma4_mlx/src/runtime.cc, crates/gemma4d-ffi/src/lib.rs`
+
+## Corpus Instruction
+
+Review the Rust/C++ FFI boundary for correctness risks. Focus on ownership, failure-closed behavior, and whether broad raw MLX internals leak into Rust.
+
+## Repo Context
+
+
+## Source Round 1 for code_review_rust_4k_001
+
+### BEGIN native/gemma4_mlx/src/runtime.cc
+#include "gemma4_mlx.h"
+#include "model_manifest.h"
+#include "native_model.h"
+
+#include <cstdlib>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <cerrno>
+#include <filesystem>
+#include <memory>
+#include <new>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifdef GEMMA4D_MLX_AVAILABLE
+#include <mlx/version.h>
+#endif
+
+#define GEMMA4D_STRINGIFY_DETAIL(value) #value
+#define GEMMA4D_STRINGIFY(value) GEMMA4D_STRINGIFY_DETAIL(value)
+
+#ifndef GEMMA4D_MLX_LM_HELPER_PATH
+#define GEMMA4D_MLX_LM_HELPER_PATH "native/gemma4_mlx/scripts/gemma4d_mlx_lm_helper.py"
+#endif
+
+#ifndef GEMMA4D_MLX_LM_PYTHON
+#define GEMMA4D_MLX_LM_PYTHON "/opt/homebrew/opt/mlx-lm/libexec/bin/python"
+#endif
+
+namespace {
+
+constexpr uint64_t kTargetMagic = 0x47454d3444415447ULL;
+constexpr uint64_t kDrafterMagic = 0x47454d3444524146ULL;
+constexpr uint64_t kKvCacheMagic = 0x47454d344b564347ULL;
+constexpr uint64_t kKvSnapshotMagic = 0x47454d344b565347ULL;
+constexpr uint64_t kAdapterMagic = 0x47454d3441445054ULL;
+thread_local char g_last_error[512] = "";
+
+#ifdef GEMMA4D_MLX_AVAILABLE
+constexpr const char* kBackendVersion =
+    "m03-mlx-build-gated-mlx-" GEMMA4D_STRINGIFY(MLX_VERSION_MAJOR) "." GEMMA4D_STRINGIFY(
+        MLX_VERSION_MINOR) "." GEMMA4D_STRINGIFY(MLX_VERSION_PATCH);
+#else
+constexpr const char* kBackendVersion = "m03-smoke-no-mlx";
+#endif
+
+struct NativeTarget {
+    uint64_t magic;
+    bool model_loaded;
+    bool use_native_graph;
+    uint64_t sequence_len;
+    gemma4d::Gemma4ModelManifest manifest;
+    std::unique_ptr<gemma4d::NativeTextModel> native_model;
+    pid_t helper_pid;
+    FILE* helper_in;
+    FILE* helper_out;
+};
+
+struct NativeKvCache {
+    uint64_t magic;
+    Gemma4KvPolicy policy;
+    std::vector<int32_t> native_tokens;
+    std::unique_ptr<gemma4d::NativeKvState> native_kv_state;
+    std::unique_ptr<gemma4d::NativeHiddenState> last_hidden;
+    bool has_last_step;
+    Gemma4StepResult last_step;
+};
+
+struct NativeKvSnapshot {
+    uint64_t magic;
+    Gemma4KvPolicy policy;
+    std::vector<int32_t> native_tokens;
+    std::unique_ptr<gemma4d::NativeKvState> native_kv_state;
+    std::unique_ptr<gemma4d::NativeHiddenState> last_hidden;
+    bool has_last_step;
+    Gemma4StepResult last_step;
+};
+
+struct NativeDrafter {
+    uint64_t magic;
+    bool model_loaded;
+    std::string model_path;
+    gemma4d::Gemma4ModelManifest manifest;
+    const gemma4d::NativeTextModel* target_native_model;
+    std::unique_ptr<gemma4d::NativeMtpAssistantModel> native_model;
+};
+
+struct NativeAdapter {
+    uint64_t magic;
+    std::shared_ptr<const gemma4d::NativeLoraAdapter> native_adapter;
+    uint64_t load_latency_us;
+};
+
+void store_error(const char* message) {
+    std::snprintf(g_last_error, sizeof(g_last_error), "%s", message ? message : "unknown native error");
+}
+
+Gemma4Status fail(Gemma4Status status, const char* message) {
+    store_error(message);
+    return status;
+}
+
+Gemma4Status fail(Gemma4Status status, const std::string& message) {
+    store_error(message.c_str());
+    return status;
+}
+
+Gemma4Status ok() {
+    g_last_error[0] = '\0';
+    return GEMMA4_OK;
+}
+
+bool is_empty(const char* value) {
+    return value == nullptr || value[0] == '\0';
+}
+
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+        std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0 &&
+        std::strcmp(value, "OFF") != 0;
+}
+
+void clear_step_result(Gemma4StepResult* out) {
+    if (out != nullptr) {
+        std::memset(out, 0, sizeof(Gemma4StepResult));
+    }
+}
+
+bool same_kv_policy(const Gemma4KvPolicy& left, const Gemma4KvPolicy& right) {
+    return left.active_mode == right.active_mode && left.ram_prefix_mode == right.ram_prefix_mode &&
+        left.ssd_prefix_mode == right.ssd_prefix_mode &&
+        left.block_size_tokens == right.block_size_tokens &&
+        left.quantized_kv_start == right.quantized_kv_start &&
+        left.compress_global_layers == right.compress_global_layers &&
+        left.compress_sliding_layers == right.compress_sliding_layers &&
+        left.keep_mtp_shared_layers_bf16 == right.keep_mtp_shared_layers_bf16 &&
+        left.allow_active_compressed_decode == right.allow_active_compressed_decode;
+}
+
+void remember_last_step(NativeKvCache* cache, const Gemma4StepResult* step) {
+    if (cache == nullptr || step == nullptr) {
+        return;
+    }
+    cache->last_step = *step;
+    cache->last_step.native_last_hidden = cache->last_hidden.get();
+    cache->has_last_step = true;
+}
+
+std::string join_i32_list(const int32_t* values, size_t count) {
+    std::ostringstream out;
+    for (size_t index = 0; index < count; ++index) {
+        if (index != 0) {
+            out << ',';
+        }
+        out << values[index];
+    }
+    return out.str();
+}
+
+std::string join_vector_i32(const std::vector<int32_t>& values) {
+    return values.empty() ? std::string() : join_i32_list(values.data(), values.size());
+}
+
+std::vector<int32_t> parse_i32_list(const std::string& value) {
+    std::vector<int32_t> values;
+    if (value.empty()) {
+        return values;
+    }
+    std::stringstream input(value);
+    std::string part;
+    while (std::getline(input, part, ',')) {
+        if (!part.empty()) {
+            values.push_back(static_cast<int32_t>(std::stoi(part)));
+        }
+    }
+    return values;
+}
+
+std::vector<std::string> parse_csv_list(const char* value) {
+    std::vector<std::string> values;
+    if (is_empty(value)) {
+        return values;
+    }
+    std::stringstream input(value);
+    std::string part;
+    while (std::getline(input, part, ',')) {
+        size_t start = 0;
+        while (start < part.size() && std::isspace(static_cast<unsigned char>(part[start]))) {
+            ++start;
+        }
+        size_t end = part.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(part[end - 1]))) {
+            --end;
+        }
+        if (end > start) {
+            values.push_back(part.substr(start, end - start));
+        }
+    }
+    return values;
+}
+
+void fill_adapter_info(
+    const std::shared_ptr<const gemma4d::NativeLoraAdapter>& adapter,
+    uint64_t load_latency_us,
+    bool active,
+    Gemma4AdapterInfo* info) {
+    if (info == nullptr) {
+        return;
+    }
+    info->module_count = adapter ? adapter->module_count() : 0;
+    info->resident_bytes = adapter ? adapter->resident_bytes() : 0;
+    info->load_latency_us = load_latency_us;
+    info->active = active;
+}
+
+const std::string& required_metadata(
+    const std::unordered_map<std::string, std::string>& metadata,
+    const char* key) {
+    const auto found = metadata.find(key);
+    if (found == metadata.end()) {
+        throw std::runtime_error(std::string("snapshot metadata is missing ") + key);
+    }
+    return found->second;
+}
+
+bool metadata_flag(const std::unordered_map<std::string, std::string>& metadata, const char* key) {
+    const std::string& value = required_metadata(metadata, key);
+    return value == "true" || value == "1";
+}
+
+int metadata_i32(const std::unordered_map<std::string, std::string>& metadata, const char* key) {
+    return std::stoi(required_metadata(metadata, key));
+}
+
+uint32_t metadata_u32(const std::unordered_map<std::string, std::string>& metadata, const char* key) {
+    return static_cast<uint32_t>(std::stoul(required_metadata(metadata, key)));
+}
+
+uint64_t metadata_u64(const std::unordered_map<std::string, std::string>& metadata, const char* key) {
+    return std::stoull(required_metadata(metadata, key));
+}
+
+float metadata_float(const std::unordered_map<std::string, std::string>& metadata, const char* key) {
+    return std::stof(required_metadata(metadata, key));
+}
+
+std::unordered_map<std::string, std::string> snapshot_metadata(const NativeKvSnapshot* snapshot) {
+    std::unordered_map<std::string, std::string> metadata;
+    metadata["snapshot_format"] = "gemma4d_native_snapshot_v1";
+    metadata["policy.active_mode"] = std::to_string(static_cast<int>(snapshot->policy.active_mode));
+    metadata["policy.ram_prefix_mode"] = std::to_string(static_cast<int>(snapshot->policy.ram_prefix_mode));
+    metadata["policy.ssd_prefix_mode"] = std::to_string(static_cast<int>(snapshot->policy.ssd_prefix_mode));
+    metadata["policy.block_size_tokens"] = std::to_string(snapshot->policy.block_size_tokens);
+    metadata["policy.quantized_kv_start"] = std::to_string(snapshot->policy.quantized_kv_start);
+    metadata["policy.compress_global_layers"] = snapshot->policy.compress_global_layers ? "true" : "false";
+    metadata["policy.compress_sliding_layers"] = snapshot->policy.compress_sliding_layers ? "true" : "false";
+    metadata["policy.keep_mtp_shared_layers_bf16"] =
+        snapshot->policy.keep_mtp_shared_layers_bf16 ? "true" : "false";
+    metadata["policy.allow_active_compressed_decode"] =
+        snapshot->policy.allow_active_compressed_decode ? "true" : "false";
+    metadata["native_tokens.count"] = std::to_string(snapshot->native_tokens.size());
+    metadata["native_tokens.csv"] = join_vector_i32(snapshot->native_tokens);
+    metadata["has_last_step"] = snapshot->has_last_step ? "true" : "false";
+    metadata["last_step.greedy_token"] = std::to_string(snapshot->last_step.greedy_token);
+    metadata["last_step.greedy_logit"] = std::to_string(snapshot->last_step.greedy_logit);
+    metadata["last_step.peak_memory_gb"] = std::to_string(snapshot->last_step.peak_memory_gb);
+    metadata["last_step.peak_rss_mb"] = std::to_string(snapshot->last_step.peak_rss_mb);
+    metadata["last_step.sequence_len"] = std::to_string(snapshot->last_step.sequence_len);
+    metadata["last_step.active_kv_bytes"] = std::to_string(snapshot->last_step.active_kv_bytes);
+    metadata["last_step.accepted_draft_count"] = std::to_string(snapshot->last_step.accepted_draft_count);
+    metadata["last_step.committed_count"] = std::to_string(snapshot->last_step.committed_count);
+    metadata["last_step.committed_tokens"] =
+        join_i32_list(snapshot->last_step.committed_tokens, 4);
+    return metadata;
+}
+
+void apply_snapshot_metadata(
+    const std::unordered_map<std::string, std::string>& metadata,
+    NativeKvSnapshot* snapshot) {
+    if (required_metadata(metadata, "snapshot_format") != "gemma4d_native_snapshot_v1") {
+        throw std::runtime_error("snapshot metadata has an unsupported snapshot format");
+    }
+    snapshot->policy.active_mode = static_cast<Gemma4KvMode>(metadata_i32(metadata, "policy.active_mode"));
+    snapshot->policy.ram_prefix_mode =
+        static_cast<Gemma4KvMode>(metadata_i32(metadata, "policy.ram_prefix_mode"));
+    snapshot->policy.ssd_prefix_mode =
+        static_cast<Gemma4KvMode>(metadata_i32(metadata, "policy.ssd_prefix_mode"));
+    snapshot->policy.block_size_tokens = metadata_u32(metadata, "policy.block_size_tokens");
+    snapshot->policy.quantized_kv_start = metadata_u32(metadata, "policy.quantized_kv_start");
+    snapshot->policy.compress_global_layers = metadata_flag(metadata, "policy.compress_global_layers");
+    snapshot->policy.compress_sliding_layers = metadata_flag(metadata, "policy.compress_sliding_layers");
+    snapshot->policy.keep_mtp_shared_layers_bf16 = metadata_flag(metadata, "policy.keep_mtp_shared_layers_bf16");
+    snapshot->policy.allow_active_compressed_decode =
+        metadata_flag(metadata, "policy.allow_active_compressed_decode");
+    snapshot->native_tokens = parse_i32_list(required_metadata(metadata, "native_tokens.csv"));
+    const uint64_t token_count = metadata_u64
+
+## Final User Task
+
+Return prioritized findings with file/function anchors and one verification command.
+
+## Expected Output Style
+
+concise_code_review

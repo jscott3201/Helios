@@ -1,0 +1,111 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `benchmark_qa_4k_001`
+Family: `benchmark_qa`
+Target context tokens: `4096`
+Deterministic seed: `20260633`
+Source files: `BENCHMARKS.md, docs/xr-current-state-review.md`
+
+## Corpus Instruction
+
+Audit benchmark claims for mode confusion. Treat helper-backed, native, server, fixture, cache, adapter, and TUI measurements as separate evidence classes.
+
+## Repo Context
+
+
+## Source Round 1 for benchmark_qa_4k_001
+
+### BEGIN BENCHMARKS.md
+# Helios Benchmark Ledger
+
+This file tracks benchmark runs and measurement changes that matter for Helios
+performance claims. Raw benchmark artifacts stay under `benchmarks/out/` and are
+intentionally ignored; this ledger records the stable index of what was run,
+which code produced it, and what claims are allowed.
+
+## Tracking Rules
+
+- Record exact commands, output paths, git SHA, model path, and mode.
+- Separate command/process overhead from model load, prefill, decode, and memory.
+- Mark helper-backed, native-graph, fixture, and server paths explicitly.
+- Do not claim native graph performance from helper-backed measurements.
+- Keep `benchmarks/out/.../records.jsonl`, `summary.json`, and `report.md` as
+  the authority for raw numbers.
+- Add a new entry whenever benchmark harness behavior or performance evidence
+  changes.
+
+## Runs
+
+| Date | Scope | Status | Git SHA | Mode | Artifacts | Notes |
+|---|---|---|---|---|---|---|
+| 2026-06-30 | M12 real tiny16 matrix | Passed | `940bdfb` | `target_greedy_mlx_lm_helper_via_c_abi` | `benchmarks/out/M12/real-matrix/{records.jsonl,summary.json,report.md}` | 1K/4K/8K/16K generated 128 tokens; 32K generated one token as a memory probe. |
+| 2026-06-30 | P00 performance baseline | Passed | `d5de5db` plus local P00 changes | `target_greedy_mlx_lm_helper_via_c_abi` | `benchmarks/out/P00-performance-baseline/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p00-1782841624`; all 1K/4K/8K/16K cases generated 128 tokens. |
+| 2026-06-30 | M12 compatibility rerun after P00 instrumentation | Passed | `d5de5db` plus local P00 changes | `target_greedy_mlx_lm_helper_via_c_abi` | `benchmarks/out/M12/real-matrix/{records.jsonl,summary.json,report.md}` | Existing matrix still passes after richer `generate --json`; 1K/4K/8K/16K generated 128 tokens and 32K generated one token. |
+| 2026-06-30 | P01 persistent helper session | Passed | `d5de5db` plus local P00/P01 changes | `target_greedy_mlx_lm_helper_via_c_abi` | `benchmarks/out/P01-persistent-helper-session/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p01-1782843052`; one target load, two warm rounds across 1K/4K/8K/16K; all warm outputs matched M12 cold output. |
+| 2026-06-30 | P02 real server inference | Passed | `57f8d5f` plus local P02 benchmark changes | `server_openai_http_real_helper_generate_per_request` | `benchmarks/out/P02-real-server-inference/{records.jsonl,summary.json,report.md,blockers.md,curl-fixtures.md}` | Run ID `p02-1782844669`; localhost HTTP server route generated 128 tokens for 1K/4K/8K/16K and compared against P01 warm session. |
+| 2026-06-30 | P03 native graph triage | Passed | `88788a5` | `native_graph_vs_helper_cli_triage` | `benchmarks/out/P03-native-graph-triage/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p03-1782845820`; helper/default and `GEMMA4D_USE_NATIVE_GRAPH=1` outputs/logits matched on two tokenizer-controlled prompts plus 1K/4K/8K one-token probes. |
+| 2026-06-30 | P04 incremental native KV decode | Passed | `4f265cc` | `incremental_native_kv_vs_helper_cli` | `benchmarks/out/P04-incremental-native-kv/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p04-1782847670`; helper/default and native generated tokens matched on small prompts plus 1K/4K/8K probes; steady decode p50/p95 stayed flat across 8x context growth. |
+| 2026-06-30 | P05 true native MTP verification | Passed | `57ac3a6` | `native_target_and_native_mtp_ffi` | `benchmarks/out/P05-native-mtp/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p05-1782849629`; real native target+assistant FFI loop matched non-MTP native output for block sizes 1 and 2, then auto-disabled because acceptance was 0.000. |
+| 2026-06-30 | P06 real RAM prefix cache | Passed | `e5e61ad` | `native_ram_prefix_snapshot_ffi` | `benchmarks/out/P06-real-ram-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p06-1782851001`; native RAM snapshot restore matched fresh-prefill logits and continued decode at 4K/8K/16K, with wrong model/adapter/cache-mode namespace rejection. |
+| 2026-06-30 | P07 real SSD prefix cache | Passed | `9a4cd13` | `native_ssd_prefix_snapshot_payload` | `benchmarks/out/P07-real-ssd-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p07-1782853459`; real SSD safetensors payload restore improved warm TTFT at 4K/8K/16K, rejected namespace/corruption/mid-decode fetches, and keeps SSD disabled by default pending broader variance data. |
+| 2026-06-30 | P08 real KV compression gates | Passed | `5993b86` | `native_kv_prefix_payload_compression` | `benchmarks/out/P08-kv-compression/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p08-1782855932`; q8 full-attention payload compression passed continued-decode quality gates at 4K/8K/16K, q4 reduced payload bytes but failed greedy agreement, and compressed active decode remains disabled. |
+| 2026-06-30 | P09 real LoRA adapter hot path | Passed | `8723d50` | `native_lora_adapter_hot_path` | `benchmarks/out/P09-real-lora-adapter/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p09-1782857770747`; trusted local rank-16 q_proj/v_proj LoRA fixture loaded into real native inference, changed greedy-logit output, rejected wrong manifests, isolated adapter KV namespace, measured load/hotswap/residency, and disabled MTP while active. |
+| 2026-06-30 | P10 TUI live optimization console | Passed | `4ee1ccd` plus local P10 harness changes | `localhost_http_server_tui_provider_stub_backend` | `benchmarks/out/P10-tui-live-console/{tui-report.md,metrics.json,snapshots/}` | Command `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`; 18 snapshots, render p95 `1731 us` below `20000 us`, server health `ok`, latest benchmark report surfaced from the provider. |
+| 2026-06-30 | P11 model revision and manifest pinning | Passed | final SHA recorded in generated manifest | `manifest_capture_local_artifact_identity` | `benchmarks/out/P11-manifest-pinning/{manifest.json,report.md}` | Command `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; target and drafter revisions are explicitly pinned in `tiny16.toml` to local artifact SHA-256s because local revision metadata is unavailable. |
+
+## P00 Baseline Snapshot
+
+| Context | Generated | Load ms | Prefill ms | Decode ms | Total ms | Command wall ms | Command overhead ms | Decode tok/s | Decode p50 ms | Decode p95 ms | Peak MLX GB | Peak RSS MB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 128/128 | 1912.631 | 2102.335 | 7984.413 | 11999.488 | 12517.384 | 517.896 | 15.906 | 62.706 | 63.725 | 8.065 | 3705.500 |
+| 4K | 128/128 | 1832.444 | 9253.118 | 8827.035 | 19912.890 | 20370.634 | 457.744 | 14.388 | 64.212 | 65.247 | 9.480 | 4694.300 |
+| 8K | 128/128 | 1779.308 | 18577.923 | 9322.173 | 29679.501 | 30087.687 | 408.186 | 13.623 | 64.186 | 67.041 | 9.833 | 5598.200 |
+| 16K | 128/128 | 1825.656 | 40622.532 | 21363.721 | 63812.228 | 64448.723 | 636.495 | 5.945 | 65.744 | 68.958 | 10.512 | 5283.100 |
+
+P00 model identity:
+
+| Field | Value |
+|---|---|
+| Model path | `artifacts/models/gemma-4-12B-it-4bit` |
+| Model revision | `unavailable:GEMMA4D_MODEL_REVISION not set` |
+| Config SHA-256 | `fbc1c1cb48ed86ec98482b2d41f5a03d3991aba74b7c29a93d430761e6518a38` |
+| Tokenizer SHA-256 | `cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f` |
+| Tokenizer config SHA-256 | `fc1384a911d2c9860ac07bc3ceafff20bff26695991744b7dbe5e1e4522bfa57` |
+| Safetensors inventory SHA-256 | `a8c71f9c30898c00e3e82d1dd6524882d3ec7c078d477a8004ea642bac561440` |
+
+## M12 Compatibility Rerun Snapshot
+
+| Context | Generated | TTFT ms | Prefill tok/s | Decode tok/s | Peak MLX GB | Peak RSS MB |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 128/128 | 2065.456 | 495.774 | 15.905 | 8.065 | 5089.600 |
+| 4K | 128/128 | 9270.323 | 441.840 | 13.225 | 9.480 | 4907.700 |
+| 8K | 128/128 | 18480.872 | 443.269 | 15.601 | 9.833 | 5843.500 |
+| 16K | 128/128 | 40427.491 | 405.269 | 13.263 | 10.512 | 5698.100 |
+| 32K | 1/1 | 96862.987 | 338.292 | 0.000 | 11.888 | 5632.200 |
+
+## P01 Warm-Session Snapshot
+
+P01 loads the helper-backed target once, reuses the same process for all cases,
+and calls `KvCache::reset` before each case. The helper-backed prefill path also
+recreates the Python prompt cache for the new prefix.
+
+Load amortization:
+
+| Warm cases | Warm load once ms | Equivalent cold load ms | Load ms saved | Saved % |
+|---:|---:|---:|---:|---:|
+| 8 | 2009.969 | 14169.072 | 12159.103 | 85.814 |
+
+Cold vs warm comparison:
+
+| Context | Output stable | Cold total ms | Warm case ms | Warm amortized total ms | Delta ms | Cold load ms | Warm amortized load ms | Cold prefill ms | Warm prefill ms | Cold decode ms | Warm decode ms | Warm peak GB | Warm RSS MB |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1K | `true` | 11887.014 | 10378.486 | 10629.732 | -1257.282 | 1836.691 | 251.246 | 2065.456 | 2196.965 | 7984.709 | 8181.520 | 10.512 | 2502.531 |
+| 4K | `true` | 20552.826 | 22558.533 | 22809.779 | 2256.953 | 1679.052 | 251.246 | 9270.323 | 9988
+
+## Final User Task
+
+List which claims are supported, which are out of scope, and what artifact paths prove each claim.
+
+## Expected Output Style
+
+benchmark_claim_audit

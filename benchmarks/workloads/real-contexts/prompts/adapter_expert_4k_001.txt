@@ -1,0 +1,460 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `adapter_expert_4k_001`
+Family: `adapter_expert`
+Target context tokens: `4096`
+Deterministic seed: `20260638`
+Source files: `crates/gemma4d-adapters/src/lib.rs, crates/gemma4d-bench/examples/p09_real_lora_adapter.rs`
+
+## Corpus Instruction
+
+Review adapter import and native hot-path evidence. Emphasize trusted roots, tokenizer/template compatibility, namespace isolation, and MTP adapter gates.
+
+## Repo Context
+
+
+## Source Round 1 for adapter_expert_4k_001
+
+### BEGIN crates/gemma4d-adapters/src/lib.rs
+#![doc = "Dynamic LoRA/QLoRA adapter manifests, trust policy, registry state, and request routing."]
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+pub const CRATE_NAME: &str = "gemma4d-adapters";
+pub const REGISTRY_FILE: &str = "registry.json";
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+pub fn bootstrap_status() -> &'static str {
+    "m10-dynamic-adapters"
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    AdapterNotFound { adapter_id: String },
+    InvalidManifest(String),
+    InvalidPeftConfig(String),
+    InvalidSafetensors(String),
+    Io(String),
+    Json(String),
+    UntrustedPath { root: PathBuf, candidate: PathBuf },
+    UnsupportedAdapter(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AdapterNotFound { adapter_id } => write!(f, "adapter not found: {adapter_id}"),
+            Self::InvalidManifest(message) => f.write_str(message),
+            Self::InvalidPeftConfig(message) => f.write_str(message),
+            Self::InvalidSafetensors(message) => f.write_str(message),
+            Self::Io(message) => f.write_str(message),
+            Self::Json(message) => f.write_str(message),
+            Self::UntrustedPath { root, candidate } => write!(
+                f,
+                "adapter path {} is outside trusted root {}",
+                candidate.display(),
+                root.display()
+            ),
+            Self::UnsupportedAdapter(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Json(source.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterType {
+    Lora,
+    Qlora,
+    Alora,
+}
+
+impl AdapterType {
+    fn is_m10_supported(self) -> bool {
+        matches!(self, Self::Lora | Self::Qlora)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFormat {
+    Peft,
+    MlxLm,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdapterDType {
+    Bf16,
+    Fp16,
+    Fp32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MtpSupport {
+    #[default]
+    Unknown,
+    False,
+    True,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdapterManifest {
+    pub adapter_id: String,
+    pub adapter_type: AdapterType,
+    pub base_model_id: String,
+    pub base_weight_hash: String,
+    pub tokenizer_hash: String,
+    pub chat_template_hash: String,
+    pub rank: u32,
+    pub alpha: f64,
+    pub target_modules: Vec<String>,
+    pub adapter_weight_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_format: Option<SourceFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropout: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtype: Option<AdapterDType>,
+    #[serde(default)]
+    pub modules_to_save: Vec<String>,
+    #[serde(default)]
+    pub requires_tokenizer_changes: bool,
+    #[serde(default)]
+    pub supports_mtp: MtpSupport,
+}
+
+impl AdapterManifest {
+    pub fn from_json_str(value: &str) -> Result<Self> {
+        let manifest: Self = serde_json::from_str(value)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        require_non_empty(&self.adapter_id, "adapter_id")?;
+        require_non_empty(&self.base_model_id, "base_model_id")?;
+        require_non_empty(&self.base_weight_hash, "base_weight_hash")?;
+        require_non_empty(&self.tokenizer_hash, "tokenizer_hash")?;
+        require_non_empty(&self.chat_template_hash, "chat_template_hash")?;
+        require_non_empty(&self.adapter_weight_hash, "adapter_weight_hash")?;
+        if !self.adapter_type.is_m10_supported() {
+            return Err(Error::UnsupportedAdapter(format!(
+                "adapter_type {:?} is not supported by M10 standard LoRA routing",
+                self.adapter_type
+            )));
+        }
+        if self.rank == 0 || self.rank > 256 {
+            return Err(Error::InvalidManifest(format!(
+                "rank must be between 1 and 256, got {}",
+                self.rank
+            )));
+        }
+        if self.alpha <= 0.0 || !self.alpha.is_finite() {
+            return Err(Error::InvalidManifest(format!(
+                "alpha must be finite and positive, got {}",
+                self.alpha
+            )));
+        }
+        if self.target_modules.is_empty() {
+            return Err(Error::InvalidManifest(
+                "target_modules must not be empty".to_owned(),
+            ));
+        }
+        if self
+            .target_modules
+            .iter()
+            .any(|module| module.trim().is_empty())
+        {
+            return Err(Error::InvalidManifest(
+                "target_modules must not contain empty module names".to_owned(),
+            ));
+        }
+        if !self.modules_to_save.is_empty() {
+            return Err(Error::UnsupportedAdapter(
+                "modules_to_save is rejected for M10 standard LoRA MVP".to_owned(),
+            ));
+        }
+        if self.requires_tokenizer_changes {
+            return Err(Error::UnsupportedAdapter(
+                "adapters requiring tokenizer changes are rejected".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterCompatibility {
+    pub base_model_id: String,
+    pub base_weight_hash: String,
+    pub tokenizer_hash: String,
+    pub chat_template_hash: String,
+}
+
+impl AdapterCompatibility {
+    pub fn validate(&self, manifest: &AdapterManifest) -> Result<()> {
+        compare_manifest_field(
+            "base_model_id",
+            &self.base_model_id,
+            &manifest.base_model_id,
+        )?;
+        compare_manifest_field(
+            "base_weight_hash",
+            &self.base_weight_hash,
+            &manifest.base_weight_hash,
+        )?;
+        compare_manifest_field(
+            "tokenizer_hash",
+            &self.tokenizer_hash,
+            &manifest.tokenizer_hash,
+        )?;
+        compare_manifest_field(
+            "chat_template_hash",
+            &self.chat_template_hash,
+            &manifest.chat_template_hash,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedPathPolicy {
+    root: PathBuf,
+}
+
+impl TrustedPathPolicy {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().canonicalize()?;
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn require_trusted(&self, candidate: impl AsRef<Path>) -> Result<PathBuf> {
+        let candidate = candidate.as_ref().canonicalize()?;
+        if candidate.starts_with(&self.root) {
+            Ok(candidate)
+        } else {
+            Err(Error::UntrustedPath {
+                root: self.root.clone(),
+                candidate,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetensorsValidation {
+    pub tensor_count: usize,
+    pub lora_a_tensors: usize,
+    pub lora_b_tensors: usize,
+    pub resident_bytes: u64,
+    pub shape_validation_result: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportedAdapter {
+    pub manifest: AdapterManifest,
+    pub source_path: PathBuf,
+    pub config_path: PathBuf,
+    pub weights_path: PathBuf,
+    pub validation: SafetensorsValidation,
+    pub load_latency_us: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegistryEntry {
+    pub adapter: ImportedAdapter,
+    pub loaded: bool,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterSummary {
+    pub adapter_id: String,
+    pub display_name: Option<String>,
+    pub adapter_type: AdapterType,
+    pub source_path: PathBuf,
+    pub loaded: bool,
+    pub pinned: bool,
+    pub active: bool,
+    pub resident_bytes: u64,
+    pub load_latency_us: u128,
+    pub target_modules: Vec<String>,
+    pub supports_mtp: MtpSupport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterRoute {
+    pub active_adapter_id: Option<String>,
+    pub adapter_weight_hash: Option<String>,
+    pub mtp_enabled: bool,
+    pub mtp_disable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+struct RegistryIndex {
+    entries: Vec<RegistryEntry>,
+    active_adapter_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterRegistry {
+    registry_dir: PathBuf,
+    index: RegistryIndex,
+}
+
+impl AdapterRegistry {
+    pub fn open(registry_dir: impl AsRef<Path>) -> Result<Self> {
+        let registry_dir = registry_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&registry_dir)?;
+        let index_path = registry_dir.join(REGISTRY_FILE);
+        let index = if index_path.exists() {
+            let raw = fs::read_to_string(&index_path)?;
+            serde_json::from_str(&raw)?
+        } else {
+            RegistryIndex::default()
+        };
+        Ok(Self {
+            registry_dir,
+            index,
+        })
+    }
+
+    pub fn import_peft(
+        &mut self,
+        source_dir: impl AsRef<Path>,
+        trusted: &TrustedPathPolicy,
+        expected: &AdapterCompatibility,
+    ) -> Result<ImportedAdapter> {
+        let started = Instant::now();
+        let source_path = trusted.require_trusted(source_dir)?;
+        let config_path = source_path.join("adapter_config.json");
+        let weights_path = source_path.join("adapter_model.safetensors");
+        let config = PeftAdapterConfig::from_path(&config_path)?;
+        let validation = validate_safetensors(&weights_path)?;
+        let manifest = config.to_manifest(
+            &source_path,
+            expected,
+            &sha256_file(&weights_path)?,
+            Some(validation.clone()),
+        )?;
+        expected.validate(&manifest)?;
+        manifest.validate()?;
+        let imported = ImportedAdapter {
+            manifest,
+            source_path,
+            config_path,
+            weights_path,
+            validation,
+            load_latency_us: started.elapsed().as_micros(),
+        };
+        self.upsert_entry(imported.clone(), true)?;
+        Ok(imported)
+    }
+
+    pub fn load(&mut self, adapter_id: &str) -> Result<AdapterSummary> {
+        let active = self.index.active_adapter_id.clone();
+        let entry = self.entry_mut(adapter_id)?;
+        entry.loaded = true;
+        let summary = summary_for_entry(entry, active.as_deref());
+        self.persist()?;
+        Ok(summary)
+    }
+
+    pub fn unload(&mut self, adapter_id: &str) -> Result<AdapterSummary> {
+        if self.index.active_adapter_id.as_deref() == Some(adapter_id) {
+            self.index.active_adapter_id = None;
+        }
+        let active = self.index.active_adapter_id.clone();
+        let entry = self.entry_mut(adapter_id)?;
+        entry.loaded = false;
+        let summary = summary_for_entry(entry, active.as_deref());
+        self.persist()?;
+        Ok(summary)
+    }
+
+    pub fn pin(&mut self, adapter_id: &str) -> Result<AdapterSummary> {
+        let active = self.index.active_adapter_id.clone();
+        let entry = self.entry_mut(adapter_id)?;
+        entry.pinned = true;
+        let summary = summary_for_entry(entry, active.as_deref());
+        self.persist()?;
+        Ok(summary)
+    }
+
+    pub fn activate_request(&mut self, adapter_id: Option<&str>) -> Result<AdapterRoute> {
+        let Some(adapter_id) = adapter_id else {
+            self.index.active_adapter_id = None;
+            self.persist()?;
+            return Ok(AdapterRoute {
+                active_adapter_id: None,
+                adapter_weight_hash: None,
+                mtp_enabled: true,
+                mtp_disable_reason: None,
+            });
+        };
+
+        let entry = self.entry(adapter_id)?;
+        if !entry.loaded {
+            return Err(Error::AdapterNotFound {
+                adapter_id: adapter_id.to_owned(),
+            });
+        }
+        let adapter_weight_hash = entry.adapter.manifest.adapter_weight_hash.clone();
+        self.index.active_adapter_id = Some(adapter_id.to_owned());
+        self.persist()?;
+        Ok(AdapterRoute {
+            active_adapter_id: Some(adapter_id.to_owned()),
+            adapter_weight_hash: Some(adapter_weight_hash),
+            mtp_enabled: false,
+            mtp_disable_reason: Some(
+                "MTP is disabled for active standard LoRA adapters until per-adapter exactness is verified"
+                    .to_owned(),
+            ),
+        })
+    }
+
+    pub fn summaries(&self) -> Vec<AdapterSummary> {
+        self.index
+            .entries
+            .
+
+## Final User Task
+
+Return a concise adapter-runtime risk assessment and the exact tests or benchmark records to inspect next.
+
+## Expected Output Style
+
+adapter_expert_review

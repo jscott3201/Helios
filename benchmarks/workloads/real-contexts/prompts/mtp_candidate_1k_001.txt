@@ -1,0 +1,104 @@
+# Helios XR00 Real-Context Workload
+
+Workload ID: `mtp_candidate_1k_001`
+Family: `mtp_candidate`
+Target context tokens: `1024`
+Deterministic seed: `20260641`
+Source files: `crates/gemma4d-bench/examples/p05_native_mtp.rs`
+
+## Corpus Instruction
+
+This prompt is designed for speculative decoding diagnosis. It asks for a deterministic continuation with repeated structure and explicit numbering.
+
+## Repo Context
+
+
+## Source Round 1 for mtp_candidate_1k_001
+
+### BEGIN crates/gemma4d-bench/examples/p05_native_mtp.rs
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    io::Write,
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use gemma4d_ffi::{
+    Drafter, KvCache, KvPolicy, LoadConfig, StepResult, Target, decode_one, draft_block, prefill,
+    verify_tokens,
+};
+use serde::Serialize;
+
+const DEFAULT_MODEL: &str = "artifacts/models/gemma-4-12B-it-4bit";
+const DEFAULT_ASSISTANT_MODEL: &str = "artifacts/models/gemma-4-12B-it-qat-assistant-4bit";
+const DEFAULT_OUT_DIR: &str = "benchmarks/out/P05-native-mtp";
+const MODE: &str = "native_target_and_native_mtp_ffi";
+const MIN_ACCEPTANCE_RATE: f64 = 0.35;
+const MEMORY_CLIFF_GB: f64 = 14.0;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse()?;
+    fs::create_dir_all(&args.out_dir)?;
+
+    let run_id = run_id();
+    let records_path = args.out_dir.join("records.jsonl");
+    let summary_path = args.out_dir.join("summary.json");
+    let report_path = args.out_dir.join("report.md");
+    let blockers_path = args.out_dir.join("blockers.md");
+    let environment = capture_environment();
+    let probes = probes(args.max_new_tokens);
+    let mut records = Vec::new();
+    let mut blockers = startup_blockers(&args);
+
+    if blockers.is_empty() {
+        for probe in &probes {
+            let baseline = run_baseline(&args, probe)?;
+            for block_size in &args.block_sizes {
+                records.push(run_record(
+                    &args,
+                    &run_id,
+                    probe,
+                    *block_size,
+                    baseline.clone(),
+                )?);
+            }
+        }
+    }
+
+    blockers.extend(blockers_for_records(&records));
+    let status = if blockers.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    };
+    let default_recommendation = default_recommendation(&records);
+
+    let summary = P05Summary {
+        schema_version: 1,
+        goal: "P05-native-mtp",
+        status,
+        run_id,
+        timestamp_unix: unix_now(),
+        mode: MODE,
+        model_path: args.model_path.display().to_string(),
+        assistant_model_path: args.assistant_model_path.display().to_string(),
+        records_path: records_path.display().to_string(),
+        summary_path: summary_path.display().to_string(),
+        report_path: report_path.display().to_string(),
+        blockers_path: blockers_path.display().to_string(),
+        environment,
+        relevant_environment: capture_relevant_environment(),
+        max_context_tokens: args.max_context_tokens,
+        block_sizes: args.block_sizes.clone(),
+
+
+## Final User Task
+
+Continue the checklist with items 6 through 12, preserving the exact prefix 'MTP check N:' for each line.
+
+## Expected Output Style
+
+predictable_continuation
