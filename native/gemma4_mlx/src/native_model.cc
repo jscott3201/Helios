@@ -1096,16 +1096,22 @@ std::unique_ptr<NativeHiddenState> NativeHiddenState::clone() const {
     if (impl_ == nullptr) {
         return nullptr;
     }
-    std::unique_ptr<NativeHiddenState::Impl> cloned_impl(new NativeHiddenState::Impl{});
 #ifdef GEMMA4D_MLX_AVAILABLE
-    cloned_impl->hidden = impl_->hidden;
-    cloned_impl->full_attention_key = impl_->full_attention_key;
-    cloned_impl->full_attention_value = impl_->full_attention_value;
-    cloned_impl->sliding_attention_key = impl_->sliding_attention_key;
-    cloned_impl->sliding_attention_value = impl_->sliding_attention_value;
+    std::unique_ptr<NativeHiddenState::Impl> cloned_impl(new NativeHiddenState::Impl{
+        impl_->hidden,
+        impl_->full_attention_key,
+        impl_->full_attention_value,
+        impl_->sliding_attention_key,
+        impl_->sliding_attention_value,
+        impl_->sequence_len,
+        impl_->hidden_size,
+    });
+#else
+    std::unique_ptr<NativeHiddenState::Impl> cloned_impl(new NativeHiddenState::Impl{
+        impl_->sequence_len,
+        impl_->hidden_size,
+    });
 #endif
-    cloned_impl->sequence_len = impl_->sequence_len;
-    cloned_impl->hidden_size = impl_->hidden_size;
     return std::unique_ptr<NativeHiddenState>(new NativeHiddenState(std::move(cloned_impl)));
 }
 
