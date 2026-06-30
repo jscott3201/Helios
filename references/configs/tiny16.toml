@@ -68,12 +68,7 @@ tick_rate_ms = 250
 enable_mouse = false
 enable_paste = true
 confirm_destructive_actions = true
-
-[tui]
-enabled = true
 server_url = "http://127.0.0.1:8080"
-tick_ms = 250
 mouse = false
-confirm_destructive_actions = true
 max_log_lines = 5000
 max_chat_render_lines = 2000

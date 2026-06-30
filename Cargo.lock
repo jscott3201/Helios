@@ -640,6 +640,11 @@ dependencies = [
 [[package]]
 name = "gemma4d-bench"
 version = "0.1.0"
+dependencies = [
+ "gemma4d-server",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "gemma4d-cache"
