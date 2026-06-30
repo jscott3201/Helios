@@ -44,6 +44,11 @@ mod raw {
     }
 
     #[repr(C)]
+    pub struct Gemma4Adapter {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
     pub struct Gemma4VersionInfo {
         pub abi_version: u32,
         pub backend_name: *const c_char,
@@ -97,6 +102,25 @@ mod raw {
         pub has_last_step: bool,
     }
 
+    #[repr(C)]
+    pub struct Gemma4AdapterLoadConfig {
+        pub adapter_path: *const c_char,
+        pub adapter_id: *const c_char,
+        pub adapter_weight_hash: *const c_char,
+        pub target_modules_csv: *const c_char,
+        pub rank: u32,
+        pub alpha: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Gemma4AdapterInfo {
+        pub module_count: u64,
+        pub resident_bytes: u64,
+        pub load_latency_us: u64,
+        pub active: bool,
+    }
+
     // SAFETY: These declarations mirror `native/gemma4_mlx/include/gemma4_mlx.h`.
     unsafe extern "C" {
         pub fn gemma4_runtime_version(out: *mut Gemma4VersionInfo) -> Gemma4Status;
@@ -106,6 +130,22 @@ mod raw {
             out: *mut *mut Gemma4Target,
         ) -> Gemma4Status;
         pub fn gemma4_free_target(target: *mut Gemma4Target) -> Gemma4Status;
+        pub fn gemma4_load_adapter(
+            target: *mut Gemma4Target,
+            config: *const Gemma4AdapterLoadConfig,
+            out: *mut *mut Gemma4Adapter,
+            info: *mut Gemma4AdapterInfo,
+        ) -> Gemma4Status;
+        pub fn gemma4_free_adapter(adapter: *mut Gemma4Adapter) -> Gemma4Status;
+        pub fn gemma4_set_adapter(
+            target: *mut Gemma4Target,
+            adapter: *mut Gemma4Adapter,
+            info: *mut Gemma4AdapterInfo,
+        ) -> Gemma4Status;
+        pub fn gemma4_clear_adapter(
+            target: *mut Gemma4Target,
+            info: *mut Gemma4AdapterInfo,
+        ) -> Gemma4Status;
         pub fn gemma4_kv_create(
             policy: *const Gemma4KvPolicy,
             out: *mut *mut Gemma4KvCache,
@@ -358,12 +398,106 @@ impl Target {
         })?;
         Ok(Self { ptr })
     }
+
+    pub fn set_adapter(&mut self, adapter: &Adapter) -> Result<AdapterInfo> {
+        let mut info = raw::Gemma4AdapterInfo::default();
+        // SAFETY: both handles are owned by safe wrappers and remain valid for the duration of the call.
+        check(unsafe {
+            raw::gemma4_set_adapter(self.ptr.as_ptr(), adapter.ptr.as_ptr(), &mut info)
+        })?;
+        Ok(info.into())
+    }
+
+    pub fn clear_adapter(&mut self) -> Result<AdapterInfo> {
+        let mut info = raw::Gemma4AdapterInfo::default();
+        // SAFETY: `self.ptr` is an owned target handle returned by `gemma4_load_target`.
+        check(unsafe { raw::gemma4_clear_adapter(self.ptr.as_ptr(), &mut info) })?;
+        Ok(info.into())
+    }
 }
 
 impl Drop for Target {
     fn drop(&mut self) {
         // SAFETY: `self.ptr` is an owned target handle returned by `gemma4_load_target`.
         let status = unsafe { raw::gemma4_free_target(self.ptr.as_ptr()) };
+        debug_assert_eq!(Status::from_raw(status), Status::Ok);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterLoadConfig {
+    pub adapter_path: String,
+    pub adapter_id: String,
+    pub adapter_weight_hash: String,
+    pub target_modules: Vec<String>,
+    pub rank: NonZeroU32,
+    pub alpha: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterInfo {
+    pub module_count: u64,
+    pub resident_bytes: u64,
+    pub load_latency_us: u64,
+    pub active: bool,
+}
+
+impl From<raw::Gemma4AdapterInfo> for AdapterInfo {
+    fn from(value: raw::Gemma4AdapterInfo) -> Self {
+        Self {
+            module_count: value.module_count,
+            resident_bytes: value.resident_bytes,
+            load_latency_us: value.load_latency_us,
+            active: value.active,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Adapter {
+    ptr: NonNull<raw::Gemma4Adapter>,
+    info: AdapterInfo,
+}
+
+impl Adapter {
+    pub fn load(target: &Target, config: &AdapterLoadConfig) -> Result<Self> {
+        let adapter_path = CString::new(config.adapter_path.as_str())?;
+        let adapter_id = CString::new(config.adapter_id.as_str())?;
+        let adapter_weight_hash = CString::new(config.adapter_weight_hash.as_str())?;
+        let target_modules_csv = CString::new(config.target_modules.join(","))?;
+        let raw_config = raw::Gemma4AdapterLoadConfig {
+            adapter_path: adapter_path.as_ptr(),
+            adapter_id: adapter_id.as_ptr(),
+            adapter_weight_hash: adapter_weight_hash.as_ptr(),
+            target_modules_csv: target_modules_csv.as_ptr(),
+            rank: config.rank.get(),
+            alpha: config.alpha,
+        };
+        let mut out = ptr::null_mut();
+        let mut info = raw::Gemma4AdapterInfo::default();
+        // SAFETY: `raw_config` C strings live through the call, `target` is valid, and out pointers are writable.
+        check(unsafe {
+            raw::gemma4_load_adapter(target.ptr.as_ptr(), &raw_config, &mut out, &mut info)
+        })?;
+        let ptr = NonNull::new(out).ok_or_else(|| Error {
+            status: Status::Runtime,
+            message: "gemma4_load_adapter returned OK with a null adapter".to_owned(),
+        })?;
+        Ok(Self {
+            ptr,
+            info: info.into(),
+        })
+    }
+
+    pub fn info(&self) -> AdapterInfo {
+        self.info
+    }
+}
+
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is an owned adapter handle returned by `gemma4_load_adapter`.
+        let status = unsafe { raw::gemma4_free_adapter(self.ptr.as_ptr()) };
         debug_assert_eq!(Status::from_raw(status), Status::Ok);
     }
 }

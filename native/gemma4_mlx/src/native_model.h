@@ -81,6 +81,42 @@ private:
     friend class NativeTextModel;
 };
 
+class NativeLoraAdapter {
+public:
+    struct Impl;
+
+    NativeLoraAdapter();
+    ~NativeLoraAdapter();
+
+    NativeLoraAdapter(const NativeLoraAdapter&) = delete;
+    NativeLoraAdapter& operator=(const NativeLoraAdapter&) = delete;
+    NativeLoraAdapter(NativeLoraAdapter&&) noexcept;
+    NativeLoraAdapter& operator=(NativeLoraAdapter&&) noexcept;
+
+    static bool load_peft(
+        const std::filesystem::path& adapter_path,
+        const std::string& adapter_id,
+        const std::string& adapter_weight_hash,
+        uint32_t rank,
+        float alpha,
+        const std::vector<std::string>& target_modules,
+        const class NativeTextModel& target_model,
+        std::shared_ptr<const NativeLoraAdapter>* out,
+        uint64_t* load_latency_us,
+        std::string* error);
+
+    const std::string& adapter_id() const;
+    const std::string& adapter_weight_hash() const;
+    size_t module_count() const;
+    uint64_t resident_bytes() const;
+    const Impl* impl() const;
+
+private:
+    explicit NativeLoraAdapter(std::unique_ptr<Impl> impl);
+
+    std::unique_ptr<Impl> impl_;
+};
+
 class NativeTextModel {
 public:
     struct Impl;
@@ -101,6 +137,12 @@ public:
 
     size_t tensor_count() const;
     std::string summary() const;
+    bool set_adapter(std::shared_ptr<const NativeLoraAdapter> adapter, std::string* error);
+    void clear_adapter();
+    bool has_adapter() const;
+    std::string active_adapter_id() const;
+    size_t active_adapter_module_count() const;
+    uint64_t active_adapter_resident_bytes() const;
 
     bool forward_greedy(
         const std::vector<int32_t>& tokens,
@@ -134,6 +176,7 @@ public:
 private:
     std::unique_ptr<Impl> impl_;
 
+    friend class NativeLoraAdapter;
     friend class NativeMtpAssistantModel;
 };
 

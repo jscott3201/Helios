@@ -3,6 +3,7 @@
 #include "native_model.h"
 
 #include <cstdlib>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
@@ -38,6 +39,7 @@ constexpr uint64_t kTargetMagic = 0x47454d3444415447ULL;
 constexpr uint64_t kDrafterMagic = 0x47454d3444524146ULL;
 constexpr uint64_t kKvCacheMagic = 0x47454d344b564347ULL;
 constexpr uint64_t kKvSnapshotMagic = 0x47454d344b565347ULL;
+constexpr uint64_t kAdapterMagic = 0x47454d3441445054ULL;
 thread_local char g_last_error[512] = "";
 
 #ifdef GEMMA4D_MLX_AVAILABLE
@@ -87,6 +89,12 @@ struct NativeDrafter {
     gemma4d::Gemma4ModelManifest manifest;
     const gemma4d::NativeTextModel* target_native_model;
     std::unique_ptr<gemma4d::NativeMtpAssistantModel> native_model;
+};
+
+struct NativeAdapter {
+    uint64_t magic;
+    std::shared_ptr<const gemma4d::NativeLoraAdapter> native_adapter;
+    uint64_t load_latency_us;
 };
 
 void store_error(const char* message) {
@@ -176,6 +184,43 @@ std::vector<int32_t> parse_i32_list(const std::string& value) {
         }
     }
     return values;
+}
+
+std::vector<std::string> parse_csv_list(const char* value) {
+    std::vector<std::string> values;
+    if (is_empty(value)) {
+        return values;
+    }
+    std::stringstream input(value);
+    std::string part;
+    while (std::getline(input, part, ',')) {
+        size_t start = 0;
+        while (start < part.size() && std::isspace(static_cast<unsigned char>(part[start]))) {
+            ++start;
+        }
+        size_t end = part.size();
+        while (end > start && std::isspace(static_cast<unsigned char>(part[end - 1]))) {
+            --end;
+        }
+        if (end > start) {
+            values.push_back(part.substr(start, end - start));
+        }
+    }
+    return values;
+}
+
+void fill_adapter_info(
+    const std::shared_ptr<const gemma4d::NativeLoraAdapter>& adapter,
+    uint64_t load_latency_us,
+    bool active,
+    Gemma4AdapterInfo* info) {
+    if (info == nullptr) {
+        return;
+    }
+    info->module_count = adapter ? adapter->module_count() : 0;
+    info->resident_bytes = adapter ? adapter->resident_bytes() : 0;
+    info->load_latency_us = load_latency_us;
+    info->active = active;
 }
 
 const std::string& required_metadata(
@@ -563,7 +608,7 @@ struct Gemma4Target : NativeTarget {};
 struct Gemma4KvCache : NativeKvCache {};
 struct Gemma4KvSnapshot : NativeKvSnapshot {};
 struct Gemma4Drafter : NativeDrafter {};
-struct Gemma4Adapter {};
+struct Gemma4Adapter : NativeAdapter {};
 
 Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
     if (out == nullptr) {
@@ -666,6 +711,124 @@ Gemma4Status gemma4_free_target(Gemma4Target* target) {
     target->magic = 0;
     stop_helper(target);
     delete target;
+    return ok();
+}
+
+Gemma4Status gemma4_load_adapter(
+    Gemma4Target* target,
+    const Gemma4AdapterLoadConfig* config,
+    Gemma4Adapter** out,
+    Gemma4AdapterInfo* info) {
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires a non-null out pointer");
+    }
+    *out = nullptr;
+    fill_adapter_info(nullptr, 0, false, info);
+
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires a valid target handle");
+    }
+    if (config == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires a non-null config");
+    }
+    if (is_empty(config->adapter_path)) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires a non-empty adapter_path");
+    }
+    if (is_empty(config->adapter_id)) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires a non-empty adapter_id");
+    }
+    if (is_empty(config->adapter_weight_hash)) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires a non-empty adapter_weight_hash");
+    }
+    if (config->rank == 0) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires rank > 0");
+    }
+    if (!target->use_native_graph || target->native_model == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_load_adapter requires a loaded native target graph");
+    }
+
+    const std::vector<std::string> target_modules = parse_csv_list(config->target_modules_csv);
+    if (target_modules.empty()) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_adapter requires target_modules_csv");
+    }
+
+    std::shared_ptr<const gemma4d::NativeLoraAdapter> native_adapter;
+    uint64_t load_latency_us = 0;
+    std::string native_error;
+    if (!gemma4d::NativeLoraAdapter::load_peft(
+            config->adapter_path,
+            config->adapter_id,
+            config->adapter_weight_hash,
+            config->rank,
+            config->alpha,
+            target_modules,
+            *target->native_model,
+            &native_adapter,
+            &load_latency_us,
+            &native_error)) {
+        return fail(GEMMA4_ERR_ADAPTER, native_error);
+    }
+
+    Gemma4Adapter* adapter = new (std::nothrow) Gemma4Adapter{};
+    if (adapter == nullptr) {
+        return fail(GEMMA4_ERR_RUNTIME, "gemma4_load_adapter could not allocate adapter handle");
+    }
+    adapter->magic = kAdapterMagic;
+    adapter->native_adapter = std::move(native_adapter);
+    adapter->load_latency_us = load_latency_us;
+    fill_adapter_info(adapter->native_adapter, adapter->load_latency_us, false, info);
+    *out = adapter;
+    return ok();
+}
+
+Gemma4Status gemma4_free_adapter(Gemma4Adapter* adapter) {
+    if (adapter == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_free_adapter requires a non-null adapter");
+    }
+    if (adapter->magic != kAdapterMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_free_adapter received an invalid adapter handle");
+    }
+
+    adapter->magic = 0;
+    delete adapter;
+    return ok();
+}
+
+Gemma4Status gemma4_set_adapter(Gemma4Target* target, Gemma4Adapter* adapter, Gemma4AdapterInfo* info) {
+    fill_adapter_info(nullptr, 0, false, info);
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_set_adapter requires a valid target handle");
+    }
+    if (adapter == nullptr || adapter->magic != kAdapterMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_set_adapter requires a valid adapter handle");
+    }
+    if (!target->use_native_graph || target->native_model == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_set_adapter requires a loaded native target graph");
+    }
+
+    std::string native_error;
+    if (!target->native_model->set_adapter(adapter->native_adapter, &native_error)) {
+        return fail(GEMMA4_ERR_ADAPTER, native_error);
+    }
+    fill_adapter_info(adapter->native_adapter, adapter->load_latency_us, true, info);
+    return ok();
+}
+
+Gemma4Status gemma4_clear_adapter(Gemma4Target* target, Gemma4AdapterInfo* info) {
+    fill_adapter_info(nullptr, 0, false, info);
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_clear_adapter requires a valid target handle");
+    }
+    if (!target->use_native_graph || target->native_model == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_clear_adapter requires a loaded native target graph");
+    }
+    target->native_model->clear_adapter();
     return ok();
 }
 
@@ -1064,6 +1227,11 @@ Gemma4Status gemma4_load_drafter(
     if (is_empty(config->model_path)) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_drafter requires a non-empty model_path");
     }
+    if (target->use_native_graph && target->native_model != nullptr && target->native_model->has_adapter()) {
+        return fail(
+            GEMMA4_ERR_ADAPTER,
+            "gemma4_load_drafter is disabled while a standard LoRA adapter is active");
+    }
 
     Gemma4Drafter* drafter = new (std::nothrow) Gemma4Drafter{};
     if (drafter == nullptr) {
@@ -1167,6 +1335,12 @@ Gemma4Status gemma4_mtp_draft_block(
             GEMMA4_ERR_UNSUPPORTED_CONFIG,
             "gemma4_mtp_draft_block requires a native target graph and loaded native MTP assistant tensors");
     }
+    if (drafter->target_native_model->has_adapter()) {
+        *inout_count = 0;
+        return fail(
+            GEMMA4_ERR_ADAPTER,
+            "gemma4_mtp_draft_block is disabled while a standard LoRA adapter is active");
+    }
 
     std::string native_error;
     if (!drafter->native_model->draft_block(
@@ -1214,6 +1388,11 @@ Gemma4Status gemma4_verify_tokens(
     if (target->use_native_graph) {
         if (target->native_model == nullptr) {
             return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 model state is missing");
+        }
+        if (target->native_model->has_adapter()) {
+            return fail(
+                GEMMA4_ERR_ADAPTER,
+                "gemma4_verify_tokens is disabled while a standard LoRA adapter is active");
         }
         if (cache->native_tokens.empty()) {
             return fail(

@@ -1,7 +1,9 @@
 #include "native_model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -50,9 +52,30 @@ struct NativeKvState::Impl {
     uint64_t active_bytes = 0;
 };
 
+struct NativeLoraAdapter::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    struct Module {
+        std::string prefix;
+        std::string target_module;
+        mlx::core::array a_transposed;
+        mlx::core::array b_transposed;
+        float scale = 1.0f;
+        uint64_t resident_bytes = 0;
+    };
+    std::vector<Module> modules;
+#endif
+    std::string adapter_id;
+    std::string adapter_weight_hash;
+    std::vector<std::string> target_modules;
+    uint32_t rank = 0;
+    float alpha = 0.0f;
+    uint64_t resident_bytes = 0;
+};
+
 struct NativeTextModel::Impl {
 #ifdef GEMMA4D_MLX_AVAILABLE
     std::unordered_map<std::string, mlx::core::array> tensors;
+    std::shared_ptr<const NativeLoraAdapter> active_adapter;
 #endif
     QuantizationSpec default_quantization;
     std::unordered_map<std::string, QuantizationSpec> quantization_overrides;
@@ -100,6 +123,9 @@ bool is_assistant_tensor(const std::string& key) {
 
 using mlx::core::array;
 
+array model_dtype(array value);
+array model_scalar(float value);
+
 array to_float32(array value) {
     return mlx::core::astype(std::move(value), mlx::core::float32);
 }
@@ -120,6 +146,119 @@ QuantizationSpec quantization_for(const Impl& impl, const std::string& prefix) {
         return found->second;
     }
     return impl.default_quantization;
+}
+
+bool starts_with(const std::string& value, const std::string& prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+
+bool ends_with(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string trim_ascii(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
+        ++start;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        --end;
+    }
+    return value.substr(start, end - start);
+}
+
+std::string canonical_lora_prefix(std::string prefix) {
+    if (starts_with(prefix, "base_model.model.model.")) {
+        return "language_model.model." + prefix.substr(std::string("base_model.model.model.").size());
+    }
+    if (starts_with(prefix, "base_model.model.")) {
+        return "language_model.model." + prefix.substr(std::string("base_model.model.").size());
+    }
+    if (starts_with(prefix, "model.")) {
+        return "language_model.model." + prefix.substr(std::string("model.").size());
+    }
+    return prefix;
+}
+
+std::optional<std::string> lora_tensor_prefix(const std::string& name, const char* suffix) {
+    const std::string suffix_value(suffix);
+    if (!ends_with(name, suffix_value)) {
+        return std::nullopt;
+    }
+    return canonical_lora_prefix(name.substr(0, name.size() - suffix_value.size()));
+}
+
+std::string target_module_for_prefix(const std::string& prefix) {
+    const size_t last_dot = prefix.rfind('.');
+    if (last_dot == std::string::npos || last_dot + 1 >= prefix.size()) {
+        return prefix;
+    }
+    return prefix.substr(last_dot + 1);
+}
+
+bool target_module_allowed(const std::string& prefix, const std::vector<std::string>& target_modules) {
+    const std::string leaf = target_module_for_prefix(prefix);
+    for (const std::string& module : target_modules) {
+        const std::string trimmed = trim_ascii(module);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (leaf == trimmed || prefix == trimmed || ends_with(prefix, "." + trimmed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t quantized_linear_input_dim(const QuantizationSpec& spec, const array& weight) {
+    const auto& shape = weight.shape();
+    if (shape.size() != 2 || spec.bits == 0 || 32 % spec.bits != 0) {
+        throw std::runtime_error("unsupported quantized weight shape for LoRA validation");
+    }
+    return static_cast<uint64_t>(shape[1]) * static_cast<uint64_t>(32 / spec.bits);
+}
+
+const NativeLoraAdapter::Impl::Module* active_lora_module(
+    const NativeTextModel::Impl& impl,
+    const std::string& prefix) {
+    if (!impl.active_adapter) {
+        return nullptr;
+    }
+    const NativeLoraAdapter::Impl* adapter = impl.active_adapter->impl();
+    if (adapter == nullptr) {
+        return nullptr;
+    }
+    for (const NativeLoraAdapter::Impl::Module& module : adapter->modules) {
+        if (module.prefix == prefix) {
+            return &module;
+        }
+    }
+    return nullptr;
+}
+
+template <typename Impl>
+array add_lora_delta_if_active(
+    const Impl&,
+    const array&,
+    const std::string&,
+    array base_output) {
+    return base_output;
+}
+
+array add_lora_delta_if_active(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    const std::string& prefix,
+    array base_output) {
+    const NativeLoraAdapter::Impl::Module* module = active_lora_module(impl, prefix);
+    if (module == nullptr) {
+        return base_output;
+    }
+    array low_rank = mlx::core::matmul(to_float32(x), module->a_transposed);
+    array delta = mlx::core::matmul(low_rank, module->b_transposed) * model_scalar(module->scale);
+    return model_dtype(base_output + model_dtype(delta));
 }
 
 bool force_float32_enabled() {
@@ -144,7 +283,7 @@ array model_scalar(float value) {
 template <typename Impl>
 array quantized_linear(const Impl& impl, const array& x, const std::string& prefix) {
     const QuantizationSpec spec = quantization_for(impl, prefix);
-    return model_dtype(mlx::core::quantized_matmul(
+    array output = model_dtype(mlx::core::quantized_matmul(
         x,
         tensor_or_throw(impl, prefix + ".weight"),
         tensor_or_throw(impl, prefix + ".scales"),
@@ -153,6 +292,7 @@ array quantized_linear(const Impl& impl, const array& x, const std::string& pref
         static_cast<int>(spec.group_size),
         static_cast<int>(spec.bits),
         "affine"));
+    return add_lora_delta_if_active(impl, x, prefix, output);
 }
 
 array quantized_embedding(const NativeTextModel::Impl& impl, const array& token_ids) {
@@ -1741,6 +1881,221 @@ bool NativeKvState::load_safetensors(
 #endif
 }
 
+NativeLoraAdapter::NativeLoraAdapter() : impl_(std::make_unique<Impl>()) {}
+
+NativeLoraAdapter::NativeLoraAdapter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+NativeLoraAdapter::~NativeLoraAdapter() = default;
+
+NativeLoraAdapter::NativeLoraAdapter(NativeLoraAdapter&&) noexcept = default;
+
+NativeLoraAdapter& NativeLoraAdapter::operator=(NativeLoraAdapter&&) noexcept = default;
+
+bool NativeLoraAdapter::load_peft(
+    const std::filesystem::path& adapter_path,
+    const std::string& adapter_id,
+    const std::string& adapter_weight_hash,
+    uint32_t rank,
+    float alpha,
+    const std::vector<std::string>& target_modules,
+    const NativeTextModel& target_model,
+    std::shared_ptr<const NativeLoraAdapter>* out,
+    uint64_t* load_latency_us,
+    std::string* error) {
+    if (out == nullptr || error == nullptr || load_latency_us == nullptr) {
+        return false;
+    }
+    out->reset();
+    *load_latency_us = 0;
+    error->clear();
+    const auto started = std::chrono::steady_clock::now();
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)adapter_path;
+    (void)adapter_id;
+    (void)adapter_weight_hash;
+    (void)rank;
+    (void)alpha;
+    (void)target_modules;
+    (void)target_model;
+    *error = "native LoRA adapter loading requires an MLX build";
+    return false;
+#else
+    try {
+        if (adapter_id.empty()) {
+            *error = "adapter_id must not be empty";
+            return false;
+        }
+        if (adapter_weight_hash.empty()) {
+            *error = "adapter_weight_hash must not be empty";
+            return false;
+        }
+        if (rank == 0) {
+            *error = "LoRA rank must be greater than zero";
+            return false;
+        }
+        if (!(alpha > 0.0f) || !std::isfinite(alpha)) {
+            *error = "LoRA alpha must be finite and positive";
+            return false;
+        }
+        if (target_modules.empty()) {
+            *error = "LoRA target_modules must not be empty";
+            return false;
+        }
+        if (target_model.impl_ == nullptr || target_model.impl_->language_tensor_count == 0) {
+            *error = "native target model must be loaded before adapter shape validation";
+            return false;
+        }
+
+        const std::filesystem::path weights_path = adapter_path / "adapter_model.safetensors";
+        if (!std::filesystem::exists(weights_path)) {
+            *error = "adapter_model.safetensors not found at " + weights_path.string();
+            return false;
+        }
+
+        auto loaded = mlx::core::load_safetensors(weights_path.string());
+        std::unordered_map<std::string, array> lora_a;
+        std::unordered_map<std::string, array> lora_b;
+        for (const auto& entry : loaded.first) {
+            if (const std::optional<std::string> prefix =
+                    lora_tensor_prefix(entry.first, ".lora_A.weight")) {
+                if (target_module_allowed(*prefix, target_modules)) {
+                    lora_a.emplace(*prefix, entry.second);
+                }
+            } else if (const std::optional<std::string> prefix =
+                           lora_tensor_prefix(entry.first, ".lora_B.weight")) {
+                if (target_module_allowed(*prefix, target_modules)) {
+                    lora_b.emplace(*prefix, entry.second);
+                }
+            }
+        }
+
+        std::unique_ptr<Impl> impl(new Impl());
+        impl->adapter_id = adapter_id;
+        impl->adapter_weight_hash = adapter_weight_hash;
+        impl->target_modules = target_modules;
+        impl->rank = rank;
+        impl->alpha = alpha;
+        const float scale = alpha / static_cast<float>(rank);
+
+        std::vector<array> eval_arrays;
+        for (const auto& entry : lora_a) {
+            const std::string& prefix = entry.first;
+            const auto b_found = lora_b.find(prefix);
+            if (b_found == lora_b.end()) {
+                *error = "missing lora_B tensor for " + prefix;
+                return false;
+            }
+            const auto weight_found = target_model.impl_->tensors.find(prefix + ".weight");
+            if (weight_found == target_model.impl_->tensors.end()) {
+                *error = "adapter target module does not exist in native model: " + prefix;
+                return false;
+            }
+
+            const array& a = entry.second;
+            const array& b = b_found->second;
+            const auto& a_shape = a.shape();
+            const auto& b_shape = b.shape();
+            const auto& weight_shape = weight_found->second.shape();
+            if (a_shape.size() != 2 || b_shape.size() != 2 || weight_shape.size() != 2) {
+                *error = "LoRA tensors and target weight must be rank-2 for " + prefix;
+                return false;
+            }
+            const QuantizationSpec spec = quantization_for(*target_model.impl_, prefix);
+            const uint64_t expected_in = quantized_linear_input_dim(spec, weight_found->second);
+            const uint64_t expected_out = static_cast<uint64_t>(weight_shape[0]);
+            if (static_cast<uint64_t>(a_shape[0]) != rank ||
+                static_cast<uint64_t>(a_shape[1]) != expected_in ||
+                static_cast<uint64_t>(b_shape[0]) != expected_out ||
+                static_cast<uint64_t>(b_shape[1]) != rank) {
+                std::ostringstream message;
+                message << "LoRA shape mismatch for " << prefix
+                        << ": A=[" << a_shape[0] << ',' << a_shape[1]
+                        << "] B=[" << b_shape[0] << ',' << b_shape[1]
+                        << "] expected A=[" << rank << ',' << expected_in
+                        << "] B=[" << expected_out << ',' << rank << ']';
+                *error = message.str();
+                return false;
+            }
+
+            NativeLoraAdapter::Impl::Module module{
+                prefix,
+                target_module_for_prefix(prefix),
+                mlx::core::transpose(to_float32(a), {1, 0}),
+                mlx::core::transpose(to_float32(b), {1, 0}),
+                scale,
+                static_cast<uint64_t>(a.nbytes() + b.nbytes()),
+            };
+            impl->resident_bytes += module.resident_bytes;
+            eval_arrays.push_back(module.a_transposed);
+            eval_arrays.push_back(module.b_transposed);
+            impl->modules.push_back(std::move(module));
+        }
+
+        if (impl->modules.empty()) {
+            *error = "adapter contains no supported LoRA tensor pairs for requested target_modules";
+            return false;
+        }
+        for (const std::string& requested : target_modules) {
+            const std::string trimmed = trim_ascii(requested);
+            if (trimmed.empty()) {
+                continue;
+            }
+            bool covered = false;
+            for (const NativeLoraAdapter::Impl::Module& module : impl->modules) {
+                if (target_module_allowed(module.prefix, {trimmed})) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                *error = "adapter contains no LoRA tensor pair for target_module " + trimmed;
+                return false;
+            }
+        }
+
+        mlx::core::eval(eval_arrays);
+        *load_latency_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count());
+        std::unique_ptr<NativeLoraAdapter> adapter(new NativeLoraAdapter(std::move(impl)));
+        *out = std::shared_ptr<const NativeLoraAdapter>(std::move(adapter));
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("MLX native LoRA adapter load failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "MLX native LoRA adapter load failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+const std::string& NativeLoraAdapter::adapter_id() const {
+    static const std::string empty;
+    return impl_ == nullptr ? empty : impl_->adapter_id;
+}
+
+const std::string& NativeLoraAdapter::adapter_weight_hash() const {
+    static const std::string empty;
+    return impl_ == nullptr ? empty : impl_->adapter_weight_hash;
+}
+
+size_t NativeLoraAdapter::module_count() const {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    return impl_ == nullptr ? 0 : impl_->modules.size();
+#else
+    return 0;
+#endif
+}
+
+uint64_t NativeLoraAdapter::resident_bytes() const {
+    return impl_ == nullptr ? 0 : impl_->resident_bytes;
+}
+
+const NativeLoraAdapter::Impl* NativeLoraAdapter::impl() const {
+    return impl_.get();
+}
+
 NativeTextModel::NativeTextModel() : impl_(std::make_unique<Impl>()) {}
 
 NativeTextModel::~NativeTextModel() = default;
@@ -1835,6 +2190,78 @@ std::string NativeTextModel::summary() const {
         out << "; " << impl_->manifest_summary;
     }
     return out.str();
+}
+
+bool NativeTextModel::set_adapter(std::shared_ptr<const NativeLoraAdapter> adapter, std::string* error) {
+    if (error == nullptr) {
+        return false;
+    }
+    error->clear();
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)adapter;
+    *error = "native LoRA adapter activation requires an MLX build";
+    return false;
+#else
+    if (impl_ == nullptr || impl_->language_tensor_count == 0) {
+        *error = "native Gemma 4 model state is not loaded";
+        return false;
+    }
+    if (!adapter || adapter->module_count() == 0) {
+        *error = "cannot activate an empty LoRA adapter";
+        return false;
+    }
+    impl_->active_adapter = std::move(adapter);
+    return true;
+#endif
+}
+
+void NativeTextModel::clear_adapter() {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    if (impl_ != nullptr) {
+        impl_->active_adapter.reset();
+    }
+#endif
+}
+
+bool NativeTextModel::has_adapter() const {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    return impl_ != nullptr && impl_->active_adapter != nullptr;
+#else
+    return false;
+#endif
+}
+
+std::string NativeTextModel::active_adapter_id() const {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    if (impl_ == nullptr || !impl_->active_adapter) {
+        return std::string();
+    }
+    return impl_->active_adapter->adapter_id();
+#else
+    return std::string();
+#endif
+}
+
+size_t NativeTextModel::active_adapter_module_count() const {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    if (impl_ == nullptr || !impl_->active_adapter) {
+        return 0;
+    }
+    return impl_->active_adapter->module_count();
+#else
+    return 0;
+#endif
+}
+
+uint64_t NativeTextModel::active_adapter_resident_bytes() const {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    if (impl_ == nullptr || !impl_->active_adapter) {
+        return 0;
+    }
+    return impl_->active_adapter->resident_bytes();
+#else
+    return 0;
+#endif
 }
 
 bool NativeTextModel::forward_greedy(

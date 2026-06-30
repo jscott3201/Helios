@@ -84,11 +84,36 @@ typedef struct Gemma4KvSnapshotInfo {
     bool has_last_step;
 } Gemma4KvSnapshotInfo;
 
+typedef struct Gemma4AdapterLoadConfig {
+    const char* adapter_path;
+    const char* adapter_id;
+    const char* adapter_weight_hash;
+    const char* target_modules_csv;
+    uint32_t rank;
+    float alpha;
+} Gemma4AdapterLoadConfig;
+
+typedef struct Gemma4AdapterInfo {
+    uint64_t module_count;
+    uint64_t resident_bytes;
+    uint64_t load_latency_us;
+    bool active;
+} Gemma4AdapterInfo;
+
 Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out);
 Gemma4Status gemma4_get_last_error(char* buffer, size_t buffer_len);
 
 Gemma4Status gemma4_load_target(const Gemma4LoadConfig* config, Gemma4Target** out);
 Gemma4Status gemma4_free_target(Gemma4Target* target);
+
+Gemma4Status gemma4_load_adapter(
+    Gemma4Target* target,
+    const Gemma4AdapterLoadConfig* config,
+    Gemma4Adapter** out,
+    Gemma4AdapterInfo* info);
+Gemma4Status gemma4_free_adapter(Gemma4Adapter* adapter);
+Gemma4Status gemma4_set_adapter(Gemma4Target* target, Gemma4Adapter* adapter, Gemma4AdapterInfo* info);
+Gemma4Status gemma4_clear_adapter(Gemma4Target* target, Gemma4AdapterInfo* info);
 
 Gemma4Status gemma4_kv_create(const Gemma4KvPolicy* policy, Gemma4KvCache** out);
 Gemma4Status gemma4_kv_free(Gemma4KvCache* cache);
