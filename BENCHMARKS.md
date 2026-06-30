@@ -31,6 +31,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P06 real RAM prefix cache | Passed | `e5e61ad` | `native_ram_prefix_snapshot_ffi` | `benchmarks/out/P06-real-ram-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p06-1782851001`; native RAM snapshot restore matched fresh-prefill logits and continued decode at 4K/8K/16K, with wrong model/adapter/cache-mode namespace rejection. |
 | 2026-06-30 | P07 real SSD prefix cache | Passed | `9a4cd13` | `native_ssd_prefix_snapshot_payload` | `benchmarks/out/P07-real-ssd-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p07-1782853459`; real SSD safetensors payload restore improved warm TTFT at 4K/8K/16K, rejected namespace/corruption/mid-decode fetches, and keeps SSD disabled by default pending broader variance data. |
 | 2026-06-30 | P08 real KV compression gates | Passed | `5993b86` | `native_kv_prefix_payload_compression` | `benchmarks/out/P08-kv-compression/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p08-1782855932`; q8 full-attention payload compression passed continued-decode quality gates at 4K/8K/16K, q4 reduced payload bytes but failed greedy agreement, and compressed active decode remains disabled. |
+| 2026-06-30 | P09 real LoRA adapter hot path | Passed | `8723d50` | `native_lora_adapter_hot_path` | `benchmarks/out/P09-real-lora-adapter/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p09-1782857770747`; trusted local rank-16 q_proj/v_proj LoRA fixture loaded into real native inference, changed greedy-logit output, rejected wrong manifests, isolated adapter KV namespace, measured load/hotswap/residency, and disabled MTP while active. |
 
 ## P00 Baseline Snapshot
 
@@ -285,6 +286,33 @@ Native KV compression probe results:
 | 16K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 608.126 | 17.386% | 3.270 | 360.565 | 0.000% |
 | 16K | `mlx_affine_q4` | `false` | `false` | 1.937500 | 544.126 | 26.080% | 6.373 | 178.773 | 0.000% |
 
+## P09 Real LoRA Adapter Snapshot
+
+P09 moves adapters from registry/control-plane fixtures into the real native
+inference path for one trusted local rank-16 PEFT LoRA adapter fixture. The
+fixture uses real Gemma 4 layer-0 `q_proj` and `v_proj` shapes and is loaded
+through the native C ABI after registry import/manifest validation.
+
+Claim inventory from the `8723d50` run:
+
+| Category | Result |
+|---|---|
+| Adapter output | Active adapter output differed from base by greedy-logit delta `0.250000` on the 128-token native prefill. Greedy token IDs stayed the same for this prompt. |
+| Manifest rejection | Wrong base model, base weight hash, tokenizer hash, and chat-template hash were rejected before native load. |
+| KV namespace | Adapter identity and adapter weight hash changed namespace hash and block ID; wrong-adapter RAM prefix restore was rejected. |
+| Residency | Native adapter loaded `2` LoRA module pairs with `884736` resident bytes and `40566 us` native load latency. |
+| Hotswap | Base-to-adapter and adapter-to-base activation calls were both measured at `1 us`; clearing restored base output for the deterministic prompt. |
+| MTP default | Native MTP drafter load/verify are disabled while the standard adapter is active. |
+| Runtime blockers | None recorded. |
+
+Native adapter generation results:
+
+| Run | Context | Decode | Prefill ms | Decode ms | Total ms | Prefill Token | Prefill Logit | Generated Tokens |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `base` | 128 | 2 | 1118.985 | 158.188 | 1277.173 | 236772 | 18.625000 | `236772,236772,236772` |
+| `adapter` | 128 | 2 | 544.963 | 156.611 | 701.574 | 236772 | 18.375000 | `236772,236772,236772` |
+| `base_after_clear` | 128 | 2 | 307.862 | 150.023 | 457.885 | 236772 | 18.625000 | `236772,236772,236772` |
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -306,6 +334,8 @@ Native KV compression probe results:
 | 2026-06-30 | Added P07 real SSD prefix-cache benchmark harness and goal contract. The harness writes SSD metadata plus real native safetensors payloads, restores before prefill only, verifies restored last-step and continued decode parity, records IO/latency metrics, and exercises namespace, corruption, and mid-decode rejection paths. | `crates/gemma4d-bench/examples/p07_real_ssd_prefix_cache.rs`, `codex/goals/P07-real-ssd-prefix-cache.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `make verify`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p07_real_ssd_prefix_cache -- --out-dir benchmarks/out/P07-real-ssd-prefix-cache --cache-dir benchmarks/out/P07-real-ssd-prefix-cache/ssd-cache --model-path artifacts/models/gemma-4-12B-it-4bit`. |
 | 2026-06-30 | Added native compressed KV snapshot payload save through the narrow C ABI. The writer applies MLX affine q8 or packed q4 to selected KV tensors, records per-tensor min/scale metadata, keeps hidden/sliding tensors BF16 for P08 full-attention-only mode, and transparently reconstructs BF16 tensors on snapshot load. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P08 benchmark run. |
 | 2026-06-30 | Added P08 real KV compression benchmark harness and goal contract. The harness compares BF16/q8/q4 real native prefix payloads at 4K/8K/16K, records payload memory reduction, warm restore latency, continued-decode greedy agreement/logit delta, active KV memory, and Planar/Iso disabled status. | `crates/gemma4d-bench/examples/p08_kv_compression.rs`, `codex/goals/P08-kv-compression.goal.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit`. |
+| 2026-06-30 | Added native PEFT LoRA adapter load/activate/clear/free through the narrow C ABI and safe Rust wrappers. The native graph applies active LoRA deltas inside target `quantized_linear`, shape-validates adapter A/B tensors against loaded Gemma 4 weights, and fails MTP closed while an adapter is active. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P09 benchmark run. |
+| 2026-06-30 | Added P09 real LoRA adapter benchmark harness and goal contract. The harness creates a trusted local deterministic rank-16 adapter fixture with real Gemma 4 q_proj/v_proj shapes, imports it through the adapter registry, runs base/adapter/post-clear native generation, records load/hotswap/residency latency, checks manifest rejection, KV namespace isolation, and MTP-disabled behavior. | `crates/gemma4d-bench/examples/p09_real_lora_adapter.rs`, `codex/goals/P09-real-lora-adapter-hot-path.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p09_real_lora_adapter -- --out-dir benchmarks/out/P09-real-lora-adapter --model-path artifacts/models/gemma-4-12B-it-4bit`. |
 
 ## Verification Gates
 
@@ -341,10 +371,17 @@ Native KV compression probe results:
 | 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P08 FFI wrappers and benchmark harness. |
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Required MLX build gate for compressed native snapshot payload API. |
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P08 records, summary, report, and blocker report with no blockers at clean SHA `5993b86`. |
+| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P09 native adapter ABI and benchmark changes. |
+| 2026-06-30 | `cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Focused FFI compile gate for native adapter load/activate/clear wrappers. |
+| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Required MLX build gate for native LoRA adapter loading and delta application code. |
+| 2026-06-30 | `cargo test -p gemma4d-bench --all-targets --no-run` | Passed | Focused compile coverage for the P09 benchmark harness and adapter-registry dependency. |
+| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p09_real_lora_adapter -- --out-dir benchmarks/out/P09-real-lora-adapter --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P09 records, summary, report, and blocker report with no blockers at clean SHA `8723d50`. |
+| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused post-P09 test coverage for FFI wrappers and benchmark harness after ledger update. |
+| 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed after P09 changes. |
 
 ## Current Claim Boundaries
 
-- Current real target benchmark claims are helper-backed through the Rust C ABI
+- M12 and P00 broad throughput claims are helper-backed through the Rust C ABI
   and MLX-LM helper.
 - The hand-written native Gemma 4 graph remains opt-in and is not represented by
   M12 or P00 helper-backed throughput numbers.
@@ -382,3 +419,15 @@ Native KV compression probe results:
 - P06 warm TTFT measures namespace restore plus native snapshot import and
   cached last-step retrieval. Snapshot export cost is reported separately and is
   paid when the prefix is first cached, not on the warm restore path.
+- P07 proves SSD-backed native snapshot payload restore only before prefill for
+  the measured 4K/8K/16K text-only greedy prefixes. SSD remains disabled by
+  default pending broader variance data.
+- P08 proves q8/q4 prefix-payload compression only for full-attention KV tensors
+  restored back into BF16 active decode state. It does not enable compressed
+  active decode; q4 failed greedy agreement in the measured run.
+- P09 proves one trusted local deterministic rank-16 PEFT LoRA adapter fixture
+  on the opt-in native graph. It does not enable remote adapter loading, aLoRA,
+  adapter fusion, default server adapter routing, or adapter-active MTP.
+- P09 adapter output evidence is a greedy-logit delta on the measured 128-token
+  deterministic prompt; generated token IDs did not differ in the final default
+  run, though the shorter smoke run changed the prefill greedy token.
