@@ -1,9 +1,407 @@
-#![doc = "Placeholder crate for the narrow Rust/native FFI boundary."]
+#![doc = "Safe Rust wrappers for the narrow Gemma4D native C ABI."]
 
-pub const CRATE_NAME: &str = "gemma4d-ffi";
+use std::{
+    ffi::{CStr, CString, NulError},
+    fmt,
+    num::NonZeroU32,
+    os::raw::c_char,
+    ptr::{self, NonNull},
+};
 
-pub fn bootstrap_status() -> &'static str {
-    "placeholder"
+mod raw {
+    use super::c_char;
+
+    pub type Gemma4Status = i32;
+
+    pub const GEMMA4_OK: Gemma4Status = 0;
+    pub const GEMMA4_ERR_INVALID_ARGUMENT: Gemma4Status = 1;
+    pub const GEMMA4_ERR_UNSUPPORTED_CONFIG: Gemma4Status = 2;
+    pub const GEMMA4_ERR_MODEL_LOAD: Gemma4Status = 3;
+    pub const GEMMA4_ERR_RUNTIME: Gemma4Status = 4;
+    pub const GEMMA4_ERR_MEMORY_GUARD: Gemma4Status = 5;
+    pub const GEMMA4_ERR_CACHE: Gemma4Status = 6;
+    pub const GEMMA4_ERR_ADAPTER: Gemma4Status = 7;
+
+    #[repr(C)]
+    pub struct Gemma4Target {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct Gemma4KvCache {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct Gemma4VersionInfo {
+        pub abi_version: u32,
+        pub backend_name: *const c_char,
+        pub backend_version: *const c_char,
+    }
+
+    #[repr(C)]
+    pub struct Gemma4LoadConfig {
+        pub model_path: *const c_char,
+        pub model_id: *const c_char,
+        pub model_revision: *const c_char,
+        pub expected_architecture: *const c_char,
+        pub max_context_tokens: u32,
+        pub allow_unsupported_config: bool,
+    }
+
+    #[repr(C)]
+    pub struct Gemma4KvPolicy {
+        pub active_mode: i32,
+        pub ram_prefix_mode: i32,
+        pub ssd_prefix_mode: i32,
+        pub block_size_tokens: u32,
+        pub quantized_kv_start: u32,
+        pub compress_global_layers: bool,
+        pub compress_sliding_layers: bool,
+        pub keep_mtp_shared_layers_bf16: bool,
+        pub allow_active_compressed_decode: bool,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Gemma4StepResult {
+        pub greedy_token: i32,
+        pub greedy_logit: f32,
+        pub sequence_len: u64,
+        pub native_last_hidden: *mut std::ffi::c_void,
+    }
+
+    // SAFETY: These declarations mirror `native/gemma4_mlx/include/gemma4_mlx.h`.
+    unsafe extern "C" {
+        pub fn gemma4_runtime_version(out: *mut Gemma4VersionInfo) -> Gemma4Status;
+        pub fn gemma4_get_last_error(buffer: *mut c_char, buffer_len: usize) -> Gemma4Status;
+        pub fn gemma4_load_target(
+            config: *const Gemma4LoadConfig,
+            out: *mut *mut Gemma4Target,
+        ) -> Gemma4Status;
+        pub fn gemma4_free_target(target: *mut Gemma4Target) -> Gemma4Status;
+        pub fn gemma4_kv_create(
+            policy: *const Gemma4KvPolicy,
+            out: *mut *mut Gemma4KvCache,
+        ) -> Gemma4Status;
+        pub fn gemma4_kv_free(cache: *mut Gemma4KvCache) -> Gemma4Status;
+        pub fn gemma4_kv_reset(cache: *mut Gemma4KvCache) -> Gemma4Status;
+        pub fn gemma4_prefill(
+            target: *mut Gemma4Target,
+            cache: *mut Gemma4KvCache,
+            tokens: *const i32,
+            token_count: usize,
+            out: *mut Gemma4StepResult,
+        ) -> Gemma4Status;
+        pub fn gemma4_decode_one(
+            target: *mut Gemma4Target,
+            cache: *mut Gemma4KvCache,
+            token: i32,
+            out: *mut Gemma4StepResult,
+        ) -> Gemma4Status;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    InvalidArgument,
+    UnsupportedConfig,
+    ModelLoad,
+    Runtime,
+    MemoryGuard,
+    Cache,
+    Adapter,
+    Unknown(i32),
+}
+
+impl Status {
+    fn from_raw(raw: raw::Gemma4Status) -> Self {
+        match raw {
+            raw::GEMMA4_OK => Self::Ok,
+            raw::GEMMA4_ERR_INVALID_ARGUMENT => Self::InvalidArgument,
+            raw::GEMMA4_ERR_UNSUPPORTED_CONFIG => Self::UnsupportedConfig,
+            raw::GEMMA4_ERR_MODEL_LOAD => Self::ModelLoad,
+            raw::GEMMA4_ERR_RUNTIME => Self::Runtime,
+            raw::GEMMA4_ERR_MEMORY_GUARD => Self::MemoryGuard,
+            raw::GEMMA4_ERR_CACHE => Self::Cache,
+            raw::GEMMA4_ERR_ADAPTER => Self::Adapter,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error {
+    status: Status,
+    message: String,
+}
+
+impl Error {
+    pub fn status(&self) -> Status {
+        self.status
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<NulError> for Error {
+    fn from(error: NulError) -> Self {
+        Self {
+            status: Status::InvalidArgument,
+            message: format!("string contains interior NUL byte: {error}"),
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionInfo {
+    pub abi_version: u32,
+    pub backend_name: String,
+    pub backend_version: String,
+}
+
+pub fn runtime_version() -> Result<VersionInfo> {
+    let mut raw_version = raw::Gemma4VersionInfo {
+        abi_version: 0,
+        backend_name: ptr::null(),
+        backend_version: ptr::null(),
+    };
+
+    // SAFETY: `raw_version` is a valid, writable out pointer for the duration of the call.
+    check(unsafe { raw::gemma4_runtime_version(&mut raw_version) })?;
+
+    Ok(VersionInfo {
+        abi_version: raw_version.abi_version,
+        backend_name: cstr_to_string(raw_version.backend_name),
+        backend_version: cstr_to_string(raw_version.backend_version),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadConfig {
+    pub model_path: String,
+    pub model_id: Option<String>,
+    pub model_revision: Option<String>,
+    pub expected_architecture: Option<String>,
+    pub max_context_tokens: NonZeroU32,
+    pub allow_unsupported_config: bool,
+}
+
+impl LoadConfig {
+    pub fn smoke(model_path: impl Into<String>) -> Self {
+        Self {
+            model_path: model_path.into(),
+            model_id: Some("gemma4d-smoke".to_owned()),
+            model_revision: None,
+            expected_architecture: Some("gemma4".to_owned()),
+            max_context_tokens: NonZeroU32::new(1).expect("1 is non-zero"),
+            allow_unsupported_config: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum KvMode {
+    Bf16 = 0,
+    MlxAffineQ8 = 1,
+    MlxAffineQ4 = 2,
+}
+
+#[derive(Debug, Clone)]
+pub struct KvPolicy {
+    pub active_mode: KvMode,
+    pub ram_prefix_mode: KvMode,
+    pub ssd_prefix_mode: KvMode,
+    pub block_size_tokens: NonZeroU32,
+    pub quantized_kv_start: u32,
+    pub compress_global_layers: bool,
+    pub compress_sliding_layers: bool,
+    pub keep_mtp_shared_layers_bf16: bool,
+    pub allow_active_compressed_decode: bool,
+}
+
+impl Default for KvPolicy {
+    fn default() -> Self {
+        Self {
+            active_mode: KvMode::Bf16,
+            ram_prefix_mode: KvMode::Bf16,
+            ssd_prefix_mode: KvMode::Bf16,
+            block_size_tokens: NonZeroU32::new(1024).expect("1024 is non-zero"),
+            quantized_kv_start: 0,
+            compress_global_layers: false,
+            compress_sliding_layers: false,
+            keep_mtp_shared_layers_bf16: true,
+            allow_active_compressed_decode: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Target {
+    ptr: NonNull<raw::Gemma4Target>,
+}
+
+impl Target {
+    pub fn load(config: &LoadConfig) -> Result<Self> {
+        let model_path = CString::new(config.model_path.as_str())?;
+        let model_id = optional_cstring(config.model_id.as_deref())?;
+        let model_revision = optional_cstring(config.model_revision.as_deref())?;
+        let expected_architecture = optional_cstring(config.expected_architecture.as_deref())?;
+
+        let raw_config = raw::Gemma4LoadConfig {
+            model_path: model_path.as_ptr(),
+            model_id: optional_ptr(&model_id),
+            model_revision: optional_ptr(&model_revision),
+            expected_architecture: optional_ptr(&expected_architecture),
+            max_context_tokens: config.max_context_tokens.get(),
+            allow_unsupported_config: config.allow_unsupported_config,
+        };
+
+        let mut out = ptr::null_mut();
+        // SAFETY: `raw_config` points to C strings that live through the call, and `out` is writable.
+        check(unsafe { raw::gemma4_load_target(&raw_config, &mut out) })?;
+        let ptr = NonNull::new(out).ok_or_else(|| Error {
+            status: Status::Runtime,
+            message: "gemma4_load_target returned OK with a null target".to_owned(),
+        })?;
+        Ok(Self { ptr })
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is an owned target handle returned by `gemma4_load_target`.
+        let status = unsafe { raw::gemma4_free_target(self.ptr.as_ptr()) };
+        debug_assert_eq!(Status::from_raw(status), Status::Ok);
+    }
+}
+
+#[derive(Debug)]
+pub struct KvCache {
+    ptr: NonNull<raw::Gemma4KvCache>,
+}
+
+impl KvCache {
+    pub fn create(policy: &KvPolicy) -> Result<Self> {
+        let raw_policy = raw::Gemma4KvPolicy {
+            active_mode: policy.active_mode as i32,
+            ram_prefix_mode: policy.ram_prefix_mode as i32,
+            ssd_prefix_mode: policy.ssd_prefix_mode as i32,
+            block_size_tokens: policy.block_size_tokens.get(),
+            quantized_kv_start: policy.quantized_kv_start,
+            compress_global_layers: policy.compress_global_layers,
+            compress_sliding_layers: policy.compress_sliding_layers,
+            keep_mtp_shared_layers_bf16: policy.keep_mtp_shared_layers_bf16,
+            allow_active_compressed_decode: policy.allow_active_compressed_decode,
+        };
+
+        let mut out = ptr::null_mut();
+        // SAFETY: `raw_policy` is a valid policy and `out` is writable for the duration of the call.
+        check(unsafe { raw::gemma4_kv_create(&raw_policy, &mut out) })?;
+        let ptr = NonNull::new(out).ok_or_else(|| Error {
+            status: Status::Runtime,
+            message: "gemma4_kv_create returned OK with a null cache".to_owned(),
+        })?;
+        Ok(Self { ptr })
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        // SAFETY: `self.ptr` is an owned KV cache handle returned by `gemma4_kv_create`.
+        check(unsafe { raw::gemma4_kv_reset(self.ptr.as_ptr()) })
+    }
+}
+
+impl Drop for KvCache {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is an owned KV cache handle returned by `gemma4_kv_create`.
+        let status = unsafe { raw::gemma4_kv_free(self.ptr.as_ptr()) };
+        debug_assert_eq!(Status::from_raw(status), Status::Ok);
+    }
+}
+
+pub fn smoke_prefill(target: &Target, cache: &mut KvCache, tokens: &[i32]) -> Result<()> {
+    let mut out = raw::Gemma4StepResult::default();
+    let token_ptr = if tokens.is_empty() {
+        ptr::null()
+    } else {
+        tokens.as_ptr()
+    };
+
+    // SAFETY: handles come from safe wrappers; token pointer/count describe `tokens`; `out` is writable.
+    check(unsafe {
+        raw::gemma4_prefill(
+            target.ptr.as_ptr(),
+            cache.ptr.as_ptr(),
+            token_ptr,
+            tokens.len(),
+            &mut out,
+        )
+    })
+}
+
+pub fn smoke_decode_one(target: &Target, cache: &mut KvCache, token: i32) -> Result<()> {
+    let mut out = raw::Gemma4StepResult::default();
+    // SAFETY: handles come from safe wrappers and `out` is writable for the duration of the call.
+    check(unsafe {
+        raw::gemma4_decode_one(target.ptr.as_ptr(), cache.ptr.as_ptr(), token, &mut out)
+    })
+}
+
+fn check(status: raw::Gemma4Status) -> Result<()> {
+    match Status::from_raw(status) {
+        Status::Ok => Ok(()),
+        status => Err(Error {
+            status,
+            message: last_error_message(),
+        }),
+    }
+}
+
+fn last_error_message() -> String {
+    let mut buffer = [0 as c_char; 512];
+    // SAFETY: `buffer` is writable and its length matches the value passed to native code.
+    let status = unsafe { raw::gemma4_get_last_error(buffer.as_mut_ptr(), buffer.len()) };
+    if Status::from_raw(status) != Status::Ok {
+        return "native error unavailable".to_owned();
+    }
+
+    // SAFETY: native code always writes a NUL-terminated string into non-empty buffers.
+    unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn cstr_to_string(value: *const c_char) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+
+    // SAFETY: successful native version query returns pointers to static NUL-terminated strings.
+    unsafe { CStr::from_ptr(value) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn optional_cstring(value: Option<&str>) -> Result<Option<CString>> {
+    value.map(CString::new).transpose().map_err(Into::into)
+}
+
+fn optional_ptr(value: &Option<CString>) -> *const c_char {
+    value.as_ref().map_or(ptr::null(), |value| value.as_ptr())
 }
 
 #[cfg(test)]
@@ -11,8 +409,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reports_placeholder_status() {
-        assert_eq!(CRATE_NAME, "gemma4d-ffi");
-        assert_eq!(bootstrap_status(), "placeholder");
+    fn runtime_version_reports_smoke_backend() {
+        let version = runtime_version().expect("runtime version should be available");
+        assert_eq!(version.abi_version, 1);
+        assert_eq!(version.backend_name, "gemma4_mlx");
+        assert_eq!(version.backend_version, "m01-ffi-smoke");
+    }
+
+    #[test]
+    fn target_and_kv_lifecycle_work_without_model_loading() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        cache.reset().expect("kv reset");
+        drop(cache);
+        drop(target);
+    }
+
+    #[test]
+    fn invalid_target_config_returns_error_message() {
+        let err = Target::load(&LoadConfig::smoke("")).expect_err("empty model path should fail");
+        assert_eq!(err.status(), Status::InvalidArgument);
+        assert!(err.message().contains("model_path"));
+    }
+
+    #[test]
+    fn execution_stubs_return_unsupported_config() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+
+        let prefill =
+            smoke_prefill(&target, &mut cache, &[1, 2, 3]).expect_err("M01 prefill is a stub");
+        assert_eq!(prefill.status(), Status::UnsupportedConfig);
+        assert!(prefill.message().contains("not implemented in M01"));
+
+        let decode = smoke_decode_one(&target, &mut cache, 1).expect_err("M01 decode is a stub");
+        assert_eq!(decode.status(), Status::UnsupportedConfig);
+        assert!(decode.message().contains("not implemented in M01"));
+    }
+
+    #[test]
+    fn raw_null_pointers_return_invalid_argument() {
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe { raw::gemma4_runtime_version(ptr::null_mut()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("runtime_version"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe { raw::gemma4_free_target(ptr::null_mut()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("free_target"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe { raw::gemma4_kv_create(ptr::null(), ptr::null_mut()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("kv_create"));
     }
 }
