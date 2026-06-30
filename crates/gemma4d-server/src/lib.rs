@@ -36,6 +36,7 @@ pub struct GenerateOptions {
 pub struct GenerateSummary {
     pub input_tokens: usize,
     pub generated_tokens: Vec<i32>,
+    pub generated_logits: Vec<f32>,
     pub model_load: Duration,
     pub ttft: Duration,
     pub prefill: Duration,
@@ -589,10 +590,12 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
     let mut peak_rss_mb = step.peak_rss_mb;
 
     let mut generated_tokens = Vec::with_capacity(options.max_new_tokens);
+    let mut generated_logits = Vec::with_capacity(options.max_new_tokens);
     let mut decode_token_latencies = Vec::with_capacity(options.max_new_tokens.saturating_sub(1));
     let decode_started = Instant::now();
     for index in 0..options.max_new_tokens {
         generated_tokens.push(step.greedy_token);
+        generated_logits.push(step.greedy_logit);
         if index + 1 < options.max_new_tokens {
             let token_started = Instant::now();
             step = ffi::decode_one(&target, &mut cache, step.greedy_token)
@@ -608,6 +611,7 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
     Ok(GenerateSummary {
         input_tokens: token_ids.len(),
         generated_tokens,
+        generated_logits,
         model_load,
         ttft,
         prefill,
@@ -914,9 +918,10 @@ impl GenerateSummary {
 
     fn to_json(&self) -> String {
         format!(
-            "{{\"input_tokens\":{},\"generated_tokens\":{:?},\"model_load_ms\":{:.3},\"prefill_ms\":{:.3},\"ttft_ms\":{:.3},\"decode_ms\":{:.3},\"total_ms\":{:.3},\"decode_tps\":{:.3},\"decode_token_latencies_ms\":{},\"mlx_active_memory_gb\":null,\"mlx_cache_memory_gb\":null,\"peak_memory_gb\":{:.3},\"peak_rss_mb\":{:.1}}}",
+            "{{\"input_tokens\":{},\"generated_tokens\":{:?},\"generated_logits\":{:?},\"model_load_ms\":{:.3},\"prefill_ms\":{:.3},\"ttft_ms\":{:.3},\"decode_ms\":{:.3},\"total_ms\":{:.3},\"decode_tps\":{:.3},\"decode_token_latencies_ms\":{},\"mlx_active_memory_gb\":null,\"mlx_cache_memory_gb\":null,\"peak_memory_gb\":{:.3},\"peak_rss_mb\":{:.1}}}",
             self.input_tokens,
             self.generated_tokens,
+            self.generated_logits,
             self.model_load_ms(),
             self.prefill_ms(),
             self.ttft_ms(),
