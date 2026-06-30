@@ -4,6 +4,8 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
+    num::NonZeroU32,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -11,6 +13,8 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use crate::{GenerateOptions, GenerateSummary, detokenize_tokens, generate};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const SERVER_NAME: &str = "gemma4d";
@@ -52,10 +56,28 @@ impl From<serde_json::Error> for HttpError {
 pub struct ServerConfig {
     pub bind_addr: SocketAddr,
     pub model_id: String,
+    pub backend: ServerBackend,
+    pub model_path: Option<PathBuf>,
     pub max_context_tokens: usize,
     pub memory_budget_bytes: u64,
     pub queue_capacity: usize,
     pub adapters: Vec<ServerAdapter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerBackend {
+    Stub,
+    RealHelper,
+}
+
+impl ServerBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stub => "stub",
+            Self::RealHelper => "real_helper",
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -65,6 +87,8 @@ impl Default for ServerConfig {
                 .parse()
                 .expect("default bind address is valid"),
             model_id: "mlx-community/gemma-4-12B-it-4bit".to_owned(),
+            backend: ServerBackend::Stub,
+            model_path: None,
             max_context_tokens: 32_768,
             memory_budget_bytes: 12 * 1024 * 1024 * 1024,
             queue_capacity: 0,
@@ -80,6 +104,12 @@ impl ServerConfig {
 
     pub fn with_bind_addr(mut self, bind_addr: SocketAddr) -> Self {
         self.bind_addr = bind_addr;
+        self
+    }
+
+    pub fn with_real_helper(mut self, model_path: impl Into<PathBuf>) -> Self {
+        self.backend = ServerBackend::RealHelper;
+        self.model_path = Some(model_path.into());
         self
     }
 
@@ -122,7 +152,9 @@ pub struct ServerMetrics {
     pub queue_depth: u64,
     pub errors_total: BTreeMap<String, u64>,
     pub memory_process_rss_bytes: u64,
+    pub memory_peak_mlx_bytes: u64,
     pub memory_guard_rejections_total: u64,
+    pub model_load_seconds: f64,
     pub prefill_tokens_total: u64,
     pub decode_tokens_total: u64,
     pub prefill_seconds: f64,
@@ -169,7 +201,8 @@ impl ServerRuntime {
             ("GET", "/health") => self.json_ok(json!({
                 "status": "ok",
                 "server": SERVER_NAME,
-                "model_loaded": true,
+                "backend": self.config.backend.as_str(),
+                "model_loaded": self.backend_model_available(),
                 "bind": self.config.bind_addr.to_string(),
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
             })),
@@ -191,9 +224,11 @@ impl ServerRuntime {
             ("GET", "/v1/runtime/snapshot") => self.runtime_snapshot_response(),
             ("GET", "/v1/runtime/events") => self.runtime_events_response(),
             ("GET", "/v1/config") => self.json_ok(json!({
-                "status": "stub",
+                "status": self.config.backend.as_str(),
                 "bind": self.config.bind_addr.to_string(),
                 "model": self.config.model_id,
+                "backend": self.config.backend.as_str(),
+                "model_path": self.config.model_path.as_ref().map(|path| path.display().to_string()),
                 "max_context_tokens": self.config.max_context_tokens,
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
             })),
@@ -246,10 +281,21 @@ impl ServerRuntime {
             Err(error) => return self.error_response(error.status, error.code, error.message),
         };
         let _guard = ActiveGenerationGuard::enter(self);
+        match self.config.backend {
+            ServerBackend::Stub => self.stub_chat_completions_response(request, admitted),
+            ServerBackend::RealHelper => self.real_chat_completions_response(request, admitted),
+        }
+    }
+
+    fn stub_chat_completions_response(
+        &self,
+        request: ChatCompletionRequest,
+        admitted: AdmittedRequest,
+    ) -> HttpResponse {
         let response_text = stub_chat_response(&request, admitted.adapter_id.as_deref());
         let completion_id = format!("chatcmpl-gemma4d-stub-{}", now_unix_seconds());
         let created = now_unix_seconds();
-        self.record_generation(&request, &response_text, admitted.adapter_id.as_deref());
+        self.record_stub_generation(&request, &response_text, admitted.adapter_id.as_deref());
 
         if request.stream.unwrap_or(false) {
             self.increment_streaming();
@@ -284,6 +330,93 @@ impl ServerRuntime {
         }
     }
 
+    fn real_chat_completions_response(
+        &self,
+        request: ChatCompletionRequest,
+        admitted: AdmittedRequest,
+    ) -> HttpResponse {
+        let Some(model_path) = self.config.model_path.clone() else {
+            return self.error_response(
+                500,
+                "native_backend_error",
+                "real-helper backend requires a configured model path",
+            );
+        };
+        let Some(max_context_tokens) = usize_to_nonzero_u32(self.config.max_context_tokens) else {
+            return self.error_response(
+                500,
+                "unsupported_model_config",
+                "max_context_tokens must fit in u32 for the helper backend",
+            );
+        };
+        let max_new_tokens = request.max_tokens.unwrap_or(16);
+        let prompt = render_chat_prompt(&request.messages);
+        let summary = match generate(GenerateOptions {
+            model_path: model_path.clone(),
+            prompt: Some(prompt),
+            token_ids: Vec::new(),
+            max_new_tokens,
+            max_context_tokens,
+            output_json: false,
+        }) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return self.error_response(
+                    500,
+                    "native_backend_error",
+                    format!("real-helper generation failed: {error}"),
+                );
+            }
+        };
+        let response_text = match detokenize_tokens(&model_path, &summary.generated_tokens) {
+            Ok(text) if !text.is_empty() => text,
+            Ok(_) => generated_tokens_text(&summary.generated_tokens),
+            Err(error) => {
+                return self.error_response(
+                    500,
+                    "native_backend_error",
+                    format!("real-helper detokenize failed: {error}"),
+                );
+            }
+        };
+        let completion_id = format!("chatcmpl-gemma4d-real-{}", now_unix_seconds());
+        let created = now_unix_seconds();
+        self.record_real_generation(&summary, admitted.adapter_id.as_deref());
+
+        if request.stream.unwrap_or(false) {
+            self.increment_streaming();
+            HttpResponse::ok(
+                "text/event-stream",
+                streaming_chat_body(&completion_id, created, &request.model, &response_text),
+            )
+        } else {
+            self.increment_chat();
+            let prompt_tokens = summary.input_tokens;
+            let completion_tokens = summary.generated_tokens.len();
+            self.json_ok(json!({
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text,
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+                "system_fingerprint": admitted.adapter_id.unwrap_or_else(|| "base".to_owned()),
+                "gemma4d_metrics": real_generation_metrics_json(&summary),
+            }))
+        }
+    }
+
     fn admit_chat_request(
         &self,
         request: &ChatCompletionRequest,
@@ -299,7 +432,7 @@ impl ServerRuntime {
             return Err(ApiError::new(
                 400,
                 "unsupported_model_config",
-                "temperature must be 0 for the M11 stub backend",
+                "temperature must be 0 for the Gemma4D server backend",
             ));
         }
         let max_tokens = request.max_tokens.unwrap_or(16);
@@ -344,6 +477,13 @@ impl ServerRuntime {
             .filter(|adapter| !adapter.is_empty() && *adapter != "none")
             .map(str::to_owned);
         if let Some(adapter_id) = adapter_id.as_deref() {
+            if self.config.backend == ServerBackend::RealHelper {
+                return Err(ApiError::new(
+                    400,
+                    "unsupported_model_config",
+                    "real-helper backend does not apply adapters in P02",
+                ));
+            }
             let adapters = self.adapters.lock().expect("adapters lock");
             let Some(adapter) = adapters.iter().find(|adapter| adapter.id == adapter_id) else {
                 return Err(ApiError::new(
@@ -474,8 +614,16 @@ impl ServerRuntime {
             metrics.memory_process_rss_bytes
         ));
         lines.push(format!(
+            "gemma4d_memory_peak_mlx_bytes {}",
+            metrics.memory_peak_mlx_bytes
+        ));
+        lines.push(format!(
             "gemma4d_memory_guard_rejections_total {}",
             metrics.memory_guard_rejections_total
+        ));
+        lines.push(format!(
+            "gemma4d_model_load_seconds {:.6}",
+            metrics.model_load_seconds
         ));
         lines.push(format!(
             "gemma4d_prefill_tokens_total {}",
@@ -569,7 +717,7 @@ impl ServerRuntime {
             .streaming_chat_completions_total += 1;
     }
 
-    fn record_generation(
+    fn record_stub_generation(
         &self,
         request: &ChatCompletionRequest,
         response_text: &str,
@@ -594,6 +742,30 @@ impl ServerRuntime {
         }
     }
 
+    fn record_real_generation(&self, summary: &GenerateSummary, adapter_id: Option<&str>) {
+        let mut metrics = self.metrics.lock().expect("metrics lock");
+        let prompt_tokens = summary.input_tokens as u64;
+        let completion_tokens = summary.generated_tokens.len() as u64;
+        metrics.prefill_tokens_total = metrics.prefill_tokens_total.saturating_add(prompt_tokens);
+        metrics.decode_tokens_total = metrics
+            .decode_tokens_total
+            .saturating_add(completion_tokens);
+        metrics.model_load_seconds += summary.model_load.as_secs_f64();
+        metrics.prefill_seconds += summary.prefill.as_secs_f64();
+        metrics.decode_seconds += summary.decode.as_secs_f64();
+        metrics.ttft_seconds += summary.ttft.as_secs_f64();
+        metrics.tokens_per_second =
+            tokens_per_second(summary.generated_tokens.len(), summary.decode);
+        metrics.memory_process_rss_bytes = mb_to_bytes(summary.peak_rss_mb);
+        metrics.memory_peak_mlx_bytes = gb_to_bytes(summary.peak_memory_gb);
+        if let Some(adapter_id) = adapter_id {
+            *metrics
+                .adapter_requests_total
+                .entry(adapter_id.to_owned())
+                .or_insert(0) += 1;
+        }
+    }
+
     fn record_error(&self, code: &str) {
         let mut metrics = self.metrics.lock().expect("metrics lock");
         *metrics.errors_total.entry(code.to_owned()).or_insert(0) += 1;
@@ -608,6 +780,17 @@ impl ServerRuntime {
             .filter(|adapter| adapter.loaded)
             .map(|adapter| adapter.resident_bytes)
             .sum();
+    }
+
+    fn backend_model_available(&self) -> bool {
+        match self.config.backend {
+            ServerBackend::Stub => true,
+            ServerBackend::RealHelper => self
+                .config
+                .model_path
+                .as_ref()
+                .is_some_and(|path| path.exists()),
+        }
     }
 }
 
@@ -863,6 +1046,23 @@ fn stub_chat_response(request: &ChatCompletionRequest, adapter_id: Option<&str>)
     }
 }
 
+fn render_chat_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        if !prompt.is_empty() {
+            prompt.push('\n');
+        }
+        prompt.push_str(message.role.trim());
+        prompt.push_str(": ");
+        prompt.push_str(message.content.trim());
+    }
+    if !prompt.is_empty() {
+        prompt.push('\n');
+    }
+    prompt.push_str("assistant:");
+    prompt
+}
+
 fn streaming_chat_body(id: &str, created: u64, model: &str, response_text: &str) -> String {
     let role = json!({
         "id": id,
@@ -939,6 +1139,53 @@ fn estimate_prompt_tokens(messages: &[ChatMessage]) -> usize {
 
 fn estimate_text_tokens(text: &str) -> usize {
     text.split_whitespace().count().max(1)
+}
+
+fn real_generation_metrics_json(summary: &GenerateSummary) -> serde_json::Value {
+    json!({
+        "input_tokens": summary.input_tokens,
+        "generated_tokens": summary.generated_tokens.len(),
+        "model_load_ms": duration_ms(summary.model_load),
+        "prefill_ms": duration_ms(summary.prefill),
+        "ttft_ms": duration_ms(summary.ttft),
+        "decode_ms": duration_ms(summary.decode),
+        "total_ms": duration_ms(summary.total),
+        "decode_tps": tokens_per_second(summary.generated_tokens.len(), summary.decode),
+        "decode_token_latencies_ms": summary.decode_token_latencies.iter().map(|latency| duration_ms(*latency)).collect::<Vec<_>>(),
+        "mlx_active_memory_gb": null,
+        "mlx_cache_memory_gb": null,
+        "peak_memory_gb": summary.peak_memory_gb,
+        "peak_rss_mb": summary.peak_rss_mb,
+    })
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn tokens_per_second(tokens: usize, duration: Duration) -> f64 {
+    if tokens == 0 || duration.is_zero() {
+        0.0
+    } else {
+        tokens as f64 / duration.as_secs_f64()
+    }
+}
+
+fn mb_to_bytes(value: f32) -> u64 {
+    (value.max(0.0) * 1024.0 * 1024.0).round() as u64
+}
+
+fn gb_to_bytes(value: f32) -> u64 {
+    (value.max(0.0) * 1024.0 * 1024.0 * 1024.0).round() as u64
+}
+
+fn usize_to_nonzero_u32(value: usize) -> Option<NonZeroU32> {
+    let value = u32::try_from(value).ok()?;
+    NonZeroU32::new(value)
+}
+
+fn generated_tokens_text(tokens: &[i32]) -> String {
+    format!("generated_tokens={tokens:?}")
 }
 
 fn compact_json(value: &serde_json::Value) -> String {
@@ -1098,8 +1345,10 @@ mod tests {
             "gemma4d_requests_total",
             "gemma4d_active_generations",
             "gemma4d_errors_total",
+            "gemma4d_model_load_seconds",
             "gemma4d_prefill_tokens_total",
             "gemma4d_decode_tokens_total",
+            "gemma4d_memory_peak_mlx_bytes",
             "gemma4d_adapters_loaded",
             "gemma4d_adapter_requests_total{adapter_id=\"rust-coding-r16-v1\"}",
         ] {
@@ -1136,6 +1385,24 @@ mod tests {
         );
         assert_eq!(memory.status, 400);
         assert!(memory.body.contains("memory_guard_rejected"));
+    }
+
+    #[test]
+    fn real_helper_requires_configured_model_path() {
+        let config = ServerConfig {
+            backend: ServerBackend::RealHelper,
+            model_path: None,
+            ..ServerConfig::default()
+        };
+        let response = ServerRuntime::new(config).handle_request(
+            "POST",
+            "/v1/chat/completions",
+            chat_body(false, None).as_bytes(),
+        );
+
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("native_backend_error"));
+        assert!(response.body.contains("model path"));
     }
 
     #[test]

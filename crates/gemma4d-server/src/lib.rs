@@ -14,7 +14,7 @@ use gemma4d_adapters::{
     AdapterCompatibility, AdapterRegistry, AdapterSummary, ImportedAdapter, TrustedPathPolicy,
 };
 use gemma4d_ffi::{self as ffi, KvCache, KvPolicy, LoadConfig, Target};
-use http::{ServerConfig, parse_bind_addr, serve_blocking};
+use http::{ServerBackend, ServerConfig, parse_bind_addr, serve_blocking};
 
 pub const CRATE_NAME: &str = "gemma4d-server";
 
@@ -77,6 +77,8 @@ pub struct AdapterListOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeOptions {
     pub bind_addr: std::net::SocketAddr,
+    pub backend: ServerBackend,
+    pub model_path: Option<PathBuf>,
     pub max_context_tokens: usize,
     pub memory_budget_mb: u64,
 }
@@ -170,6 +172,8 @@ where
 {
     let mut args = args.into_iter().map(Into::into).peekable();
     let mut bind_addr = ServerConfig::default().bind_addr;
+    let mut backend = ServerConfig::default().backend;
+    let mut model_path = None;
     let mut max_context_tokens = ServerConfig::default().max_context_tokens;
     let mut memory_budget_mb = ServerConfig::default().memory_budget_bytes / (1024 * 1024);
 
@@ -178,6 +182,16 @@ where
             "--bind" => {
                 let value = required_value(&mut args, "--bind")?;
                 bind_addr = parse_bind_addr(&value).map_err(CliError::Usage)?;
+            }
+            "--backend" => {
+                let value = required_value(&mut args, "--backend")?;
+                backend = parse_server_backend(&value)?;
+            }
+            "--real-helper" => {
+                backend = ServerBackend::RealHelper;
+            }
+            "--model-path" => {
+                model_path = Some(PathBuf::from(required_value(&mut args, "--model-path")?));
             }
             "--max-context-tokens" => {
                 max_context_tokens = parse_positive_usize(
@@ -207,8 +221,24 @@ where
         }
     }
 
+    match backend {
+        ServerBackend::Stub if model_path.is_some() => {
+            return Err(CliError::Usage(
+                "--model-path requires --backend real-helper".to_owned(),
+            ));
+        }
+        ServerBackend::RealHelper if model_path.is_none() => {
+            return Err(CliError::Usage(
+                "serve --backend real-helper requires --model-path".to_owned(),
+            ));
+        }
+        _ => {}
+    }
+
     Ok(ServeOptions {
         bind_addr,
+        backend,
+        model_path,
         max_context_tokens,
         memory_budget_mb,
     })
@@ -216,6 +246,8 @@ where
 
 pub fn serve(options: ServeOptions) -> Result<(), CliError> {
     let mut config = ServerConfig::localhost_default().with_bind_addr(options.bind_addr);
+    config.backend = options.backend;
+    config.model_path = options.model_path;
     config.max_context_tokens = options.max_context_tokens;
     config.memory_budget_bytes = options.memory_budget_mb.saturating_mul(1024 * 1024);
     serve_blocking(config)
@@ -619,6 +651,45 @@ print(json.dumps(tokenizer.encode(sys.argv[2]), separators=(",", ":")))
     parse_token_json(stdout.trim())
 }
 
+pub fn detokenize_tokens(model_path: &PathBuf, tokens: &[i32]) -> Result<String, CliError> {
+    let python = std::env::var("GEMMA4D_MLX_LM_PYTHON")
+        .unwrap_or_else(|_| "/opt/homebrew/opt/mlx-lm/libexec/bin/python".to_owned());
+    let token_json = format!(
+        "[{}]",
+        tokens
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let script = r#"
+import json
+import sys
+from pathlib import Path
+from mlx_lm.utils import load_tokenizer
+tokenizer = load_tokenizer(Path(sys.argv[1]))
+print(tokenizer.decode(json.loads(sys.argv[2])), end="")
+"#;
+
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .arg(model_path)
+        .arg(token_json)
+        .output()
+        .map_err(|error| CliError::Runtime(format!("failed to run detokenizer helper: {error}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::Runtime(format!(
+            "detokenizer helper failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn required_value<I>(args: &mut std::iter::Peekable<I>, flag: &str) -> Result<String, CliError>
 where
     I: Iterator<Item = String>,
@@ -664,6 +735,16 @@ fn parse_nonzero_u32(value: &str, flag: &str) -> Result<NonZeroU32, CliError> {
         .map_err(|error| CliError::Usage(format!("{flag} must be a positive integer: {error}")))?;
     NonZeroU32::new(parsed)
         .ok_or_else(|| CliError::Usage(format!("{flag} must be greater than zero")))
+}
+
+fn parse_server_backend(value: &str) -> Result<ServerBackend, CliError> {
+    match value {
+        "stub" => Ok(ServerBackend::Stub),
+        "real-helper" | "real_helper" => Ok(ServerBackend::RealHelper),
+        other => Err(CliError::Usage(format!(
+            "--backend must be stub or real-helper, got '{other}'"
+        ))),
+    }
 }
 
 fn parse_token_id(value: &str) -> Result<i32, CliError> {
@@ -723,7 +804,7 @@ fn usage() -> String {
 }
 
 fn serve_usage() -> String {
-    "usage: gemma4d serve [--bind 127.0.0.1:8080] [--max-context-tokens N] [--memory-budget-mb N]"
+    "usage: gemma4d serve [--bind 127.0.0.1:8080] [--backend stub|real-helper --model-path PATH] [--max-context-tokens N] [--memory-budget-mb N]"
         .to_owned()
 }
 
@@ -863,8 +944,35 @@ mod tests {
     fn serve_parse_defaults_to_localhost() {
         let options = parse_serve_options(std::iter::empty::<&str>()).expect("serve options");
         assert_eq!(options.bind_addr.to_string(), "127.0.0.1:8080");
+        assert_eq!(options.backend, ServerBackend::Stub);
+        assert_eq!(options.model_path, None);
         assert_eq!(options.max_context_tokens, 32_768);
         assert!(options.memory_budget_mb > 0);
+    }
+
+    #[test]
+    fn serve_parse_accepts_real_helper_backend() {
+        let options = parse_serve_options([
+            "--backend",
+            "real-helper",
+            "--model-path",
+            "/tmp/gemma4d-model",
+        ])
+        .expect("serve options");
+
+        assert_eq!(options.backend, ServerBackend::RealHelper);
+        assert_eq!(
+            options.model_path,
+            Some(PathBuf::from("/tmp/gemma4d-model"))
+        );
+    }
+
+    #[test]
+    fn serve_parse_requires_model_path_for_real_helper() {
+        let err =
+            parse_serve_options(["--backend", "real-helper"]).expect_err("model path required");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--model-path"));
     }
 
     #[test]
