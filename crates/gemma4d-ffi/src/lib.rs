@@ -128,6 +128,14 @@ mod raw {
             snapshot: *const Gemma4KvSnapshot,
             out: *mut Gemma4KvSnapshotInfo,
         ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_save(
+            snapshot: *const Gemma4KvSnapshot,
+            payload_path: *const c_char,
+        ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_load(
+            payload_path: *const c_char,
+            out: *mut *mut Gemma4KvSnapshot,
+        ) -> Gemma4Status;
         pub fn gemma4_kv_snapshot_free(snapshot: *mut Gemma4KvSnapshot) -> Gemma4Status;
         pub fn gemma4_prefill(
             target: *mut Gemma4Target,
@@ -477,6 +485,18 @@ pub struct KvSnapshotInfo {
 }
 
 impl KvSnapshot {
+    pub fn load_from_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = CString::new(path.as_ref().to_string_lossy().as_ref())?;
+        let mut out = ptr::null_mut();
+        // SAFETY: `path` is a live C string and `out` is writable for the duration of the call.
+        check(unsafe { raw::gemma4_kv_snapshot_load(path.as_ptr(), &mut out) })?;
+        let ptr = NonNull::new(out).ok_or_else(|| Error {
+            status: Status::Runtime,
+            message: "gemma4_kv_snapshot_load returned OK with a null snapshot".to_owned(),
+        })?;
+        Ok(Self { ptr })
+    }
+
     pub fn info(&self) -> Result<KvSnapshotInfo> {
         let mut out = raw::Gemma4KvSnapshotInfo::default();
         // SAFETY: `self.ptr` is an owned snapshot handle and `out` is writable.
@@ -487,6 +507,12 @@ impl KvSnapshot {
             token_count: out.token_count,
             has_last_step: out.has_last_step,
         })
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let path = CString::new(path.as_ref().to_string_lossy().as_ref())?;
+        // SAFETY: `self.ptr` is an owned snapshot handle and `path` is a live C string.
+        check(unsafe { raw::gemma4_kv_snapshot_save(self.ptr.as_ptr(), path.as_ptr()) })
     }
 }
 

@@ -1060,6 +1060,41 @@ void trace_parity_logits(const std::vector<int32_t>& tokens, const array& logits
     std::cerr << "}\n";
 }
 
+std::string bool_metadata(bool value) {
+    return value ? "true" : "false";
+}
+
+bool metadata_bool(const std::unordered_map<std::string, std::string>& metadata, const std::string& key) {
+    const auto found = metadata.find(key);
+    if (found == metadata.end()) {
+        return false;
+    }
+    return found->second == "true" || found->second == "1";
+}
+
+uint64_t metadata_u64(
+    const std::unordered_map<std::string, std::string>& metadata,
+    const std::string& key,
+    uint64_t fallback = 0) {
+    const auto found = metadata.find(key);
+    if (found == metadata.end() || found->second.empty()) {
+        return fallback;
+    }
+    return std::stoull(found->second);
+}
+
+std::string shape_metadata(const array& value) {
+    std::ostringstream out;
+    const auto& shape = value.shape();
+    for (size_t index = 0; index < shape.size(); ++index) {
+        if (index != 0) {
+            out << 'x';
+        }
+        out << shape[index];
+    }
+    return out.str();
+}
+
 #endif
 
 } // namespace
@@ -1152,6 +1187,210 @@ std::unique_ptr<NativeKvState> NativeKvState::clone() const {
     cloned->impl_->sequence_len = impl_->sequence_len;
     cloned->impl_->active_bytes = impl_->active_bytes;
     return cloned;
+}
+
+bool NativeKvState::save_safetensors(
+    const std::filesystem::path& payload_path,
+    const NativeHiddenState* last_hidden,
+    const std::unordered_map<std::string, std::string>& metadata,
+    std::string* error) const {
+    if (error == nullptr) {
+        return false;
+    }
+    error->clear();
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)payload_path;
+    (void)last_hidden;
+    (void)metadata;
+    *error = "native KV snapshot payload save requires MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->layers.empty() || impl_->sequence_len == 0) {
+            *error = "native KV snapshot payload save requires a populated KV state";
+            return false;
+        }
+
+        std::unordered_map<std::string, array> arrays;
+        std::unordered_map<std::string, std::string> payload_metadata = metadata;
+        payload_metadata["format"] = "gemma4d_native_kv_snapshot_v1";
+        payload_metadata["kv_sequence_len"] = std::to_string(impl_->sequence_len);
+        payload_metadata["kv_active_bytes"] = std::to_string(impl_->active_bytes);
+        payload_metadata["kv_layer_count"] = std::to_string(impl_->layers.size());
+
+        std::vector<array> eval_arrays;
+        eval_arrays.reserve((impl_->layers.size() * 2) + 5);
+        for (size_t index = 0; index < impl_->layers.size(); ++index) {
+            const NativeKvState::Impl::Layer& layer = impl_->layers[index];
+            const std::string prefix = "kv.layer_" + std::to_string(index);
+            payload_metadata[prefix + ".full_attention"] = bool_metadata(layer.full_attention);
+            payload_metadata[prefix + ".has_key"] = bool_metadata(layer.key.has_value());
+            payload_metadata[prefix + ".has_value"] = bool_metadata(layer.value.has_value());
+            if (layer.key.has_value()) {
+                const std::string name = prefix + ".key";
+                arrays.insert_or_assign(name, *layer.key);
+                payload_metadata[name + ".shape"] = shape_metadata(*layer.key);
+                eval_arrays.push_back(*layer.key);
+            }
+            if (layer.value.has_value()) {
+                const std::string name = prefix + ".value";
+                arrays.insert_or_assign(name, *layer.value);
+                payload_metadata[name + ".shape"] = shape_metadata(*layer.value);
+                eval_arrays.push_back(*layer.value);
+            }
+        }
+
+        if (last_hidden != nullptr && last_hidden->impl_ != nullptr) {
+            payload_metadata["hidden_present"] = "true";
+            payload_metadata["hidden_sequence_len"] = std::to_string(last_hidden->impl_->sequence_len);
+            payload_metadata["hidden_size"] = std::to_string(last_hidden->impl_->hidden_size);
+            arrays.insert_or_assign("hidden.last", last_hidden->impl_->hidden);
+            payload_metadata["hidden.last.shape"] = shape_metadata(last_hidden->impl_->hidden);
+            eval_arrays.push_back(last_hidden->impl_->hidden);
+
+            auto add_hidden = [&](const char* name, const std::optional<array>& value) {
+                const std::string key = std::string("hidden.") + name;
+                payload_metadata[key + ".present"] = bool_metadata(value.has_value());
+                if (value.has_value()) {
+                    arrays.insert_or_assign(key, *value);
+                    payload_metadata[key + ".shape"] = shape_metadata(*value);
+                    eval_arrays.push_back(*value);
+                }
+            };
+            add_hidden("full_attention_key", last_hidden->impl_->full_attention_key);
+            add_hidden("full_attention_value", last_hidden->impl_->full_attention_value);
+            add_hidden("sliding_attention_key", last_hidden->impl_->sliding_attention_key);
+            add_hidden("sliding_attention_value", last_hidden->impl_->sliding_attention_value);
+        } else {
+            payload_metadata["hidden_present"] = "false";
+        }
+
+        if (arrays.empty()) {
+            *error = "native KV snapshot payload save found no arrays to persist";
+            return false;
+        }
+        if (!eval_arrays.empty()) {
+            mlx::core::eval(eval_arrays);
+        }
+        if (!payload_path.parent_path().empty()) {
+            std::filesystem::create_directories(payload_path.parent_path());
+        }
+        mlx::core::save_safetensors(payload_path.string(), std::move(arrays), std::move(payload_metadata));
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native KV snapshot payload save failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native KV snapshot payload save failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+bool NativeKvState::load_safetensors(
+    const std::filesystem::path& payload_path,
+    std::unique_ptr<NativeKvState>* kv_state,
+    std::unique_ptr<NativeHiddenState>* last_hidden,
+    std::unordered_map<std::string, std::string>* metadata,
+    std::string* error) {
+    if (kv_state == nullptr || last_hidden == nullptr || metadata == nullptr || error == nullptr) {
+        return false;
+    }
+    kv_state->reset();
+    last_hidden->reset();
+    metadata->clear();
+    error->clear();
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)payload_path;
+    *error = "native KV snapshot payload load requires MLX";
+    return false;
+#else
+    try {
+        mlx::core::SafetensorsLoad loaded = mlx::core::load_safetensors(payload_path.string());
+        std::unordered_map<std::string, array>& arrays = loaded.first;
+        *metadata = std::move(loaded.second);
+
+        const auto format = metadata->find("format");
+        if (format == metadata->end() || format->second != "gemma4d_native_kv_snapshot_v1") {
+            *error = "native KV snapshot payload has an unsupported format";
+            return false;
+        }
+
+        const uint64_t layer_count_u64 = metadata_u64(*metadata, "kv_layer_count");
+        if (layer_count_u64 == 0 || layer_count_u64 > 4096) {
+            *error = "native KV snapshot payload has an invalid layer count";
+            return false;
+        }
+        const size_t layer_count = static_cast<size_t>(layer_count_u64);
+        std::unique_ptr<NativeKvState> state(new NativeKvState());
+        state->impl_->layers.resize(layer_count);
+        state->impl_->sequence_len = metadata_u64(*metadata, "kv_sequence_len");
+        state->impl_->active_bytes = metadata_u64(*metadata, "kv_active_bytes");
+
+        for (size_t index = 0; index < layer_count; ++index) {
+            const std::string prefix = "kv.layer_" + std::to_string(index);
+            NativeKvState::Impl::Layer& layer = state->impl_->layers[index];
+            layer.full_attention = metadata_bool(*metadata, prefix + ".full_attention");
+            if (metadata_bool(*metadata, prefix + ".has_key")) {
+                const auto found = arrays.find(prefix + ".key");
+                if (found == arrays.end()) {
+                    *error = "native KV snapshot payload is missing " + prefix + ".key";
+                    return false;
+                }
+                layer.key = found->second;
+            }
+            if (metadata_bool(*metadata, prefix + ".has_value")) {
+                const auto found = arrays.find(prefix + ".value");
+                if (found == arrays.end()) {
+                    *error = "native KV snapshot payload is missing " + prefix + ".value";
+                    return false;
+                }
+                layer.value = found->second;
+            }
+        }
+
+        if (metadata_bool(*metadata, "hidden_present")) {
+            const auto hidden = arrays.find("hidden.last");
+            if (hidden == arrays.end()) {
+                *error = "native KV snapshot payload declares hidden state but is missing hidden.last";
+                return false;
+            }
+            auto optional_array = [&](const char* name) -> std::optional<array> {
+                const std::string key = std::string("hidden.") + name;
+                if (!metadata_bool(*metadata, key + ".present")) {
+                    return std::nullopt;
+                }
+                const auto found = arrays.find(key);
+                if (found == arrays.end()) {
+                    throw std::runtime_error("native KV snapshot payload is missing " + key);
+                }
+                return found->second;
+            };
+
+            std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
+                hidden->second,
+                optional_array("full_attention_key"),
+                optional_array("full_attention_value"),
+                optional_array("sliding_attention_key"),
+                optional_array("sliding_attention_value"),
+                metadata_u64(*metadata, "hidden_sequence_len"),
+                static_cast<uint32_t>(metadata_u64(*metadata, "hidden_size")),
+            });
+            last_hidden->reset(new NativeHiddenState(std::move(hidden_impl)));
+        }
+
+        *kv_state = std::move(state);
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native KV snapshot payload load failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native KV snapshot payload load failed with an unknown exception";
+        return false;
+    }
+#endif
 }
 
 NativeTextModel::NativeTextModel() : impl_(std::make_unique<Impl>()) {}

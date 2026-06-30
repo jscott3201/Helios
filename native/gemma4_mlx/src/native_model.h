@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gemma4d {
@@ -33,6 +34,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend class NativeMtpAssistantModel;
+    friend class NativeKvState;
     friend class NativeTextModel;
 };
 
@@ -52,6 +54,18 @@ public:
     uint64_t sequence_len() const;
     uint64_t active_bytes() const;
     std::unique_ptr<NativeKvState> clone() const;
+    bool save_safetensors(
+        const std::filesystem::path& payload_path,
+        const NativeHiddenState* last_hidden,
+        const std::unordered_map<std::string, std::string>& metadata,
+        std::string* error) const;
+
+    static bool load_safetensors(
+        const std::filesystem::path& payload_path,
+        std::unique_ptr<NativeKvState>* kv_state,
+        std::unique_ptr<NativeHiddenState>* last_hidden,
+        std::unordered_map<std::string, std::string>* metadata,
+        std::string* error);
 
 private:
     std::unique_ptr<Impl> impl_;
