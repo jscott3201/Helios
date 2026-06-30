@@ -98,6 +98,12 @@ Gemma4Status gemma4_kv_snapshot_export(const Gemma4KvCache* cache, Gemma4KvSnaps
 Gemma4Status gemma4_kv_snapshot_import(Gemma4KvCache* cache, const Gemma4KvSnapshot* snapshot);
 Gemma4Status gemma4_kv_snapshot_info(const Gemma4KvSnapshot* snapshot, Gemma4KvSnapshotInfo* out);
 Gemma4Status gemma4_kv_snapshot_save(const Gemma4KvSnapshot* snapshot, const char* payload_path);
+Gemma4Status gemma4_kv_snapshot_save_compressed(
+    const Gemma4KvSnapshot* snapshot,
+    const char* payload_path,
+    Gemma4KvMode mode,
+    bool compress_global_layers,
+    bool compress_sliding_layers);
 Gemma4Status gemma4_kv_snapshot_load(const char* payload_path, Gemma4KvSnapshot** out);
 Gemma4Status gemma4_kv_snapshot_free(Gemma4KvSnapshot* snapshot);
 

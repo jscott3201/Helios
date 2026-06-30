@@ -59,6 +59,14 @@ public:
         const NativeHiddenState* last_hidden,
         const std::unordered_map<std::string, std::string>& metadata,
         std::string* error) const;
+    bool save_compressed_safetensors(
+        const std::filesystem::path& payload_path,
+        const NativeHiddenState* last_hidden,
+        const std::unordered_map<std::string, std::string>& metadata,
+        Gemma4KvMode mode,
+        bool compress_global_layers,
+        bool compress_sliding_layers,
+        std::string* error) const;
 
     static bool load_safetensors(
         const std::filesystem::path& payload_path,

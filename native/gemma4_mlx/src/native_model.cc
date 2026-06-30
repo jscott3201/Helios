@@ -1095,6 +1095,209 @@ std::string shape_metadata(const array& value) {
     return out.str();
 }
 
+mlx::core::Shape parse_shape_metadata(const std::string& value) {
+    mlx::core::Shape shape;
+    std::stringstream input(value);
+    std::string part;
+    while (std::getline(input, part, 'x')) {
+        if (!part.empty()) {
+            shape.push_back(static_cast<mlx::core::ShapeElem>(std::stoi(part)));
+        }
+    }
+    if (shape.empty()) {
+        throw std::runtime_error("empty tensor shape metadata");
+    }
+    return shape;
+}
+
+std::string compression_mode_label(Gemma4KvMode mode) {
+    switch (mode) {
+    case GEMMA4_KV_BF16:
+        return "bf16";
+    case GEMMA4_KV_MLX_AFFINE_Q8:
+        return "mlx_affine_q8";
+    case GEMMA4_KV_MLX_AFFINE_Q4:
+        return "mlx_affine_q4";
+    default:
+        return "unsupported";
+    }
+}
+
+Gemma4KvMode compression_mode_from_label(const std::string& value) {
+    if (value == "bf16" || value.empty()) {
+        return GEMMA4_KV_BF16;
+    }
+    if (value == "mlx_affine_q8") {
+        return GEMMA4_KV_MLX_AFFINE_Q8;
+    }
+    if (value == "mlx_affine_q4") {
+        return GEMMA4_KV_MLX_AFFINE_Q4;
+    }
+    throw std::runtime_error("unsupported tensor compression mode " + value);
+}
+
+bool should_compress_tensor(
+    bool full_attention,
+    Gemma4KvMode mode,
+    bool compress_global_layers,
+    bool compress_sliding_layers) {
+    if (mode == GEMMA4_KV_BF16) {
+        return false;
+    }
+    return (full_attention && compress_global_layers) ||
+        (!full_attention && compress_sliding_layers);
+}
+
+array scalar_array(float value) {
+    return array(value, mlx::core::float32);
+}
+
+array affine_scale(const array& source, float levels) {
+    const array minimum = mlx::core::min(source);
+    const array maximum = mlx::core::max(source);
+    return mlx::core::maximum(
+        (maximum - minimum) / scalar_array(levels),
+        scalar_array(std::numeric_limits<float>::epsilon()));
+}
+
+array affine_quantize(const array& value, Gemma4KvMode mode, array* out_minimum, array* out_scale) {
+    const float levels = mode == GEMMA4_KV_MLX_AFFINE_Q8 ? 255.0f : 15.0f;
+    const array source = to_float32(value);
+    *out_minimum = mlx::core::min(source);
+    *out_scale = affine_scale(source, levels);
+    const array normalized = mlx::core::round((source - *out_minimum) / *out_scale);
+    const array clipped = mlx::core::clip(
+        normalized,
+        std::optional<array>(scalar_array(0.0f)),
+        std::optional<array>(scalar_array(levels)));
+    return mlx::core::astype(clipped, mlx::core::uint8);
+}
+
+array pack_q4_values(const array& quantized, uint64_t* value_count) {
+    array flat = mlx::core::flatten(quantized);
+    *value_count = flat.size();
+    const size_t padded_count = flat.size() + (flat.size() % 2);
+    if (padded_count != flat.size()) {
+        flat = mlx::core::concatenate({flat, mlx::core::zeros({1}, mlx::core::uint8)}, 0);
+    }
+
+    const array low = mlx::core::slice(
+        flat,
+        {0},
+        {static_cast<int>(padded_count)},
+        {2});
+    const array high = mlx::core::slice(
+        flat,
+        {1},
+        {static_cast<int>(padded_count)},
+        {2});
+    const array mask = array(static_cast<uint8_t>(0x0f));
+    const array shift = array(static_cast<uint8_t>(4));
+    return mlx::core::bitwise_or(
+        mlx::core::bitwise_and(low, mask),
+        mlx::core::left_shift(mlx::core::bitwise_and(high, mask), shift));
+}
+
+array unpack_q4_values(const array& packed, uint64_t value_count, const mlx::core::Shape& shape) {
+    const array mask = array(static_cast<uint8_t>(0x0f));
+    const array shift = array(static_cast<uint8_t>(4));
+    const array low = mlx::core::bitwise_and(packed, mask);
+    const array high = mlx::core::bitwise_and(mlx::core::right_shift(packed, shift), mask);
+    const array paired = mlx::core::flatten(mlx::core::stack({low, high}, 1));
+    const array trimmed = mlx::core::slice(
+        paired,
+        {0},
+        {static_cast<int>(value_count)});
+    return mlx::core::reshape(trimmed, shape);
+}
+
+void add_encoded_tensor(
+    const std::string& name,
+    const array& value,
+    bool compress,
+    Gemma4KvMode mode,
+    std::unordered_map<std::string, array>* arrays,
+    std::unordered_map<std::string, std::string>* metadata,
+    std::vector<array>* eval_arrays,
+    uint64_t* compressed_tensor_count) {
+    (*metadata)[name + ".shape"] = shape_metadata(value);
+    (*metadata)[name + ".bf16_bytes"] = std::to_string(value.size() * 2);
+    if (!compress) {
+        arrays->insert_or_assign(name, value);
+        (*metadata)[name + ".compression_mode"] = "bf16";
+        (*metadata)[name + ".encoded_shape"] = shape_metadata(value);
+        (*metadata)[name + ".encoded_bytes"] = std::to_string(value.nbytes());
+        eval_arrays->push_back(value);
+        return;
+    }
+
+    array minimum = scalar_array(0.0f);
+    array scale = scalar_array(1.0f);
+    array quantized = affine_quantize(value, mode, &minimum, &scale);
+    (*metadata)[name + ".compression_mode"] = compression_mode_label(mode);
+    (*metadata)[name + ".affine_min_name"] = name + ".affine_min";
+    (*metadata)[name + ".affine_scale_name"] = name + ".affine_scale";
+    arrays->insert_or_assign(name + ".affine_min", minimum);
+    arrays->insert_or_assign(name + ".affine_scale", scale);
+    eval_arrays->push_back(minimum);
+    eval_arrays->push_back(scale);
+
+    if (mode == GEMMA4_KV_MLX_AFFINE_Q4) {
+        uint64_t value_count = 0;
+        array packed = pack_q4_values(quantized, &value_count);
+        (*metadata)[name + ".quantized_value_count"] = std::to_string(value_count);
+        (*metadata)[name + ".encoded_shape"] = shape_metadata(packed);
+        (*metadata)[name + ".encoded_bytes"] = std::to_string(packed.nbytes());
+        arrays->insert_or_assign(name, packed);
+        eval_arrays->push_back(packed);
+    } else {
+        (*metadata)[name + ".quantized_value_count"] = std::to_string(quantized.size());
+        (*metadata)[name + ".encoded_shape"] = shape_metadata(quantized);
+        (*metadata)[name + ".encoded_bytes"] = std::to_string(quantized.nbytes());
+        arrays->insert_or_assign(name, quantized);
+        eval_arrays->push_back(quantized);
+    }
+    *compressed_tensor_count += 1;
+}
+
+array decode_encoded_tensor(
+    const std::string& name,
+    const array& encoded,
+    const std::unordered_map<std::string, array>& arrays,
+    const std::unordered_map<std::string, std::string>& metadata) {
+    const auto found_mode = metadata.find(name + ".compression_mode");
+    const Gemma4KvMode mode = found_mode == metadata.end()
+        ? GEMMA4_KV_BF16
+        : compression_mode_from_label(found_mode->second);
+    if (mode == GEMMA4_KV_BF16) {
+        return encoded;
+    }
+
+    const auto min_name = metadata.find(name + ".affine_min_name");
+    const auto scale_name = metadata.find(name + ".affine_scale_name");
+    if (min_name == metadata.end() || scale_name == metadata.end()) {
+        throw std::runtime_error("compressed tensor " + name + " is missing affine metadata names");
+    }
+    const auto minimum = arrays.find(min_name->second);
+    const auto scale = arrays.find(scale_name->second);
+    if (minimum == arrays.end() || scale == arrays.end()) {
+        throw std::runtime_error("compressed tensor " + name + " is missing affine min/scale tensors");
+    }
+
+    array quantized = encoded;
+    if (mode == GEMMA4_KV_MLX_AFFINE_Q4) {
+        const uint64_t value_count = metadata_u64(metadata, name + ".quantized_value_count");
+        quantized = unpack_q4_values(
+            encoded,
+            value_count,
+            parse_shape_metadata(metadata.at(name + ".shape")));
+    }
+
+    const array reconstructed =
+        mlx::core::astype(quantized, mlx::core::float32) * scale->second + minimum->second;
+    return model_dtype(reconstructed);
+}
+
 #endif
 
 } // namespace
@@ -1288,6 +1491,151 @@ bool NativeKvState::save_safetensors(
 #endif
 }
 
+bool NativeKvState::save_compressed_safetensors(
+    const std::filesystem::path& payload_path,
+    const NativeHiddenState* last_hidden,
+    const std::unordered_map<std::string, std::string>& metadata,
+    Gemma4KvMode mode,
+    bool compress_global_layers,
+    bool compress_sliding_layers,
+    std::string* error) const {
+    if (error == nullptr) {
+        return false;
+    }
+    error->clear();
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)payload_path;
+    (void)last_hidden;
+    (void)metadata;
+    (void)mode;
+    (void)compress_global_layers;
+    (void)compress_sliding_layers;
+    *error = "native compressed KV snapshot payload save requires MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->layers.empty() || impl_->sequence_len == 0) {
+            *error = "native compressed KV snapshot payload save requires a populated KV state";
+            return false;
+        }
+        if (mode != GEMMA4_KV_BF16 && mode != GEMMA4_KV_MLX_AFFINE_Q8 && mode != GEMMA4_KV_MLX_AFFINE_Q4) {
+            *error = "native compressed KV snapshot payload save received an unsupported compression mode";
+            return false;
+        }
+
+        std::unordered_map<std::string, array> arrays;
+        std::unordered_map<std::string, std::string> payload_metadata = metadata;
+        payload_metadata["format"] = "gemma4d_native_kv_snapshot_v1";
+        payload_metadata["kv_sequence_len"] = std::to_string(impl_->sequence_len);
+        payload_metadata["kv_active_bytes"] = std::to_string(impl_->active_bytes);
+        payload_metadata["kv_layer_count"] = std::to_string(impl_->layers.size());
+        payload_metadata["compression.mode"] = compression_mode_label(mode);
+        payload_metadata["compression.algorithm"] =
+            mode == GEMMA4_KV_BF16 ? "none" : "mlx_affine_per_tensor_min_scale";
+        payload_metadata["compression.compress_global_layers"] = bool_metadata(compress_global_layers);
+        payload_metadata["compression.compress_sliding_layers"] = bool_metadata(compress_sliding_layers);
+        payload_metadata["compression.active_decode_enabled"] = "false";
+        payload_metadata["compression.q4_packing"] =
+            mode == GEMMA4_KV_MLX_AFFINE_Q4 ? "packed_two_values_per_u8" : "not_applicable";
+
+        uint64_t compressed_tensor_count = 0;
+        uint64_t full_attention_tensor_count = 0;
+        uint64_t sliding_attention_tensor_count = 0;
+        std::vector<array> eval_arrays;
+        eval_arrays.reserve((impl_->layers.size() * 4) + 5);
+        for (size_t index = 0; index < impl_->layers.size(); ++index) {
+            const NativeKvState::Impl::Layer& layer = impl_->layers[index];
+            const std::string prefix = "kv.layer_" + std::to_string(index);
+            payload_metadata[prefix + ".full_attention"] = bool_metadata(layer.full_attention);
+            payload_metadata[prefix + ".has_key"] = bool_metadata(layer.key.has_value());
+            payload_metadata[prefix + ".has_value"] = bool_metadata(layer.value.has_value());
+            if (layer.full_attention) {
+                full_attention_tensor_count += layer.key.has_value() ? 1 : 0;
+                full_attention_tensor_count += layer.value.has_value() ? 1 : 0;
+            } else {
+                sliding_attention_tensor_count += layer.key.has_value() ? 1 : 0;
+                sliding_attention_tensor_count += layer.value.has_value() ? 1 : 0;
+            }
+            const bool compress_layer = should_compress_tensor(
+                layer.full_attention,
+                mode,
+                compress_global_layers,
+                compress_sliding_layers);
+            if (layer.key.has_value()) {
+                add_encoded_tensor(
+                    prefix + ".key",
+                    *layer.key,
+                    compress_layer,
+                    mode,
+                    &arrays,
+                    &payload_metadata,
+                    &eval_arrays,
+                    &compressed_tensor_count);
+            }
+            if (layer.value.has_value()) {
+                add_encoded_tensor(
+                    prefix + ".value",
+                    *layer.value,
+                    compress_layer,
+                    mode,
+                    &arrays,
+                    &payload_metadata,
+                    &eval_arrays,
+                    &compressed_tensor_count);
+            }
+        }
+        payload_metadata["compression.compressed_tensor_count"] = std::to_string(compressed_tensor_count);
+        payload_metadata["compression.full_attention_tensor_count"] = std::to_string(full_attention_tensor_count);
+        payload_metadata["compression.sliding_attention_tensor_count"] = std::to_string(sliding_attention_tensor_count);
+
+        if (last_hidden != nullptr && last_hidden->impl_ != nullptr) {
+            payload_metadata["hidden_present"] = "true";
+            payload_metadata["hidden_sequence_len"] = std::to_string(last_hidden->impl_->sequence_len);
+            payload_metadata["hidden_size"] = std::to_string(last_hidden->impl_->hidden_size);
+            arrays.insert_or_assign("hidden.last", last_hidden->impl_->hidden);
+            payload_metadata["hidden.last.shape"] = shape_metadata(last_hidden->impl_->hidden);
+            eval_arrays.push_back(last_hidden->impl_->hidden);
+
+            auto add_hidden = [&](const char* name, const std::optional<array>& value) {
+                const std::string key = std::string("hidden.") + name;
+                payload_metadata[key + ".present"] = bool_metadata(value.has_value());
+                if (value.has_value()) {
+                    arrays.insert_or_assign(key, *value);
+                    payload_metadata[key + ".shape"] = shape_metadata(*value);
+                    eval_arrays.push_back(*value);
+                }
+            };
+            add_hidden("full_attention_key", last_hidden->impl_->full_attention_key);
+            add_hidden("full_attention_value", last_hidden->impl_->full_attention_value);
+            add_hidden("sliding_attention_key", last_hidden->impl_->sliding_attention_key);
+            add_hidden("sliding_attention_value", last_hidden->impl_->sliding_attention_value);
+        } else {
+            payload_metadata["hidden_present"] = "false";
+        }
+
+        if (arrays.empty()) {
+            *error = "native compressed KV snapshot payload save found no arrays to persist";
+            return false;
+        }
+        if (!eval_arrays.empty()) {
+            mlx::core::eval(eval_arrays);
+        }
+        if (!payload_path.parent_path().empty()) {
+            std::filesystem::create_directories(payload_path.parent_path());
+        }
+        mlx::core::save_safetensors(payload_path.string(), std::move(arrays), std::move(payload_metadata));
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native compressed KV snapshot payload save failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native compressed KV snapshot payload save failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
 bool NativeKvState::load_safetensors(
     const std::filesystem::path& payload_path,
     std::unique_ptr<NativeKvState>* kv_state,
@@ -1339,7 +1687,7 @@ bool NativeKvState::load_safetensors(
                     *error = "native KV snapshot payload is missing " + prefix + ".key";
                     return false;
                 }
-                layer.key = found->second;
+                layer.key = decode_encoded_tensor(prefix + ".key", found->second, arrays, *metadata);
             }
             if (metadata_bool(*metadata, prefix + ".has_value")) {
                 const auto found = arrays.find(prefix + ".value");
@@ -1347,7 +1695,7 @@ bool NativeKvState::load_safetensors(
                     *error = "native KV snapshot payload is missing " + prefix + ".value";
                     return false;
                 }
-                layer.value = found->second;
+                layer.value = decode_encoded_tensor(prefix + ".value", found->second, arrays, *metadata);
             }
         }
 

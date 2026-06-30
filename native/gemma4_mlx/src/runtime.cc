@@ -849,6 +849,45 @@ Gemma4Status gemma4_kv_snapshot_save(const Gemma4KvSnapshot* snapshot, const cha
     return ok();
 }
 
+Gemma4Status gemma4_kv_snapshot_save_compressed(
+    const Gemma4KvSnapshot* snapshot,
+    const char* payload_path,
+    Gemma4KvMode mode,
+    bool compress_global_layers,
+    bool compress_sliding_layers) {
+    if (snapshot == nullptr || snapshot->magic != kKvSnapshotMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_save_compressed requires a valid snapshot handle");
+    }
+    if (is_empty(payload_path)) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_save_compressed requires a non-empty payload path");
+    }
+    if (snapshot->native_kv_state == nullptr || snapshot->native_tokens.empty() || !snapshot->has_last_step) {
+        return fail(GEMMA4_ERR_CACHE, "gemma4_kv_snapshot_save_compressed requires a populated native snapshot");
+    }
+    if (mode != GEMMA4_KV_BF16 && mode != GEMMA4_KV_MLX_AFFINE_Q8 && mode != GEMMA4_KV_MLX_AFFINE_Q4) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_save_compressed supports only BF16, MLX affine q8, or MLX affine q4");
+    }
+
+    std::unordered_map<std::string, std::string> metadata = snapshot_metadata(snapshot);
+    metadata["policy.ssd_prefix_mode"] = std::to_string(static_cast<int>(mode));
+    metadata["policy.compress_global_layers"] = compress_global_layers ? "true" : "false";
+    metadata["policy.compress_sliding_layers"] = compress_sliding_layers ? "true" : "false";
+    metadata["policy.allow_active_compressed_decode"] = "false";
+
+    std::string native_error;
+    if (!snapshot->native_kv_state->save_compressed_safetensors(
+            payload_path,
+            snapshot->last_hidden.get(),
+            metadata,
+            mode,
+            compress_global_layers,
+            compress_sliding_layers,
+            &native_error)) {
+        return fail(GEMMA4_ERR_RUNTIME, native_error);
+    }
+    return ok();
+}
+
 Gemma4Status gemma4_kv_snapshot_load(const char* payload_path, Gemma4KvSnapshot** out) {
     if (out == nullptr) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_load requires a non-null out pointer");

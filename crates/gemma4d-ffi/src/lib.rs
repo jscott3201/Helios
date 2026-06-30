@@ -132,6 +132,13 @@ mod raw {
             snapshot: *const Gemma4KvSnapshot,
             payload_path: *const c_char,
         ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_save_compressed(
+            snapshot: *const Gemma4KvSnapshot,
+            payload_path: *const c_char,
+            mode: i32,
+            compress_global_layers: bool,
+            compress_sliding_layers: bool,
+        ) -> Gemma4Status;
         pub fn gemma4_kv_snapshot_load(
             payload_path: *const c_char,
             out: *mut *mut Gemma4KvSnapshot,
@@ -513,6 +520,26 @@ impl KvSnapshot {
         let path = CString::new(path.as_ref().to_string_lossy().as_ref())?;
         // SAFETY: `self.ptr` is an owned snapshot handle and `path` is a live C string.
         check(unsafe { raw::gemma4_kv_snapshot_save(self.ptr.as_ptr(), path.as_ptr()) })
+    }
+
+    pub fn save_compressed_to_path(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        mode: KvMode,
+        compress_global_layers: bool,
+        compress_sliding_layers: bool,
+    ) -> Result<()> {
+        let path = CString::new(path.as_ref().to_string_lossy().as_ref())?;
+        // SAFETY: `self.ptr` is an owned snapshot handle and `path` is a live C string.
+        check(unsafe {
+            raw::gemma4_kv_snapshot_save_compressed(
+                self.ptr.as_ptr(),
+                path.as_ptr(),
+                mode as i32,
+                compress_global_layers,
+                compress_sliding_layers,
+            )
+        })
     }
 }
 
