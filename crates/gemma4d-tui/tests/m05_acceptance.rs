@@ -165,7 +165,9 @@ fn cache_page_renders_m07_accounting_summary() {
     assert!(snapshot.contains("ram_prefix_bf16"));
     assert!(snapshot.contains("RAM resident"));
     assert!(snapshot.contains("restore failures"));
-    assert!(snapshot.contains("SSD disabled"));
+    assert!(snapshot.contains("SSD enabled"));
+    assert!(snapshot.contains("bytes read"));
+    assert!(snapshot.contains("mid-decode fetches 0"));
 }
 
 #[test]

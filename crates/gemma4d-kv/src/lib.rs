@@ -1,25 +1,32 @@
-#![doc = "In-memory KV prefix cache metadata, namespace hashing, and RAM residency policy."]
+#![doc = "KV prefix cache metadata, namespace hashing, RAM residency, and SSD cold-cache policy."]
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
-    fmt,
+    fmt, fs,
     num::NonZeroU64,
+    path::{Path, PathBuf},
 };
 
 pub const CRATE_NAME: &str = "gemma4d-kv";
 pub const KV_LAYOUT_VERSION: u32 = 1;
+pub const SSD_MANIFEST_VERSION: u32 = 1;
+pub const SSD_BLOCK_FILE_VERSION: u32 = 1;
+
+const SSD_INDEX_FILE: &str = "index.json";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn bootstrap_status() -> &'static str {
-    "m07-kv-cache-core"
+    "m08-ssd-cold-prefix-cache"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     InvalidBlock(String),
+    InvalidManifest(String),
+    Io(String),
     Json(String),
     NamespaceMismatch { expected: String, actual: String },
     ChecksumMismatch { block_id: String },
@@ -31,6 +38,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidBlock(message) => f.write_str(message),
+            Self::InvalidManifest(message) => f.write_str(message),
+            Self::Io(message) => f.write_str(message),
             Self::Json(message) => f.write_str(message),
             Self::NamespaceMismatch { expected, actual } => {
                 write!(
@@ -54,6 +63,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source.to_string())
+    }
+}
 
 impl From<serde_json::Error> for Error {
     fn from(source: serde_json::Error) -> Self {
@@ -358,6 +373,555 @@ pub struct CacheAccountingSnapshot {
     pub ssd_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SsdCacheAccountingSnapshot {
+    pub budget_bytes: u64,
+    pub stored_bytes: u64,
+    pub stored_blocks: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub writes: u64,
+    pub reads: u64,
+    pub evictions: u64,
+    pub restore_failures: u64,
+    pub namespace_rejections: u64,
+    pub corruptions: u64,
+    pub bytes_written: u64,
+    pub bytes_read: u64,
+    pub hit_rate: f64,
+    pub mid_decode_fetches: u64,
+    pub ssd_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsdRestorePhase {
+    BeforePrefill,
+    MidDecode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedLayerManifest {
+    pub layer: u32,
+    pub attention_type: AttentionType,
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    pub attention_k_eq_v: bool,
+    pub sequence_start: u64,
+    pub sequence_end: u64,
+    pub local_start: u64,
+    pub local_end: u64,
+    pub shape: Vec<u64>,
+    pub stored_tensors: Vec<String>,
+    pub compression: CacheMode,
+    pub checksum: String,
+}
+
+impl PersistedLayerManifest {
+    fn from_metadata(metadata: &LayerBlockMetadata) -> Result<Self> {
+        let stored_tensors = if metadata.physical_stored_tensors == 1 {
+            vec![format!("layer_{:02}_kv_shared", metadata.layer)]
+        } else {
+            vec![
+                format!("layer_{:02}_k", metadata.layer),
+                format!("layer_{:02}_v", metadata.layer),
+            ]
+        };
+        let shape = vec![
+            metadata.absolute_end - metadata.absolute_start,
+            metadata.kv_heads as u64,
+            metadata.head_dim as u64,
+        ];
+        let checksum = sha256_json(&LayerChecksumInputs {
+            layer: metadata.layer,
+            attention_type: metadata.attention_type,
+            sequence_start: metadata.absolute_start,
+            sequence_end: metadata.absolute_end,
+            local_start: metadata.block_local_start,
+            local_end: metadata.block_local_end,
+            stored_tensors: &stored_tensors,
+            compression: metadata.compression,
+        })?;
+        Ok(Self {
+            layer: metadata.layer,
+            attention_type: metadata.attention_type,
+            head_dim: metadata.head_dim,
+            kv_heads: metadata.kv_heads,
+            attention_k_eq_v: metadata.physical_stored_tensors == 1,
+            sequence_start: metadata.absolute_start,
+            sequence_end: metadata.absolute_end,
+            local_start: metadata.block_local_start,
+            local_end: metadata.block_local_end,
+            shape,
+            stored_tensors,
+            compression: metadata.compression,
+            checksum,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LayerChecksumInputs<'a> {
+    layer: u32,
+    attention_type: AttentionType,
+    sequence_start: u64,
+    sequence_end: u64,
+    local_start: u64,
+    local_end: u64,
+    stored_tensors: &'a [String],
+    compression: CacheMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedKvManifest {
+    pub manifest_version: u32,
+    pub block_file_version: u32,
+    pub kv_layout_version: u32,
+    pub engine_version: String,
+    pub mlx_version: String,
+    pub model_id: String,
+    pub model_revision: String,
+    pub weights_sha256: String,
+    pub quantization_sha256: String,
+    pub tokenizer_sha256: String,
+    pub chat_template_sha256: String,
+    pub adapter_id: Option<String>,
+    pub adapter_weight_hash: Option<String>,
+    pub prompt_token_hash: String,
+    pub raw_prompt_hash: String,
+    pub namespace_hash: NamespaceHash,
+    pub block_id: BlockId,
+    pub cache_mode: CacheMode,
+    pub block_size_tokens: u64,
+    pub sequence_start: u64,
+    pub sequence_end: u64,
+    pub logical_byte_len: u64,
+    pub block_checksum: String,
+    pub layers: Vec<PersistedLayerManifest>,
+}
+
+impl PersistedKvManifest {
+    pub fn from_block(block: &RamPrefixBlock) -> Result<Self> {
+        Ok(Self {
+            manifest_version: SSD_MANIFEST_VERSION,
+            block_file_version: SSD_BLOCK_FILE_VERSION,
+            kv_layout_version: block.namespace.kv_layout_version,
+            engine_version: block.namespace.engine_version.clone(),
+            mlx_version: block.namespace.mlx_version.clone(),
+            model_id: block.namespace.model_id.clone(),
+            model_revision: block.namespace.model_revision.clone(),
+            weights_sha256: block.namespace.weights_sha256.clone(),
+            quantization_sha256: block.namespace.quantization_sha256.clone(),
+            tokenizer_sha256: block.namespace.tokenizer_sha256.clone(),
+            chat_template_sha256: block.namespace.chat_template_sha256.clone(),
+            adapter_id: block.namespace.adapter_id.clone(),
+            adapter_weight_hash: block.namespace.adapter_weight_hash.clone(),
+            prompt_token_hash: block.namespace.prompt_token_hash.clone(),
+            raw_prompt_hash: block.namespace.raw_prompt_hash.clone(),
+            namespace_hash: block.key.namespace_hash.clone(),
+            block_id: block.key.block_id.clone(),
+            cache_mode: block.namespace.cache_mode,
+            block_size_tokens: block.key.block_size_tokens.get(),
+            sequence_start: block.key.sequence_start,
+            sequence_end: block.key.sequence_end,
+            logical_byte_len: block.byte_len,
+            block_checksum: checksum_block(block)?,
+            layers: block
+                .layers
+                .iter()
+                .map(PersistedLayerManifest::from_metadata)
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    fn validate_for_block(&self, block: &RamPrefixBlock) -> Result<()> {
+        if self.manifest_version != SSD_MANIFEST_VERSION {
+            return Err(Error::InvalidManifest(format!(
+                "unsupported SSD manifest version {}",
+                self.manifest_version
+            )));
+        }
+        if self.block_file_version != SSD_BLOCK_FILE_VERSION {
+            return Err(Error::InvalidManifest(format!(
+                "unsupported SSD block file version {}",
+                self.block_file_version
+            )));
+        }
+        if self.kv_layout_version != block.namespace.kv_layout_version {
+            return Err(Error::InvalidManifest(
+                "KV layout version mismatch".to_owned(),
+            ));
+        }
+        if self.namespace_hash != block.key.namespace_hash {
+            return Err(Error::InvalidManifest("namespace hash mismatch".to_owned()));
+        }
+        if self.block_id != block.key.block_id {
+            return Err(Error::InvalidManifest("block id mismatch".to_owned()));
+        }
+        if self.block_size_tokens != block.key.block_size_tokens.get() {
+            return Err(Error::InvalidManifest("block size mismatch".to_owned()));
+        }
+        if self.sequence_start != block.key.sequence_start
+            || self.sequence_end != block.key.sequence_end
+        {
+            return Err(Error::InvalidManifest("sequence span mismatch".to_owned()));
+        }
+        if self.logical_byte_len != block.byte_len {
+            return Err(Error::InvalidManifest(
+                "logical byte length mismatch".to_owned(),
+            ));
+        }
+        let block_checksum = checksum_block(block)?;
+        if self.block_checksum != block_checksum {
+            return Err(Error::ChecksumMismatch {
+                block_id: block.key.block_id.0.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SsdIndexEntry {
+    pub block_id: BlockId,
+    pub namespace_hash: NamespaceHash,
+    pub relative_path: String,
+    pub logical_bytes: u64,
+    pub stored_bytes: u64,
+    pub sequence_start: u64,
+    pub sequence_end: u64,
+    pub block_size_tokens: u64,
+    pub cache_mode: CacheMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct SsdPrefixCache {
+    root: PathBuf,
+    budget_bytes: u64,
+    stored_bytes: u64,
+    index: HashMap<BlockId, SsdIndexEntry>,
+    lru: VecDeque<BlockId>,
+    hits: u64,
+    misses: u64,
+    writes: u64,
+    reads: u64,
+    evictions: u64,
+    restore_failures: u64,
+    namespace_rejections: u64,
+    corruptions: u64,
+    bytes_written: u64,
+    bytes_read: u64,
+    mid_decode_fetches: u64,
+}
+
+impl SsdPrefixCache {
+    pub fn open(root: impl AsRef<Path>, budget_bytes: NonZeroU64) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(root.join("blocks"))?;
+        let mut cache = Self {
+            root,
+            budget_bytes: budget_bytes.get(),
+            stored_bytes: 0,
+            index: HashMap::new(),
+            lru: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+            writes: 0,
+            reads: 0,
+            evictions: 0,
+            restore_failures: 0,
+            namespace_rejections: 0,
+            corruptions: 0,
+            bytes_written: 0,
+            bytes_read: 0,
+            mid_decode_fetches: 0,
+        };
+        cache.load_index()?;
+        cache.evict_to_fit(0, None)?;
+        cache.persist_index()?;
+        Ok(cache)
+    }
+
+    pub fn write_block(&mut self, block: &RamPrefixBlock) -> Result<SsdIndexEntry> {
+        block.verify_checksum()?;
+        let block_bytes = serialized_block_bytes(block)?;
+        let stored_bytes = block_bytes.len() as u64;
+        if stored_bytes > self.budget_bytes {
+            return Err(Error::BudgetExceeded {
+                block_bytes: stored_bytes,
+                budget_bytes: self.budget_bytes,
+            });
+        }
+
+        let block_id = block.key.block_id.clone();
+        if let Some(previous) = self.index.remove(&block_id) {
+            self.stored_bytes = self.stored_bytes.saturating_sub(previous.stored_bytes);
+            self.remove_lru(&block_id);
+        }
+
+        self.evict_to_fit(stored_bytes, Some(&block_id))?;
+
+        let relative_path = format!("blocks/{}.json", block_id.0);
+        let path = self.root.join(&relative_path);
+        let tmp_path = self.root.join(format!("{relative_path}.tmp"));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&tmp_path, &block_bytes)?;
+        fs::rename(&tmp_path, &path)?;
+
+        let entry = SsdIndexEntry {
+            block_id: block_id.clone(),
+            namespace_hash: block.key.namespace_hash.clone(),
+            relative_path,
+            logical_bytes: block.byte_len,
+            stored_bytes,
+            sequence_start: block.key.sequence_start,
+            sequence_end: block.key.sequence_end,
+            block_size_tokens: block.key.block_size_tokens.get(),
+            cache_mode: block.namespace.cache_mode,
+        };
+        self.stored_bytes = self.stored_bytes.saturating_add(stored_bytes);
+        self.index.insert(block_id.clone(), entry.clone());
+        self.touch(&block_id);
+        self.writes = self.writes.saturating_add(1);
+        self.bytes_written = self.bytes_written.saturating_add(stored_bytes);
+        self.persist_index()?;
+        Ok(entry)
+    }
+
+    pub fn restore_before_prefill(
+        &mut self,
+        key: &KvBlockKey,
+        expected_namespace: &KvNamespace,
+    ) -> Result<RestoredPrefix> {
+        self.restore_for_phase(key, expected_namespace, SsdRestorePhase::BeforePrefill)
+    }
+
+    pub fn restore_for_phase(
+        &mut self,
+        key: &KvBlockKey,
+        expected_namespace: &KvNamespace,
+        phase: SsdRestorePhase,
+    ) -> Result<RestoredPrefix> {
+        if phase == SsdRestorePhase::MidDecode {
+            self.restore_failures = self.restore_failures.saturating_add(1);
+            return Err(Error::InvalidBlock(
+                "SSD cold-cache restore is only allowed before prefill".to_owned(),
+            ));
+        }
+
+        let expected_hash = expected_namespace.namespace_hash()?;
+        if key.namespace_hash != expected_hash {
+            self.restore_failures = self.restore_failures.saturating_add(1);
+            self.namespace_rejections = self.namespace_rejections.saturating_add(1);
+            return Err(Error::NamespaceMismatch {
+                expected: expected_hash.0,
+                actual: key.namespace_hash.0.clone(),
+            });
+        }
+
+        let block_id = key.block_id.clone();
+        let Some(entry) = self.index.get(&block_id).cloned() else {
+            self.misses = self.misses.saturating_add(1);
+            return Err(Error::NotFound {
+                block_id: block_id.0,
+            });
+        };
+
+        let bytes = match fs::read(self.root.join(&entry.relative_path)) {
+            Ok(bytes) => bytes,
+            Err(source) => {
+                self.misses = self.misses.saturating_add(1);
+                return Err(Error::Io(source.to_string()));
+            }
+        };
+        self.reads = self.reads.saturating_add(1);
+        self.bytes_read = self.bytes_read.saturating_add(bytes.len() as u64);
+
+        let file = match serde_json::from_slice::<PersistedBlockFile>(&bytes) {
+            Ok(file) => file,
+            Err(source) => {
+                self.restore_failures = self.restore_failures.saturating_add(1);
+                self.corruptions = self.corruptions.saturating_add(1);
+                return Err(Error::Json(source.to_string()));
+            }
+        };
+
+        let mut block = match validate_persisted_file(file) {
+            Ok(block) => block,
+            Err(error) => {
+                self.restore_failures = self.restore_failures.saturating_add(1);
+                if matches!(
+                    error,
+                    Error::ChecksumMismatch { .. } | Error::InvalidManifest(_)
+                ) {
+                    self.corruptions = self.corruptions.saturating_add(1);
+                }
+                return Err(error);
+            }
+        };
+
+        let actual_hash = block.namespace.namespace_hash()?;
+        if actual_hash != expected_hash {
+            self.restore_failures = self.restore_failures.saturating_add(1);
+            self.namespace_rejections = self.namespace_rejections.saturating_add(1);
+            return Err(Error::NamespaceMismatch {
+                expected: expected_hash.0,
+                actual: actual_hash.0,
+            });
+        }
+        if block.key != *key {
+            self.restore_failures = self.restore_failures.saturating_add(1);
+            self.corruptions = self.corruptions.saturating_add(1);
+            return Err(Error::InvalidManifest(
+                "persisted block key does not match requested key".to_owned(),
+            ));
+        }
+
+        block.native_handle = None;
+        let restored = RestoredPrefix {
+            block_id: block.key.block_id.clone(),
+            namespace_hash: block.key.namespace_hash.clone(),
+            sequence_start: block.key.sequence_start,
+            sequence_end: block.key.sequence_end,
+            byte_len: block.byte_len,
+            observation: block.observation(),
+            native_handle: None,
+        };
+        self.hits = self.hits.saturating_add(1);
+        self.touch(&block_id);
+        self.persist_index()?;
+        Ok(restored)
+    }
+
+    pub fn contains(&self, block_id: &BlockId) -> bool {
+        self.index.contains_key(block_id)
+    }
+
+    pub fn entry_path(&self, entry: &SsdIndexEntry) -> PathBuf {
+        self.root.join(&entry.relative_path)
+    }
+
+    pub fn accounting(&self) -> SsdCacheAccountingSnapshot {
+        let total = self.hits + self.misses;
+        SsdCacheAccountingSnapshot {
+            budget_bytes: self.budget_bytes,
+            stored_bytes: self.stored_bytes,
+            stored_blocks: self.index.len(),
+            hits: self.hits,
+            misses: self.misses,
+            writes: self.writes,
+            reads: self.reads,
+            evictions: self.evictions,
+            restore_failures: self.restore_failures,
+            namespace_rejections: self.namespace_rejections,
+            corruptions: self.corruptions,
+            bytes_written: self.bytes_written,
+            bytes_read: self.bytes_read,
+            hit_rate: if total == 0 {
+                0.0
+            } else {
+                self.hits as f64 / total as f64
+            },
+            mid_decode_fetches: self.mid_decode_fetches,
+            ssd_enabled: true,
+        }
+    }
+
+    fn load_index(&mut self) -> Result<()> {
+        let index_path = self.root.join(SSD_INDEX_FILE);
+        if !index_path.exists() {
+            return Ok(());
+        }
+        let bytes = fs::read(index_path)?;
+        let persisted: PersistedSsdIndex = serde_json::from_slice(&bytes)?;
+        if persisted.schema_version != SSD_MANIFEST_VERSION {
+            return Err(Error::InvalidManifest(format!(
+                "unsupported SSD index version {}",
+                persisted.schema_version
+            )));
+        }
+        for entry in persisted.entries {
+            if self.root.join(&entry.relative_path).exists() {
+                self.stored_bytes = self.stored_bytes.saturating_add(entry.stored_bytes);
+                self.index.insert(entry.block_id.clone(), entry);
+            }
+        }
+        for block_id in persisted.lru {
+            if self.index.contains_key(&block_id) && !self.lru.contains(&block_id) {
+                self.lru.push_back(block_id);
+            }
+        }
+        for block_id in self.index.keys() {
+            if !self.lru.contains(block_id) {
+                self.lru.push_back(block_id.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_index(&self) -> Result<()> {
+        let persisted = PersistedSsdIndex {
+            schema_version: SSD_MANIFEST_VERSION,
+            budget_bytes: self.budget_bytes,
+            entries: self.index.values().cloned().collect(),
+            lru: self.lru.iter().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec_pretty(&persisted)?;
+        fs::write(self.root.join(SSD_INDEX_FILE), bytes)?;
+        Ok(())
+    }
+
+    fn evict_to_fit(&mut self, incoming_bytes: u64, protected: Option<&BlockId>) -> Result<()> {
+        while self.stored_bytes + incoming_bytes > self.budget_bytes {
+            let Some(victim_id) = self.lru.pop_front() else {
+                break;
+            };
+            if protected == Some(&victim_id) {
+                self.lru.push_back(victim_id);
+                break;
+            }
+            if let Some(victim) = self.index.remove(&victim_id) {
+                let path = self.root.join(&victim.relative_path);
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(Error::Io(source.to_string())),
+                }
+                self.stored_bytes = self.stored_bytes.saturating_sub(victim.stored_bytes);
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn touch(&mut self, block_id: &BlockId) {
+        self.remove_lru(block_id);
+        self.lru.push_back(block_id.clone());
+    }
+
+    fn remove_lru(&mut self, block_id: &BlockId) {
+        if let Some(index) = self.lru.iter().position(|candidate| candidate == block_id) {
+            self.lru.remove(index);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedBlockFile {
+    file_version: u32,
+    manifest: PersistedKvManifest,
+    block: RamPrefixBlock,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSsdIndex {
+    schema_version: u32,
+    budget_bytes: u64,
+    entries: Vec<SsdIndexEntry>,
+    lru: Vec<BlockId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RamPrefixCache {
     budget_bytes: u64,
@@ -627,6 +1191,32 @@ fn checksum_payload(key: &KvBlockKey, payload: &StoredPrefixPayload) -> Result<S
     sha256_json(&(key, payload))
 }
 
+fn checksum_block(block: &RamPrefixBlock) -> Result<String> {
+    sha256_json(block)
+}
+
+fn serialized_block_bytes(block: &RamPrefixBlock) -> Result<Vec<u8>> {
+    let manifest = PersistedKvManifest::from_block(block)?;
+    let file = PersistedBlockFile {
+        file_version: SSD_BLOCK_FILE_VERSION,
+        manifest,
+        block: block.clone(),
+    };
+    Ok(serde_json::to_vec_pretty(&file)?)
+}
+
+fn validate_persisted_file(file: PersistedBlockFile) -> Result<RamPrefixBlock> {
+    if file.file_version != SSD_BLOCK_FILE_VERSION {
+        return Err(Error::InvalidManifest(format!(
+            "unsupported SSD block file version {}",
+            file.file_version
+        )));
+    }
+    file.block.verify_checksum()?;
+    file.manifest.validate_for_block(&file.block)?;
+    Ok(file.block)
+}
+
 fn fork_hash(
     label: &str,
     parent: Option<&str>,
@@ -667,9 +1257,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reports_m07_status() {
+    fn reports_m08_status() {
         assert_eq!(CRATE_NAME, "gemma4d-kv");
-        assert_eq!(bootstrap_status(), "m07-kv-cache-core");
+        assert_eq!(bootstrap_status(), "m08-ssd-cold-prefix-cache");
     }
 
     #[test]
@@ -786,5 +1376,186 @@ mod tests {
         assert_eq!(handle.sequence_end, block.key.sequence_end);
         assert_eq!(handle.namespace_hash, block.key.namespace_hash);
         assert_eq!(handle.byte_len, block.byte_len);
+    }
+
+    #[test]
+    fn ssd_manifest_records_required_namespace_and_layout_fields() {
+        let block =
+            fixture_block(4096, NonZeroU64::new(4096).expect("non-zero")).expect("fixture block");
+        let manifest = PersistedKvManifest::from_block(&block).expect("manifest");
+
+        assert_eq!(manifest.manifest_version, SSD_MANIFEST_VERSION);
+        assert_eq!(manifest.block_file_version, SSD_BLOCK_FILE_VERSION);
+        assert_eq!(manifest.kv_layout_version, KV_LAYOUT_VERSION);
+        assert_eq!(manifest.model_id, block.namespace.model_id);
+        assert_eq!(manifest.model_revision, block.namespace.model_revision);
+        assert_eq!(manifest.weights_sha256, block.namespace.weights_sha256);
+        assert_eq!(
+            manifest.quantization_sha256,
+            block.namespace.quantization_sha256
+        );
+        assert_eq!(manifest.tokenizer_sha256, block.namespace.tokenizer_sha256);
+        assert_eq!(
+            manifest.chat_template_sha256,
+            block.namespace.chat_template_sha256
+        );
+        assert_eq!(
+            manifest.prompt_token_hash,
+            block.namespace.prompt_token_hash
+        );
+        assert_eq!(manifest.raw_prompt_hash, block.namespace.raw_prompt_hash);
+        assert_eq!(manifest.namespace_hash, block.key.namespace_hash);
+        assert_eq!(manifest.block_id, block.key.block_id);
+        assert_eq!(manifest.layers.len(), 48);
+        assert!(
+            manifest
+                .layers
+                .iter()
+                .any(|layer| layer.attention_type == AttentionType::Full)
+        );
+        assert!(
+            manifest
+                .layers
+                .iter()
+                .any(|layer| layer.attention_type == AttentionType::Sliding)
+        );
+    }
+
+    #[test]
+    fn ssd_restore_before_prefill_matches_fresh_for_m08_context_lengths() {
+        let root = temp_cache_dir("restore_matrix");
+        let block_size = NonZeroU64::new(16 * 1024).expect("non-zero");
+        let mut cache =
+            SsdPrefixCache::open(&root, NonZeroU64::new(32 * 1024 * 1024).expect("non-zero"))
+                .expect("cache");
+
+        for sequence_len in [1024, 4096, 8192, 16384] {
+            let block = fixture_block(sequence_len, block_size).expect("fixture block");
+            let key = block.key.clone();
+            let namespace = block.namespace.clone();
+            let fresh = fresh_prefill_fixture(sequence_len);
+            cache.write_block(&block).expect("write");
+
+            let restored = cache
+                .restore_before_prefill(&key, &namespace)
+                .expect("ssd restore before prefill");
+            assert_eq!(restored.observation, fresh);
+            assert_eq!(restored.sequence_end, sequence_len);
+            assert!(restored.native_handle.is_none());
+        }
+
+        let summary = cache.accounting();
+        assert_eq!(summary.hits, 4);
+        assert_eq!(summary.reads, 4);
+        assert_eq!(summary.writes, 4);
+        assert!(summary.bytes_read > 0);
+        assert!(summary.bytes_written > 0);
+        assert_eq!(summary.mid_decode_fetches, 0);
+        assert!(summary.ssd_enabled);
+        cleanup_temp_dir(root);
+    }
+
+    #[test]
+    fn ssd_wrong_namespace_and_corrupt_block_are_rejected() {
+        let root = temp_cache_dir("rejects");
+        let mut cache =
+            SsdPrefixCache::open(&root, NonZeroU64::new(8 * 1024 * 1024).expect("non-zero"))
+                .expect("cache");
+        let block =
+            fixture_block(1024, NonZeroU64::new(1024).expect("non-zero")).expect("fixture block");
+        let key = block.key.clone();
+        let namespace = block.namespace.clone();
+        let entry = cache.write_block(&block).expect("write");
+
+        let mut wrong_namespace = namespace.clone();
+        wrong_namespace.model_id = "wrong-model".to_owned();
+        let err = cache
+            .restore_before_prefill(&key, &wrong_namespace)
+            .expect_err("wrong namespace should reject");
+        assert!(matches!(err, Error::NamespaceMismatch { .. }));
+
+        let path = cache.entry_path(&entry);
+        let mut file = serde_json::from_slice::<PersistedBlockFile>(
+            &std::fs::read(&path).expect("read persisted block"),
+        )
+        .expect("block file");
+        file.manifest.block_checksum = "corrupted".to_owned();
+        std::fs::write(&path, serde_json::to_vec_pretty(&file).expect("json")).expect("write");
+
+        let err = cache
+            .restore_before_prefill(&key, &namespace)
+            .expect_err("corruption should reject");
+        assert!(matches!(err, Error::ChecksumMismatch { .. }));
+
+        let summary = cache.accounting();
+        assert_eq!(summary.namespace_rejections, 1);
+        assert_eq!(summary.corruptions, 1);
+        assert_eq!(summary.restore_failures, 2);
+        cleanup_temp_dir(root);
+    }
+
+    #[test]
+    fn ssd_lru_evicts_to_disk_budget() {
+        let root = temp_cache_dir("eviction");
+        let first =
+            fixture_block(1024, NonZeroU64::new(1024).expect("non-zero")).expect("first block");
+        let second =
+            fixture_block(2048, NonZeroU64::new(2048).expect("non-zero")).expect("second block");
+        let first_id = first.key.block_id.clone();
+        let second_id = second.key.block_id.clone();
+        let first_size = serialized_block_bytes(&first).expect("first bytes").len() as u64;
+        let second_size = serialized_block_bytes(&second).expect("second bytes").len() as u64;
+        let budget = first_size.max(second_size);
+        let mut cache =
+            SsdPrefixCache::open(&root, NonZeroU64::new(budget).expect("non-zero")).expect("cache");
+
+        cache.write_block(&first).expect("write first");
+        cache.write_block(&second).expect("write second");
+
+        assert!(!cache.contains(&first_id));
+        assert!(cache.contains(&second_id));
+        let summary = cache.accounting();
+        assert_eq!(summary.stored_blocks, 1);
+        assert_eq!(summary.evictions, 1);
+        cleanup_temp_dir(root);
+    }
+
+    #[test]
+    fn ssd_mid_decode_restore_is_rejected_without_fetching() {
+        let root = temp_cache_dir("mid_decode");
+        let mut cache =
+            SsdPrefixCache::open(&root, NonZeroU64::new(8 * 1024 * 1024).expect("non-zero"))
+                .expect("cache");
+        let block =
+            fixture_block(1024, NonZeroU64::new(1024).expect("non-zero")).expect("fixture block");
+        let key = block.key.clone();
+        let namespace = block.namespace.clone();
+        cache.write_block(&block).expect("write");
+
+        let err = cache
+            .restore_for_phase(&key, &namespace, SsdRestorePhase::MidDecode)
+            .expect_err("mid-decode restore should reject");
+        assert!(matches!(err, Error::InvalidBlock(_)));
+        let summary = cache.accounting();
+        assert_eq!(summary.reads, 0);
+        assert_eq!(summary.bytes_read, 0);
+        assert_eq!(summary.mid_decode_fetches, 0);
+        cleanup_temp_dir(root);
+    }
+
+    fn temp_cache_dir(label: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "gemma4d-kv-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    fn cleanup_temp_dir(path: std::path::PathBuf) {
+        let _ = std::fs::remove_dir_all(path);
     }
 }

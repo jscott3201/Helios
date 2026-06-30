@@ -234,6 +234,7 @@ fn render_benchmarks(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_cache(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let cache = &state.cache;
     let ram = cache.ram;
+    let ssd = cache.ssd;
     let lines = vec![
         Line::from(vec![
             Span::styled("Status ", Style::default().fg(Color::Gray)),
@@ -267,12 +268,26 @@ fn render_cache(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Line::from(format!("Active KV {}", bytes(cache.active_kv_bytes))),
         Line::from(format!("Restored tokens {}", cache.restored_tokens)),
         Line::from(format!(
-            "SSD {}",
-            if ram.ssd_enabled {
+            "SSD {} | stored {} / {} across {} blocks",
+            if ssd.ssd_enabled {
                 "enabled"
             } else {
                 "disabled"
-            }
+            },
+            bytes(ssd.stored_bytes),
+            bytes(ssd.budget_bytes),
+            ssd.stored_blocks
+        )),
+        Line::from(format!(
+            "SSD reads {} | writes {} | bytes read {} | written {}",
+            ssd.reads,
+            ssd.writes,
+            bytes(ssd.bytes_read),
+            bytes(ssd.bytes_written)
+        )),
+        Line::from(format!(
+            "SSD failures {} | corruptions {} | mid-decode fetches {}",
+            ssd.restore_failures, ssd.corruptions, ssd.mid_decode_fetches
         )),
         Line::from(cache.note.clone()),
     ];

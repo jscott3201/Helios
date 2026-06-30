@@ -64,7 +64,7 @@ impl RuntimeProvider for MockProvider {
     }
 
     fn cache_snapshot(&mut self) -> CacheSnapshot {
-        CacheSnapshot::mock_m07()
+        CacheSnapshot::mock_m08()
     }
 
     fn mtp_snapshot(&mut self) -> MtpSnapshot {

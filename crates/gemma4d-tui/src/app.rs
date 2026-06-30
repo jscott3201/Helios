@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::ValueEnum;
-use gemma4d_kv::CacheAccountingSnapshot;
+use gemma4d_kv::{CacheAccountingSnapshot, SsdCacheAccountingSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ConfigValidation;
@@ -131,6 +131,7 @@ pub struct CacheSnapshot {
     pub block_size_tokens: u64,
     pub namespace_hash: Option<String>,
     pub ram: CacheAccountingSnapshot,
+    pub ssd: SsdCacheAccountingSnapshot,
     pub active_kv_bytes: u64,
     pub restored_tokens: u64,
     pub rejected_namespaces: u64,
@@ -155,6 +156,24 @@ impl CacheSnapshot {
                 hit_rate: 0.0,
                 ssd_enabled: false,
             },
+            ssd: SsdCacheAccountingSnapshot {
+                budget_bytes: 0,
+                stored_bytes: 0,
+                stored_blocks: 0,
+                hits: 0,
+                misses: 0,
+                writes: 0,
+                reads: 0,
+                evictions: 0,
+                restore_failures: 0,
+                namespace_rejections: 0,
+                corruptions: 0,
+                bytes_written: 0,
+                bytes_read: 0,
+                hit_rate: 0.0,
+                mid_decode_fetches: 0,
+                ssd_enabled: false,
+            },
             active_kv_bytes: 0,
             restored_tokens: 0,
             rejected_namespaces: 0,
@@ -162,12 +181,12 @@ impl CacheSnapshot {
         }
     }
 
-    pub fn mock_m07() -> Self {
+    pub fn mock_m08() -> Self {
         Self {
-            status: "ram-prefix-ready".to_owned(),
-            cache_mode: "ram_prefix_bf16".to_owned(),
+            status: "ssd-prefix-ready".to_owned(),
+            cache_mode: "ram_prefix_bf16+ssd_cold_prefix_bf16".to_owned(),
             block_size_tokens: 16 * 1024,
-            namespace_hash: Some("m07-mock-namespace".to_owned()),
+            namespace_hash: Some("m08-mock-namespace".to_owned()),
             ram: CacheAccountingSnapshot {
                 budget_bytes: 64 * 1024 * 1024 * 1024,
                 resident_bytes: 12 * 1024 * 1024 * 1024,
@@ -179,10 +198,28 @@ impl CacheSnapshot {
                 hit_rate: 1.0,
                 ssd_enabled: false,
             },
+            ssd: SsdCacheAccountingSnapshot {
+                budget_bytes: 64 * 1024 * 1024,
+                stored_bytes: 164 * 1024,
+                stored_blocks: 4,
+                hits: 4,
+                misses: 0,
+                writes: 4,
+                reads: 8,
+                evictions: 0,
+                restore_failures: 8,
+                namespace_rejections: 4,
+                corruptions: 4,
+                bytes_written: 164 * 1024,
+                bytes_read: 328 * 1024,
+                hit_rate: 1.0,
+                mid_decode_fetches: 0,
+                ssd_enabled: true,
+            },
             active_kv_bytes: 3 * 1024 * 1024 * 1024,
             restored_tokens: 1_024 + 4_096 + 8_192 + 16_384,
-            rejected_namespaces: 12,
-            note: "M07 restore matrix passes for 1K/4K/8K/16K; SSD disabled".to_owned(),
+            rejected_namespaces: 16,
+            note: "M08 SSD restore matrix passes for 1K/4K/8K/16K; no mid-decode fetch".to_owned(),
         }
     }
 }

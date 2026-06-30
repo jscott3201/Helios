@@ -3,19 +3,32 @@
   "title": "Gemma4D KV Cache Manifest",
   "type": "object",
   "required": [
+    "manifest_version",
+    "block_file_version",
     "kv_layout_version",
     "model_id",
     "model_revision",
     "weights_sha256",
+    "quantization_sha256",
     "tokenizer_sha256",
     "chat_template_sha256",
     "cache_mode",
+    "namespace_hash",
+    "block_id",
     "block_size_tokens",
     "sequence_start",
     "sequence_end",
+    "logical_byte_len",
+    "block_checksum",
     "layers"
   ],
   "properties": {
+    "manifest_version": {
+      "type": "integer"
+    },
+    "block_file_version": {
+      "type": "integer"
+    },
     "kv_layout_version": {
       "type": "integer"
     },
@@ -32,6 +45,9 @@
       "type": "string"
     },
     "weights_sha256": {
+      "type": "string"
+    },
+    "quantization_sha256": {
       "type": "string"
     },
     "tokenizer_sha256": {
@@ -55,6 +71,12 @@
     "cache_mode": {
       "type": "string"
     },
+    "namespace_hash": {
+      "type": "string"
+    },
+    "block_id": {
+      "type": "string"
+    },
     "block_size_tokens": {
       "type": "integer"
     },
@@ -63,6 +85,12 @@
     },
     "sequence_end": {
       "type": "integer"
+    },
+    "logical_byte_len": {
+      "type": "integer"
+    },
+    "block_checksum": {
+      "type": "string"
     },
     "prompt_token_hash": {
       "type": "string"
