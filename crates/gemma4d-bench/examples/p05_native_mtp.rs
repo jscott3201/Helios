@@ -484,10 +484,15 @@ fn run_mtp(
     let mut rollback_count = 0_u64;
     let mut auto_disabled = false;
     let mut auto_disable_reason = None;
+    let mut pending_greedy = Some(first.greedy_token);
     let mut events = Vec::new();
 
     while generated.len() < probe.max_new_tokens {
         if auto_disabled {
+            if let Some(token) = pending_greedy.take() {
+                generated.push(token);
+                continue;
+            }
             let token = *generated
                 .last()
                 .ok_or("auto-disabled MTP has no committed token")?;
@@ -514,6 +519,7 @@ fn run_mtp(
             auto_disable_reason = Some("native drafter returned no tokens".to_owned());
             continue;
         }
+        pending_greedy = None;
 
         attempted_draft_tokens += draft.len() as u64;
         target_verify_passes += 1;
@@ -559,12 +565,14 @@ fn run_mtp(
                 "acceptance rate {:.3} fell below threshold {:.3}",
                 acceptance_rate, MIN_ACCEPTANCE_RATE
             ));
+            pending_greedy = Some(step.greedy_token);
         } else if peak_memory_gb as f64 >= MEMORY_CLIFF_GB {
             auto_disabled = true;
             auto_disable_reason = Some(format!(
                 "peak memory {:.3} GB crossed {:.1} GB threshold",
                 peak_memory_gb, MEMORY_CLIFF_GB
             ));
+            pending_greedy = Some(step.greedy_token);
         }
     }
 
