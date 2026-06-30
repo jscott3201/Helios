@@ -1,0 +1,16 @@
+[runtime]
+profile = "tiny16"
+max_active_generations = 1
+max_context_tokens = 32768
+prefill_chunk_tokens = 512
+hard_memory_limit_mb = 1024
+leave_system_headroom_mb = 2048
+
+[model]
+target = ""
+target_revision = "PIN_ME"
+
+[tui]
+enabled = true
+tick_ms = 250
+confirm_destructive_actions = true
