@@ -31,7 +31,7 @@ No blocker, high, or medium compliance gaps were found for M00.
 ## Coverage Summary
 
 - Implemented and tested: M00 bootstrap workspace, scripts, native smoke, docs/artifact layout, ignore rules.
-- Implemented but not tested: GitHub Actions workflow is a skeleton and has not yet run remotely.
+- Implemented but not part of the M00 local acceptance gate: GitHub Actions workflow skeleton. The local equivalent is `make verify`.
 - Not implemented: Later milestone behavior, intentionally out of scope.
 - Ambiguous / needs owner decision: None for M00.
 
