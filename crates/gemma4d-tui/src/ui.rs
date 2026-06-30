@@ -66,12 +66,11 @@ fn render_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         PageId::Dashboard => render_dashboard(frame, area, state),
         PageId::Config => render_config(frame, area, state),
         PageId::Benchmarks => render_benchmarks(frame, area, state),
+        PageId::Cache => render_cache(frame, area, state),
         PageId::Mtp => render_mtp(frame, area, state),
         PageId::Logs => render_logs(frame, area, state),
         PageId::Help => render_help(frame, area),
-        PageId::Chat | PageId::Cache | PageId::Adapters => {
-            render_placeholder(frame, area, state.current_page)
-        }
+        PageId::Chat | PageId::Adapters => render_placeholder(frame, area, state.current_page),
     }
 }
 
@@ -232,6 +231,59 @@ fn render_benchmarks(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
+fn render_cache(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let cache = &state.cache;
+    let ram = cache.ram;
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Status ", Style::default().fg(Color::Gray)),
+            Span::raw(cache.status.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Mode ", Style::default().fg(Color::Gray)),
+            Span::raw(cache.cache_mode.clone()),
+        ]),
+        Line::from(format!("Block size {} tokens", cache.block_size_tokens)),
+        Line::from(format!(
+            "Namespace {}",
+            cache.namespace_hash.as_deref().unwrap_or("none")
+        )),
+        Line::from(format!(
+            "RAM resident {} / {} across {} blocks",
+            bytes(ram.resident_bytes),
+            bytes(ram.budget_bytes),
+            ram.resident_blocks
+        )),
+        Line::from(format!(
+            "Hits {} | misses {} | hit rate {:.1}%",
+            ram.hits,
+            ram.misses,
+            ram.hit_rate * 100.0
+        )),
+        Line::from(format!(
+            "Evictions {} | restore failures {} | rejected namespaces {}",
+            ram.evictions, ram.restore_failures, cache.rejected_namespaces
+        )),
+        Line::from(format!("Active KV {}", bytes(cache.active_kv_bytes))),
+        Line::from(format!("Restored tokens {}", cache.restored_tokens)),
+        Line::from(format!(
+            "SSD {}",
+            if ram.ssd_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )),
+        Line::from(cache.note.clone()),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Cache"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let items = state
         .logs
@@ -378,6 +430,18 @@ fn option_tps(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.1} tok/s"))
         .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn bytes(value: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if value >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", value as f64 / GIB)
+    } else if value >= 1024 * 1024 {
+        format!("{:.2} MiB", value as f64 / MIB)
+    } else {
+        format!("{value} B")
+    }
 }
 
 fn status_color(status: crate::config::ValidationStatus) -> Color {

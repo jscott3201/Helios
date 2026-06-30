@@ -143,13 +143,29 @@ fn disabled_feature_pages_render_dependency_messages() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
     let base = seed_state(&mut provider, config_path);
 
-    for page in [PageId::Chat, PageId::Cache, PageId::Adapters] {
+    for page in [PageId::Chat, PageId::Adapters] {
         let mut state = base.clone();
         reduce(&mut state, Action::Navigate(page));
         let snapshot = render_snapshot(&state, 80, 24).unwrap();
         assert!(snapshot.contains("Disabled until"));
         assert!(snapshot.contains(page.title()));
     }
+}
+
+#[test]
+fn cache_page_renders_m07_accounting_summary() {
+    let mut provider = MockProvider::default();
+    let config_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
+    let mut state = seed_state(&mut provider, config_path);
+    reduce(&mut state, Action::Navigate(PageId::Cache));
+
+    let snapshot = render_snapshot(&state, 80, 24).unwrap();
+    assert!(snapshot.contains("Cache"));
+    assert!(snapshot.contains("ram_prefix_bf16"));
+    assert!(snapshot.contains("RAM resident"));
+    assert!(snapshot.contains("restore failures"));
+    assert!(snapshot.contains("SSD disabled"));
 }
 
 #[test]

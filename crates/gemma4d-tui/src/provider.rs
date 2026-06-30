@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     app::{
-        BackendEvent, BenchmarkRecord, BenchmarkStatus, DashboardSnapshot, LogEntry, MtpSnapshot,
-        ProviderKind,
+        BackendEvent, BenchmarkRecord, BenchmarkStatus, CacheSnapshot, DashboardSnapshot, LogEntry,
+        MtpSnapshot, ProviderKind,
     },
     config::{ConfigValidation, validate_config_path},
 };
@@ -11,6 +11,7 @@ use crate::{
 pub trait RuntimeProvider {
     fn name(&self) -> String;
     fn dashboard_snapshot(&mut self) -> DashboardSnapshot;
+    fn cache_snapshot(&mut self) -> CacheSnapshot;
     fn mtp_snapshot(&mut self) -> MtpSnapshot;
     fn backend_events(&mut self) -> Vec<BackendEvent>;
     fn validate_config(&mut self, path: &Path) -> ConfigValidation;
@@ -57,8 +58,13 @@ impl RuntimeProvider for MockProvider {
             BackendEvent::Log(LogEntry::info(
                 "dashboard metrics are deterministic mock values",
             )),
+            BackendEvent::Cache(self.cache_snapshot()),
             BackendEvent::Mtp(self.mtp_snapshot()),
         ]
+    }
+
+    fn cache_snapshot(&mut self) -> CacheSnapshot {
+        CacheSnapshot::mock_m07()
     }
 
     fn mtp_snapshot(&mut self) -> MtpSnapshot {
@@ -115,6 +121,10 @@ impl RuntimeProvider for FileProvider {
             decode_tps_p50: None,
             cache_hit_rate: None,
         }
+    }
+
+    fn cache_snapshot(&mut self) -> CacheSnapshot {
+        CacheSnapshot::disabled("file provider has no M07 cache accounting report loaded")
     }
 
     fn backend_events(&mut self) -> Vec<BackendEvent> {

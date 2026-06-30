@@ -668,6 +668,12 @@ version = "0.1.0"
 [[package]]
 name = "gemma4d-kv"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "gemma4d-llama-baseline"
@@ -705,6 +711,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "crossterm",
+ "gemma4d-kv",
  "ratatui",
  "serde",
  "serde_json",

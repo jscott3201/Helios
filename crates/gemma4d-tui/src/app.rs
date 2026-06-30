@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::ValueEnum;
+use gemma4d_kv::CacheAccountingSnapshot;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ConfigValidation;
@@ -79,9 +80,6 @@ impl PageId {
     pub fn dependency_message(self) -> Option<&'static str> {
         match self {
             Self::Chat => Some("Disabled until M11 provides the local server/control provider."),
-            Self::Cache => {
-                Some("Disabled until M07/M08 expose KV cache and prefix-cache providers.")
-            }
             Self::Adapters => Some("Disabled until M10 dynamic adapter loading is implemented."),
             _ => None,
         }
@@ -122,6 +120,69 @@ impl DashboardSnapshot {
             ttft_p50_ms: None,
             decode_tps_p50: None,
             cache_hit_rate: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheSnapshot {
+    pub status: String,
+    pub cache_mode: String,
+    pub block_size_tokens: u64,
+    pub namespace_hash: Option<String>,
+    pub ram: CacheAccountingSnapshot,
+    pub active_kv_bytes: u64,
+    pub restored_tokens: u64,
+    pub rejected_namespaces: u64,
+    pub note: String,
+}
+
+impl CacheSnapshot {
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: "disabled".to_owned(),
+            cache_mode: "none".to_owned(),
+            block_size_tokens: 0,
+            namespace_hash: None,
+            ram: CacheAccountingSnapshot {
+                budget_bytes: 0,
+                resident_bytes: 0,
+                resident_blocks: 0,
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+                restore_failures: 0,
+                hit_rate: 0.0,
+                ssd_enabled: false,
+            },
+            active_kv_bytes: 0,
+            restored_tokens: 0,
+            rejected_namespaces: 0,
+            note: reason.into(),
+        }
+    }
+
+    pub fn mock_m07() -> Self {
+        Self {
+            status: "ram-prefix-ready".to_owned(),
+            cache_mode: "ram_prefix_bf16".to_owned(),
+            block_size_tokens: 16 * 1024,
+            namespace_hash: Some("m07-mock-namespace".to_owned()),
+            ram: CacheAccountingSnapshot {
+                budget_bytes: 64 * 1024 * 1024 * 1024,
+                resident_bytes: 12 * 1024 * 1024 * 1024,
+                resident_blocks: 4,
+                hits: 4,
+                misses: 0,
+                evictions: 0,
+                restore_failures: 12,
+                hit_rate: 1.0,
+                ssd_enabled: false,
+            },
+            active_kv_bytes: 3 * 1024 * 1024 * 1024,
+            restored_tokens: 1_024 + 4_096 + 8_192 + 16_384,
+            rejected_namespaces: 12,
+            note: "M07 restore matrix passes for 1K/4K/8K/16K; SSD disabled".to_owned(),
         }
     }
 }
@@ -303,6 +364,7 @@ impl LogEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BackendEvent {
     Dashboard(DashboardSnapshot),
+    Cache(CacheSnapshot),
     Log(LogEntry),
     Benchmark(BenchmarkRecord),
     Mtp(MtpSnapshot),
@@ -320,6 +382,7 @@ pub enum Action {
     ConfigValidated(ConfigValidation),
     StartBenchmark,
     BenchmarkRecorded(BenchmarkRecord),
+    CacheUpdated(CacheSnapshot),
     MtpUpdated(MtpSnapshot),
     BackendEvent(BackendEvent),
     DashboardUpdated(DashboardSnapshot),
@@ -337,6 +400,7 @@ pub struct AppState {
     pub config_path: PathBuf,
     pub config_validation: ConfigValidation,
     pub dashboard: DashboardSnapshot,
+    pub cache: CacheSnapshot,
     pub benchmark: BenchmarkRecord,
     pub mtp: MtpSnapshot,
     pub logs: Vec<LogEntry>,
@@ -356,6 +420,7 @@ impl AppState {
             config_path: config_path.clone(),
             config_validation: ConfigValidation::pending(config_path),
             dashboard: DashboardSnapshot::offline(&provider_name),
+            cache: CacheSnapshot::disabled("cache provider snapshot pending"),
             benchmark,
             mtp: MtpSnapshot::disabled("MTP provider snapshot pending"),
             logs: vec![LogEntry::info(
@@ -422,12 +487,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::BackendEvent(event) => match event {
             BackendEvent::Dashboard(snapshot) => reduce(state, Action::DashboardUpdated(snapshot)),
+            BackendEvent::Cache(snapshot) => reduce(state, Action::CacheUpdated(snapshot)),
             BackendEvent::Log(entry) => reduce(state, Action::AppendLog(entry)),
             BackendEvent::Benchmark(record) => reduce(state, Action::BenchmarkRecorded(record)),
             BackendEvent::Mtp(snapshot) => reduce(state, Action::MtpUpdated(snapshot)),
         },
         Action::DashboardUpdated(snapshot) => {
             state.dashboard = snapshot;
+        }
+        Action::CacheUpdated(snapshot) => {
+            state.status_line = format!("cache {}", snapshot.status);
+            state.cache = snapshot;
         }
         Action::MtpUpdated(snapshot) => {
             state.status_line = format!("MTP {}", snapshot.status.label());
