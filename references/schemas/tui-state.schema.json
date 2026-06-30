@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gemma4D TUI State Snapshot",
+  "type": "object",
+  "required": [
+    "version",
+    "screen",
+    "server",
+    "metrics",
+    "notices"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "screen": {
+      "type": "string"
+    },
+    "server": {
+      "type": "object",
+      "required": [
+        "connected",
+        "url"
+      ],
+      "properties": {
+        "connected": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        },
+        "model_loaded": {
+          "type": "boolean"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "adapters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "chat": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "notices": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gemma4D Adapter Manifest",
+  "type": "object",
+  "required": [
+    "adapter_id",
+    "adapter_type",
+    "base_model_id",
+    "base_weight_hash",
+    "tokenizer_hash",
+    "chat_template_hash",
+    "rank",
+    "alpha",
+    "target_modules",
+    "adapter_weight_hash"
+  ],
+  "properties": {
+    "adapter_id": {
+      "type": "string"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "adapter_type": {
+      "enum": [
+        "lora",
+        "qlora",
+        "alora"
+      ]
+    },
+    "source_format": {
+      "enum": [
+        "peft",
+        "mlx_lm",
+        "internal"
+      ]
+    },
+    "source_path": {
+      "type": "string"
+    },
+    "base_model_id": {
+      "type": "string"
+    },
+    "base_model_revision": {
+      "type": "string"
+    },
+    "base_weight_hash": {
+      "type": "string"
+    },
+    "tokenizer_hash": {
+      "type": "string"
+    },
+    "chat_template_hash": {
+      "type": "string"
+    },
+    "rank": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 256
+    },
+    "alpha": {
+      "type": "number"
+    },
+    "dropout": {
+      "type": "number",
+      "minimum": 0
+    },
+    "dtype": {
+      "enum": [
+        "bf16",
+        "fp16",
+        "fp32"
+      ]
+    },
+    "target_modules": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "modules_to_save": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "requires_tokenizer_changes": {
+      "type": "boolean"
+    },
+    "supports_mtp": {
+      "enum": [
+        "unknown",
+        "false",
+        "true"
+      ]
+    },
+    "adapter_weight_hash": {
+      "type": "string"
+    },
+    "activation_string": {
+      "type": "string"
+    },
+    "activation_token_ids": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      }
+    }
+  },
+  "additionalProperties": true
+}

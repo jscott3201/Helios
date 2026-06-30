@@ -1,0 +1,10 @@
+.DS_Store
+codex-id.json
+
+# Local planning/spec import folders are source material, not repo artifacts.
+_*/
+
+# Build and generated artifacts.
+target/
+benchmarks/out/
+artifacts/

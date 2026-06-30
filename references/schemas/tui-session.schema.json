@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gemma4D TUI Session Snapshot",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "provider",
+    "page",
+    "timestamp",
+    "state"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "provider": {
+      "type": "string",
+      "enum": [
+        "mock",
+        "file",
+        "http"
+      ]
+    },
+    "page": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "state": {
+      "type": "object"
+    },
+    "last_command": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_output_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

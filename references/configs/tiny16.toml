@@ -1,0 +1,79 @@
+[runtime]
+profile = "tiny16"
+max_active_generations = 1
+max_context_tokens = 32768
+prefill_chunk_tokens = 512
+hard_memory_limit_mb = 12288
+leave_system_headroom_mb = 3072
+
+[model]
+target = "mlx-community/gemma-4-12B-it-4bit"
+target_revision = "PIN_ME"
+drafter = "mlx-community/gemma-4-12B-it-qat-assistant-4bit"
+drafter_revision = "PIN_ME"
+
+[speculative]
+enabled = false
+mode = "gemma4_mtp"
+draft_block_size = 2
+require_exact_greedy = true
+enabled_with_adapters = false
+auto_disable_min_accept_rate = 0.35
+
+[kv]
+active_mode = "bf16"
+ram_prefix_mode = "bf16"
+ssd_prefix_mode = "disabled"
+compress_global_layers = false
+compress_sliding_layers = false
+keep_mtp_shared_layers_bf16 = true
+block_size_tokens = 1024
+quantized_kv_start = 4096
+adapter_aware_hashing = true
+allow_cross_adapter_cache_reuse = false
+allow_alora_base_prefix_reuse = false
+
+[ssd_cache]
+enabled = false
+path = "~/.cache/gemma4d/kv"
+max_size_gb = 32
+write_compressed = false
+restore_before_prefill_only = true
+live_decode_ssd_fetch = false
+checksum = true
+
+[adapters]
+enabled = true
+allow_dynamic_load = true
+allow_remote_load = false
+max_hot_adapters = 2
+max_hot_adapter_rank = 32
+max_total_adapter_ram_mb = 768
+reject_modules_to_save = true
+require_same_tokenizer = true
+require_same_chat_template = true
+default_adapter = "none"
+
+[server]
+bind = "127.0.0.1:8080"
+openai_compat = true
+streaming = true
+metrics = true
+
+[tui]
+enabled = true
+provider = "file" # mock during M05, file/offline by default, http after M11
+frame_rate = 20
+tick_rate_ms = 250
+enable_mouse = false
+enable_paste = true
+confirm_destructive_actions = true
+
+[tui]
+enabled = true
+server_url = "http://127.0.0.1:8080"
+tick_ms = 250
+mouse = false
+confirm_destructive_actions = true
+max_log_lines = 5000
+max_chat_render_lines = 2000

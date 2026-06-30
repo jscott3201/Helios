@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gemma4D KV Cache Manifest",
+  "type": "object",
+  "required": [
+    "kv_layout_version",
+    "model_id",
+    "model_revision",
+    "weights_sha256",
+    "tokenizer_sha256",
+    "chat_template_sha256",
+    "cache_mode",
+    "block_size_tokens",
+    "sequence_start",
+    "sequence_end",
+    "layers"
+  ],
+  "properties": {
+    "kv_layout_version": {
+      "type": "integer"
+    },
+    "engine_version": {
+      "type": "string"
+    },
+    "mlx_version": {
+      "type": "string"
+    },
+    "model_id": {
+      "type": "string"
+    },
+    "model_revision": {
+      "type": "string"
+    },
+    "weights_sha256": {
+      "type": "string"
+    },
+    "tokenizer_sha256": {
+      "type": "string"
+    },
+    "chat_template_sha256": {
+      "type": "string"
+    },
+    "adapter_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "adapter_weight_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cache_mode": {
+      "type": "string"
+    },
+    "block_size_tokens": {
+      "type": "integer"
+    },
+    "sequence_start": {
+      "type": "integer"
+    },
+    "sequence_end": {
+      "type": "integer"
+    },
+    "prompt_token_hash": {
+      "type": "string"
+    },
+    "raw_prompt_hash": {
+      "type": "string"
+    },
+    "layers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "layer",
+          "attention_type",
+          "sequence_start",
+          "sequence_end",
+          "shape",
+          "stored_tensors",
+          "checksum"
+        ],
+        "properties": {
+          "layer": {
+            "type": "integer"
+          },
+          "attention_type": {
+            "enum": [
+              "sliding",
+              "full"
+            ]
+          },
+          "head_dim": {
+            "type": "integer"
+          },
+          "kv_heads": {
+            "type": "integer"
+          },
+          "attention_k_eq_v": {
+            "type": "boolean"
+          },
+          "sequence_start": {
+            "type": "integer"
+          },
+          "sequence_end": {
+            "type": "integer"
+          },
+          "local_start": {
+            "type": "integer"
+          },
+          "local_end": {
+            "type": "integer"
+          },
+          "shape": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "stored_tensors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "compression": {
+            "type": "string"
+          },
+          "checksum": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

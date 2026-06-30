@@ -1,0 +1,421 @@
+{
+  "name": "research-review-agent-skills",
+  "version": "1.0.0",
+  "created_for": "generalized research and review agents for any application/codebase",
+  "platforms": [
+    "Codex",
+    "Cursor",
+    "Open Agent Skills-compatible tools"
+  ],
+  "skills": [
+    "codebase-research-pass",
+    "external-source-research",
+    "spec-contract-compliance-review",
+    "architecture-design-review",
+    "multi-agent-pr-review",
+    "performance-ab-benchmark-review",
+    "release-readiness-review"
+  ],
+  "subagents": [
+    "codebase-mapper",
+    "external-researcher",
+    "spec-tracer",
+    "correctness-reviewer",
+    "security-reliability-reviewer",
+    "performance-analyst",
+    "test-verifier",
+    "release-risk-reviewer"
+  ],
+  "files": [
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "b6ed2ae2bc2cf5b8e676a7dd947718a3a9b125812e4a3cc01e71d977089acbd8",
+      "bytes": 294
+    },
+    {
+      "path": "LICENSE-SHARING.md",
+      "sha256": "1fb1112a513763d978cfcf5bd84fc30a92e08072b9161b4842dfb349ee015652",
+      "bytes": 456
+    },
+    {
+      "path": "README.md",
+      "sha256": "58d2dcc7511ced8b673c2285b3cb9708bf2bd122dd9b92241f3fe1f61213b443",
+      "bytes": 3133
+    },
+    {
+      "path": "codex/.agents/skills/architecture-design-review/SKILL.md",
+      "sha256": "93ffea2909d363d8159b50b6f4834c5cbb96e80cd8dc60b9bbaeb122ffdf2bec",
+      "bytes": 5272
+    },
+    {
+      "path": "codex/.agents/skills/architecture-design-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "codex/.agents/skills/architecture-design-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "codex/.agents/skills/codebase-research-pass/SKILL.md",
+      "sha256": "adb7987ab79dc11455a8b7c16f77c891fba449b4b3325ace81a7d7ace8e04b52",
+      "bytes": 5565
+    },
+    {
+      "path": "codex/.agents/skills/codebase-research-pass/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "codex/.agents/skills/codebase-research-pass/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "codex/.agents/skills/external-source-research/SKILL.md",
+      "sha256": "3e3bab49f8640512fa798164fdaa8be3d7e6cefb540710bce3d20c21f1162339",
+      "bytes": 5373
+    },
+    {
+      "path": "codex/.agents/skills/external-source-research/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "codex/.agents/skills/external-source-research/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "codex/.agents/skills/multi-agent-pr-review/SKILL.md",
+      "sha256": "093e4ad7d59fa3aa2603bde0fcaa4419c4b2a96fed0f636118686ff1b9e9f670",
+      "bytes": 5613
+    },
+    {
+      "path": "codex/.agents/skills/multi-agent-pr-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "codex/.agents/skills/multi-agent-pr-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "codex/.agents/skills/performance-ab-benchmark-review/SKILL.md",
+      "sha256": "5d476ca764d9bd16a38c559f1149dcc32647bd613dc7e278a1513e15a2f07008",
+      "bytes": 5554
+    },
+    {
+      "path": "codex/.agents/skills/performance-ab-benchmark-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "codex/.agents/skills/performance-ab-benchmark-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "codex/.agents/skills/release-readiness-review/SKILL.md",
+      "sha256": "b8c5538b6781bbda4b4ffc74adc8b4cc76e53e4559ecaa37e2f5c4251b0cbc36",
+      "bytes": 5357
+    },
+    {
+      "path": "codex/.agents/skills/release-readiness-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "codex/.agents/skills/release-readiness-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "codex/.agents/skills/spec-contract-compliance-review/SKILL.md",
+      "sha256": "469fd7330dc406c5e484a4571f9c516e8b00e9154bb70c9fdf11f770bb86baba",
+      "bytes": 5641
+    },
+    {
+      "path": "codex/.agents/skills/spec-contract-compliance-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "codex/.agents/skills/spec-contract-compliance-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "codex/.codex/agents/codebase-mapper.toml",
+      "sha256": "b662c0ebbfe1bdb2968d03edca063e1c67cc176f59cd45bce49f2d01c5f4cd01",
+      "bytes": 1060
+    },
+    {
+      "path": "codex/.codex/agents/correctness-reviewer.toml",
+      "sha256": "35409642a53feb8a61b640b3b9574f44e6f40f0b01690913235c865eb8b29c5f",
+      "bytes": 993
+    },
+    {
+      "path": "codex/.codex/agents/external-researcher.toml",
+      "sha256": "55e0e5c42922fb8c2d3441c6cf7c78c711ea3da13c0c597f6151ee21698dcfc9",
+      "bytes": 1055
+    },
+    {
+      "path": "codex/.codex/agents/performance-analyst.toml",
+      "sha256": "2f554869d54d01ee739eff7ce03a673271da5338f040114acb9d031fa9753801",
+      "bytes": 1206
+    },
+    {
+      "path": "codex/.codex/agents/release-risk-reviewer.toml",
+      "sha256": "016004ac1b9ebf67662396fdf1be23cb6420253998700be73762f923c6ae955f",
+      "bytes": 1049
+    },
+    {
+      "path": "codex/.codex/agents/security-reliability-reviewer.toml",
+      "sha256": "1fb07ce7cd885b4093de40bce8eca323b1e1341b5282a397672408063cb852f6",
+      "bytes": 1143
+    },
+    {
+      "path": "codex/.codex/agents/spec-tracer.toml",
+      "sha256": "bffa00b632edceabd39c262ac7cc76477cafba5e7b32118ef4ca835343179923",
+      "bytes": 949
+    },
+    {
+      "path": "codex/.codex/agents/test-verifier.toml",
+      "sha256": "9fc1bc3c9d7730eadc2a9f83e36c847bb1084583e5ba031d18c5998125eb4da9",
+      "bytes": 1059
+    },
+    {
+      "path": "codex/.codex/config.toml",
+      "sha256": "36a9b3259da5f9d9357a527e8abf70d713a07ff1db58cf7b339157637a3d8f9e",
+      "bytes": 206
+    },
+    {
+      "path": "codex/AGENTS.md",
+      "sha256": "836ea3597693cd313fac98ce53c5e2f85fcd2352eb89b39e1380e7393a8d54d5",
+      "bytes": 747
+    },
+    {
+      "path": "codex/INSTALL.md",
+      "sha256": "bed11f34f41ca6e36960b1f28d8dea670ff671bbb47d6ee44e20240824a64996",
+      "bytes": 852
+    },
+    {
+      "path": "cursor/.cursor/agents/codebase-mapper.md",
+      "sha256": "e2905ddf8970e61c5e7674ff7a5b82179ff878d8fdd5a1439513cb4fa9c979a5",
+      "bytes": 955
+    },
+    {
+      "path": "cursor/.cursor/agents/correctness-reviewer.md",
+      "sha256": "a1bb575d3a175076ae698d40e2bbd08171cf8822981150c1a3e65ff53108cb7b",
+      "bytes": 888
+    },
+    {
+      "path": "cursor/.cursor/agents/external-researcher.md",
+      "sha256": "cbc2e7e8c4073558a3ddd86d4f2a1419200290b48e87eaf3db1657b4b4a9151f",
+      "bytes": 950
+    },
+    {
+      "path": "cursor/.cursor/agents/performance-analyst.md",
+      "sha256": "a8b8be439839dc43566f4db04249104fdab1c65ce7842ccabf413a399231d1ea",
+      "bytes": 1096
+    },
+    {
+      "path": "cursor/.cursor/agents/release-risk-reviewer.md",
+      "sha256": "c53b9b1a3a51bd79042567213c3f0bd50168221bc4b7ee8dfde161d8761cac37",
+      "bytes": 944
+    },
+    {
+      "path": "cursor/.cursor/agents/security-reliability-reviewer.md",
+      "sha256": "bbaf852435460712ad504ccb96b7ca20466f68677e71552335f5dbf0dba48481",
+      "bytes": 1038
+    },
+    {
+      "path": "cursor/.cursor/agents/spec-tracer.md",
+      "sha256": "a5cc32050f79520e0ec50ece7287339f56895b0e224a0a6024143513330d2f16",
+      "bytes": 844
+    },
+    {
+      "path": "cursor/.cursor/agents/test-verifier.md",
+      "sha256": "a8e44d62a27fce591898b2cf7f907b1e05f2aec0a30beb701a073e019930f5cf",
+      "bytes": 949
+    },
+    {
+      "path": "cursor/.cursor/skills/architecture-design-review/SKILL.md",
+      "sha256": "93ffea2909d363d8159b50b6f4834c5cbb96e80cd8dc60b9bbaeb122ffdf2bec",
+      "bytes": 5272
+    },
+    {
+      "path": "cursor/.cursor/skills/architecture-design-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "cursor/.cursor/skills/architecture-design-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "cursor/.cursor/skills/codebase-research-pass/SKILL.md",
+      "sha256": "adb7987ab79dc11455a8b7c16f77c891fba449b4b3325ace81a7d7ace8e04b52",
+      "bytes": 5565
+    },
+    {
+      "path": "cursor/.cursor/skills/codebase-research-pass/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "cursor/.cursor/skills/codebase-research-pass/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "cursor/.cursor/skills/external-source-research/SKILL.md",
+      "sha256": "3e3bab49f8640512fa798164fdaa8be3d7e6cefb540710bce3d20c21f1162339",
+      "bytes": 5373
+    },
+    {
+      "path": "cursor/.cursor/skills/external-source-research/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "cursor/.cursor/skills/external-source-research/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "cursor/.cursor/skills/multi-agent-pr-review/SKILL.md",
+      "sha256": "093e4ad7d59fa3aa2603bde0fcaa4419c4b2a96fed0f636118686ff1b9e9f670",
+      "bytes": 5613
+    },
+    {
+      "path": "cursor/.cursor/skills/multi-agent-pr-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "cursor/.cursor/skills/multi-agent-pr-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "cursor/.cursor/skills/performance-ab-benchmark-review/SKILL.md",
+      "sha256": "5d476ca764d9bd16a38c559f1149dcc32647bd613dc7e278a1513e15a2f07008",
+      "bytes": 5554
+    },
+    {
+      "path": "cursor/.cursor/skills/performance-ab-benchmark-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "cursor/.cursor/skills/performance-ab-benchmark-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "cursor/.cursor/skills/release-readiness-review/SKILL.md",
+      "sha256": "b8c5538b6781bbda4b4ffc74adc8b4cc76e53e4559ecaa37e2f5c4251b0cbc36",
+      "bytes": 5357
+    },
+    {
+      "path": "cursor/.cursor/skills/release-readiness-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "cursor/.cursor/skills/release-readiness-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "cursor/.cursor/skills/spec-contract-compliance-review/SKILL.md",
+      "sha256": "469fd7330dc406c5e484a4571f9c516e8b00e9154bb70c9fdf11f770bb86baba",
+      "bytes": 5641
+    },
+    {
+      "path": "cursor/.cursor/skills/spec-contract-compliance-review/references/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "cursor/.cursor/skills/spec-contract-compliance-review/references/severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "cursor/AGENTS.md",
+      "sha256": "3854df2e2b55bfa477fbbeeef10728901213bab2edb353d7abd6711ebc1d856c",
+      "bytes": 986
+    },
+    {
+      "path": "cursor/INSTALL.md",
+      "sha256": "723f3a898f007e5aef5fb908f5764332f8e32e912ac6c1465c0810c7a56fb5bb",
+      "bytes": 906
+    },
+    {
+      "path": "docs/output-contracts.md",
+      "sha256": "88b3d5da9a84c8e4683120b6b37234794ae74da829f2d79ddaa4e9507e74eb7e",
+      "bytes": 1101
+    },
+    {
+      "path": "docs/platform-format-notes.md",
+      "sha256": "9f4f549b125fc1bec5734cb9b6fec376a614f23d36ba7ea597fa74cd547b5931",
+      "bytes": 1569
+    },
+    {
+      "path": "docs/sharing-checklist.md",
+      "sha256": "c8e6ebcd83f93c30c6008cd6135d48a0afa2e2417536ca6d67c3b99d671a59a4",
+      "bytes": 668
+    },
+    {
+      "path": "docs/subagent-patterns.md",
+      "sha256": "cf456fa4b2deeb3ea0bafef37f23534cb7241f4101a501079ecf43869ccca108",
+      "bytes": 1476
+    },
+    {
+      "path": "docs/usage-playbook.md",
+      "sha256": "dec40811c232f9a40464a7cb6658e166a494fe5ef7ee9217a8685d20eb67af39",
+      "bytes": 1961
+    },
+    {
+      "path": "shared/references/benchmark-report-template.md",
+      "sha256": "f5a68a5c10dc4aaf3920f7aa49d136a1920b03922a1a0a968336e396ffe88463",
+      "bytes": 332
+    },
+    {
+      "path": "shared/references/evidence-ledger-template.md",
+      "sha256": "44e9a2697f5e271cfa7a2393442fa17f45d3b558508c200703bf9768d8497978",
+      "bytes": 292
+    },
+    {
+      "path": "shared/references/research-brief-template.md",
+      "sha256": "e33126b7a48d03844d53d033a65a9468e5178f0434c0a3ef742585f336d9589a",
+      "bytes": 304
+    },
+    {
+      "path": "shared/references/review-report-template.md",
+      "sha256": "5578b4bcbcb73a06e77795a839578b61106d885931d4e7c5904ed248b7eed590",
+      "bytes": 322
+    },
+    {
+      "path": "shared/references/review-severity-rubric.md",
+      "sha256": "020dc390fe8ff958052556f9415cff70d1da26a9b5d94a3d7aa913ed9f63dd95",
+      "bytes": 788
+    },
+    {
+      "path": "shared/references/safe-research-practices.md",
+      "sha256": "7301364cc1da554a5d9b0982698650ee43f465b89ef7d90ae86f565bac0ddf44",
+      "bytes": 609
+    },
+    {
+      "path": "shared/references/spec-compliance-matrix-template.md",
+      "sha256": "a22772a6f7469e29e5de91a1b7acd34c9559dd859f6311660b2951e5cd3850bb",
+      "bytes": 281
+    }
+  ]
+}

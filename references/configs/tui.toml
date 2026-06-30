@@ -1,0 +1,36 @@
+[tui]
+enabled = true
+server_url = "http://127.0.0.1:8080"
+tick_ms = 250
+mouse = false
+theme = "auto"
+confirm_destructive_actions = true
+sanitize_control_chars = true
+max_log_lines = 5000
+max_chat_render_lines = 2000
+
+[tui.layout]
+min_width = 80
+min_height = 24
+snapshot_widths = [80, 120, 160]
+snapshot_heights = [24, 40, 50]
+
+[tui.screens]
+default = "dashboard"
+enabled = ["dashboard", "chat", "adapters", "cache", "benchmarks", "config", "logs"]
+
+[tui.chat]
+default_adapter = "none"
+default_temperature = 0.0
+default_stream = true
+cancel_key = "Ctrl-C"
+
+[tui.benchmarks]
+default_profile = "smoke"
+write_reports = true
+report_dir = "benchmarks/out/M11"
+
+[tui.security]
+allow_shell_commands = false
+allow_remote_adapter_load = false
+redact_secrets = true
