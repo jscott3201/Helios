@@ -14,7 +14,7 @@
 |---|---|---|---|---|
 | M12-T01 | Run standard benchmark matrix at 1K/4K/8K/16K/32K. | `m12_real_tiny16_matrix`; `real-matrix/records.jsonl`; `real-matrix/report.md`; `docs/evidence/M12-release-report.md`. | Complete | 32K uses one generated token as a memory probe to protect tiny16 headroom. |
 | M12-T02 | Run MTP exactness and acceptance benchmarks if enabled. | `mtp-fixture.json`; MTP default disabled in `tiny16.toml`; M06 fixture still passes. | Complete | MTP remains disabled by default for tiny16. |
-| M12-T03 | Run RAM and SSD prefix cache warm TTFT tests. | `ram-restore-matrix.json`; `ssd-benchmark.json`. | Complete | Fixture TTFT/restore timing only. |
+| M12-T03 | Run RAM and SSD prefix cache warm TTFT tests. | `ram-restore-matrix.json` includes `cold_prefill_ttft_ms` and `warm_ram_restore_ttft_ms`; `ssd-benchmark.json` includes `cold_prefill_ttft_ms` and `warm_ssd_restore_ttft_ms`. | Complete | Fixture TTFT/restore timing only. |
 | M12-T04 | Run one Rust expert adapter load/route/unload test. | `adapter-fixture.json`; `release-gate.json` adapter gate. | Complete | Native adapter tensor math remains future work. |
 | M12-T05 | Run TUI-assisted validation of dashboard, chat, cache, adapter, benchmark, and config screens. | TUI release walkthrough report and 18 snapshots under `benchmarks/out/M12/tui-walkthrough/`; HTTP walkthrough under `tui-http-walkthrough/`. | Complete | Mock walkthrough is deterministic; HTTP walkthrough verifies live attach. |
 | M12-T06 | Run release-readiness review and risk audit. | `docs/evidence/M12-release-readiness.md`; this compliance matrix. | Complete | Decision is ready with known limitations, not production native serving. |

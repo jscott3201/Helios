@@ -39,7 +39,7 @@ The separate `release-gate.json` context matrix remains useful control-plane evi
 | Gate | Result | Evidence |
 |---|---|---|
 | MTP exactness/acceptance | Passed | `benchmarks/out/M12/mtp-fixture.json` |
-| RAM prefix cache warm restore | Passed | `benchmarks/out/M12/ram-restore-matrix.json` |
+| RAM prefix cache warm restore | Passed | `benchmarks/out/M12/ram-restore-matrix.json` includes `cold_prefill_ttft_ms` and `warm_ram_restore_ttft_ms` |
 | SSD prefix cache warm restore | Passed | `benchmarks/out/M12/ssd-benchmark.json` |
 | Rust expert adapter load/route/unload | Passed | `benchmarks/out/M12/adapter-fixture.json` and `release-gate.json` |
 | Server streaming/metrics/admission smoke | Passed | `benchmarks/out/M12/server-smoke.json` |

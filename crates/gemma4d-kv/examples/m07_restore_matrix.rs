@@ -1,4 +1,4 @@
-use std::{env, fs, num::NonZeroU64, path::PathBuf};
+use std::{env, fs, num::NonZeroU64, path::PathBuf, time::Instant};
 
 use gemma4d_kv::{
     CacheAccountingSnapshot, Error, RamPrefixCache, fixture_block, fresh_prefill_fixture,
@@ -26,6 +26,8 @@ struct CaseReport {
     restored_greedy_token: u32,
     fresh_greedy_logit: f32,
     restored_greedy_logit: f32,
+    cold_prefill_ttft_ms: f64,
+    warm_ram_restore_ttft_ms: f64,
     rejected_wrong_model: bool,
     rejected_wrong_template: bool,
     rejected_wrong_prompt_hash: bool,
@@ -44,13 +46,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cases = Vec::new();
 
     for sequence_len in [1024, 4096, 8192, 16384] {
+        let cold_start = Instant::now();
         let block = fixture_block(sequence_len, block_size)?;
         let key = block.key.clone();
         let namespace = block.namespace.clone();
         let fresh = fresh_prefill_fixture(sequence_len);
+        let cold_ttft_ms = elapsed_ms(cold_start.elapsed());
         cache.insert(block)?;
 
+        let warm_start = Instant::now();
         let restored = cache.restore(&key, &namespace)?;
+        let warm_ttft_ms = elapsed_ms(warm_start.elapsed());
         let mut wrong_model = namespace.clone();
         wrong_model.model_id = "wrong-model".to_owned();
         let mut wrong_template = namespace.clone();
@@ -79,6 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             restored_greedy_token: restored.observation.greedy_token,
             fresh_greedy_logit: fresh.greedy_logit(),
             restored_greedy_logit: restored.observation.greedy_logit(),
+            cold_prefill_ttft_ms: cold_ttft_ms,
+            warm_ram_restore_ttft_ms: warm_ttft_ms,
             rejected_wrong_model,
             rejected_wrong_template,
             rejected_wrong_prompt_hash,
@@ -127,4 +135,8 @@ fn parse_out_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
     out.ok_or_else(|| "usage: m07_restore_matrix --out <path>".into())
+}
+
+fn elapsed_ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
