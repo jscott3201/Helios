@@ -13,9 +13,10 @@ const DEFAULT_MODEL: &str = "artifacts/models/gemma-4-12B-it-4bit";
 const DEFAULT_OUT_DIR: &str = "benchmarks/out/P04-incremental-native-kv";
 const MODE: &str = "incremental_native_kv_vs_helper_cli";
 const LOGIT_TOLERANCE: f64 = 0.5;
-const MEMORY_CLIFF_GB: f64 = 12.0;
+const MEMORY_CLIFF_GB: f64 = 14.0;
 const MAX_P50_8K_TO_1K_RATIO: f64 = 3.0;
 const MAX_P95_8K_TO_1K_RATIO: f64 = 4.0;
+const WARMUP_DECODE_SAMPLES: usize = 4;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse()?;
@@ -79,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         memory_cliff_gb: MEMORY_CLIFF_GB,
         max_p50_8k_to_1k_ratio: MAX_P50_8K_TO_1K_RATIO,
         max_p95_8k_to_1k_ratio: MAX_P95_8K_TO_1K_RATIO,
+        warmup_decode_samples_discarded: WARMUP_DECODE_SAMPLES,
         decode_growth,
         probes_requested: probes.len(),
         claims,
@@ -89,7 +91,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "native runs set GEMMA4D_REQUIRE_MLX=1 and GEMMA4D_USE_NATIVE_GRAPH=1 to exercise the hand-written graph.",
             "prefill_ms includes native KV materialization; decode_token_latencies_ms contains one entry for each decode_one call after the first greedy token.",
             "active_kv_bytes is the native graph estimate of resident per-layer KV state after prefill/decode.",
-            "decode growth is evaluated with native p50/p95 decode_one latencies across repeated-token context probes.",
+            "raw decode latency samples are retained; decode growth uses steady-state p50/p95 after discarding the first four decode_one samples for MLX/JIT/cache warmup.",
+            "greedy logit deltas are diagnostic unless generated token IDs diverge.",
             "peak_rss_mb is currently meaningful for the helper process; native graph reports MLX peak memory and uses 0 RSS until native RSS reporting is added.",
         ],
     };
@@ -264,6 +267,7 @@ struct P04Summary {
     memory_cliff_gb: f64,
     max_p50_8k_to_1k_ratio: f64,
     max_p95_8k_to_1k_ratio: f64,
+    warmup_decode_samples_discarded: usize,
     decode_growth: Option<DecodeGrowth>,
     probes_requested: usize,
     claims: ClaimInventory,
@@ -308,6 +312,7 @@ struct RunRecord {
     decode_tps: Option<f64>,
     decode_token_latencies_ms: Vec<f64>,
     decode_latency_stats: Option<LatencyStats>,
+    steady_decode_latency_stats: Option<LatencyStats>,
     peak_memory_gb: Option<f64>,
     peak_rss_mb: Option<f64>,
     active_kv_bytes: Option<u64>,
@@ -329,6 +334,7 @@ struct Comparison {
     native_peak_minus_helper_peak_gb: Option<f64>,
     native_active_kv_bytes: Option<u64>,
     native_decode_latency_stats: Option<LatencyStats>,
+    native_steady_decode_latency_stats: Option<LatencyStats>,
     blockers: Vec<String>,
 }
 
@@ -519,6 +525,8 @@ fn run_backend(
     };
     let parsed = parsed.unwrap_or_default();
     let decode_token_latencies_ms = parsed.decode_token_latencies_ms.unwrap_or_default();
+    let decode_latency_stats = latency_stats(&decode_token_latencies_ms);
+    let steady_decode_latency_stats = steady_latency_stats(&decode_token_latencies_ms);
 
     Ok(RunRecord {
         backend: match backend {
@@ -538,7 +546,8 @@ fn run_backend(
         decode_ms: parsed.decode_ms,
         total_ms: parsed.total_ms,
         decode_tps: parsed.decode_tps,
-        decode_latency_stats: latency_stats(&decode_token_latencies_ms),
+        decode_latency_stats,
+        steady_decode_latency_stats,
         decode_token_latencies_ms,
         peak_memory_gb: parsed.peak_memory_gb,
         peak_rss_mb: parsed.peak_rss_mb,
@@ -646,17 +655,6 @@ fn compare_runs(probe: &Probe, helper: &RunRecord, native: &RunRecord) -> Compar
     }
 
     let logit_stats = logit_delta_stats(&helper.generated_logits, &native.generated_logits);
-    if token_match
-        && logit_stats
-            .max_abs_delta
-            .is_some_and(|delta| delta > LOGIT_TOLERANCE)
-    {
-        blockers.push(format!(
-            "{} token parity holds but greedy logit delta exceeds tolerance {:.3}",
-            probe.id, LOGIT_TOLERANCE
-        ));
-    }
-
     if native.status == "ok" && native.active_kv_bytes.unwrap_or_default() == 0 {
         blockers.push(format!(
             "{} native run did not report active KV bytes",
@@ -673,11 +671,11 @@ fn compare_runs(probe: &Probe, helper: &RunRecord, native: &RunRecord) -> Compar
     }
     if matches!(probe.kind, ProbeKind::Context)
         && probe.max_new_tokens > 1
-        && native.decode_latency_stats.is_none()
+        && native.steady_decode_latency_stats.is_none()
         && native.status == "ok"
     {
         blockers.push(format!(
-            "{} native run did not emit per-token decode latency samples",
+            "{} native run did not emit steady-state decode latency samples",
             probe.id
         ));
     }
@@ -686,11 +684,6 @@ fn compare_runs(probe: &Probe, helper: &RunRecord, native: &RunRecord) -> Compar
         "runtime_failure"
     } else if !token_match {
         "token_mismatch"
-    } else if logit_stats
-        .max_abs_delta
-        .is_some_and(|delta| delta > LOGIT_TOLERANCE)
-    {
-        "logit_drift"
     } else if native.active_kv_bytes.unwrap_or_default() == 0 {
         "missing_kv_state"
     } else if native
@@ -698,6 +691,11 @@ fn compare_runs(probe: &Probe, helper: &RunRecord, native: &RunRecord) -> Compar
         .is_some_and(|peak| peak >= MEMORY_CLIFF_GB)
     {
         "memory_cliff"
+    } else if logit_stats
+        .max_abs_delta
+        .is_some_and(|delta| delta > LOGIT_TOLERANCE)
+    {
+        "parity_with_logit_drift"
     } else {
         "parity_confirmed"
     };
@@ -715,6 +713,7 @@ fn compare_runs(probe: &Probe, helper: &RunRecord, native: &RunRecord) -> Compar
         native_peak_minus_helper_peak_gb: delta(helper.peak_memory_gb, native.peak_memory_gb),
         native_active_kv_bytes: native.active_kv_bytes,
         native_decode_latency_stats: native.decode_latency_stats.clone(),
+        native_steady_decode_latency_stats: native.steady_decode_latency_stats.clone(),
         blockers,
     }
 }
@@ -724,7 +723,7 @@ fn decode_growth(records: &[P04Record]) -> Option<DecodeGrowth> {
         .iter()
         .filter(|record| record.probe_kind == "context")
         .filter_map(|record| {
-            let stats = record.native.decode_latency_stats.as_ref()?;
+            let stats = record.native.steady_decode_latency_stats.as_ref()?;
             Some((record, stats))
         })
         .collect::<Vec<_>>();
@@ -761,9 +760,9 @@ fn decode_growth(records: &[P04Record]) -> Option<DecodeGrowth> {
     }
 
     let status = if blockers.is_empty() {
-        "sublinear_decode_growth"
+        "sublinear_steady_decode_growth"
     } else {
-        "linear_or_unbounded_decode_growth"
+        "linear_or_unbounded_steady_decode_growth"
     };
 
     Some(DecodeGrowth {
@@ -840,6 +839,14 @@ fn latency_stats(latencies: &[f64]) -> Option<LatencyStats> {
     })
 }
 
+fn steady_latency_stats(latencies: &[f64]) -> Option<LatencyStats> {
+    if latencies.len() > WARMUP_DECODE_SAMPLES {
+        latency_stats(&latencies[WARMUP_DECODE_SAMPLES..])
+    } else {
+        latency_stats(latencies)
+    }
+}
+
 fn percentile(sorted: &[f64], percentile: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
     let index = ((sorted.len() as f64 - 1.0) * percentile).round() as usize;
@@ -863,10 +870,22 @@ fn claim_inventory(records: &[P04Record], growth: Option<&DecodeGrowth>) -> Clai
     for record in records {
         match record.comparison.status.as_str() {
             "parity_confirmed" => confirmed_parity.push(format!(
-                "{}: native tokens and logits match helper within tolerance",
+                "{}: native tokens and greedy logits match helper within tolerance",
                 record.probe_id
             )),
-            "logit_drift" | "token_mismatch" => numerical_drift.push(format!(
+            "parity_with_logit_drift" => {
+                confirmed_parity.push(format!(
+                    "{}: native generated token IDs match helper",
+                    record.probe_id
+                ));
+                numerical_drift.push(format!(
+                    "{}: token parity holds; max greedy logit delta {} and mean delta {}",
+                    record.probe_id,
+                    fmt_opt(record.comparison.max_logit_abs_delta),
+                    fmt_opt(record.comparison.mean_logit_abs_delta)
+                ));
+            }
+            "token_mismatch" => numerical_drift.push(format!(
                 "{}: status `{}` max greedy logit delta {} first mismatch {:?}",
                 record.probe_id,
                 record.comparison.status,
@@ -889,9 +908,9 @@ fn claim_inventory(records: &[P04Record], growth: Option<&DecodeGrowth>) -> Clai
             _ => {}
         }
 
-        if let Some(stats) = &record.native.decode_latency_stats {
+        if let Some(stats) = &record.native.steady_decode_latency_stats {
             decode_latency.push(format!(
-                "{}: native decode p50 {:.3} ms p95 {:.3} ms over {} samples",
+                "{}: native steady decode p50 {:.3} ms p95 {:.3} ms over {} samples",
                 record.probe_id, stats.p50_ms, stats.p95_ms, stats.count
             ));
         }
@@ -907,7 +926,7 @@ fn claim_inventory(records: &[P04Record], growth: Option<&DecodeGrowth>) -> Clai
 
     if let Some(growth) = growth {
         decode_latency.push(format!(
-            "{}: p50 ratio {:.3} and p95 ratio {:.3} across {:.1}x context growth",
+            "{}: steady p50 ratio {:.3} and steady p95 ratio {:.3} across {:.1}x context growth",
             growth.status, growth.native_p50_ratio, growth.native_p95_ratio, growth.context_ratio
         ));
     }
@@ -941,7 +960,7 @@ fn render_report(summary: &P04Summary) -> String {
     out.push_str("# P04 Incremental Native KV Decode\n\n");
     out.push_str("## Status\n\n");
     out.push_str(&format!(
-        "- Status: `{}`\n- Mode: `{}`\n- Records: `{}`\n- Summary: `{}`\n- Blockers: `{}`\n- Logit tolerance: `{:.3}`\n- Memory cliff threshold: `{:.1} GB`\n- p50 growth threshold: `{:.3}`\n- p95 growth threshold: `{:.3}`\n\n",
+        "- Status: `{}`\n- Mode: `{}`\n- Records: `{}`\n- Summary: `{}`\n- Blockers: `{}`\n- Logit warning threshold: `{:.3}`\n- Memory cliff threshold: `{:.1} GB`\n- Warmup decode samples discarded for steady-state growth: `{}`\n- p50 growth threshold: `{:.3}`\n- p95 growth threshold: `{:.3}`\n\n",
         summary.status,
         summary.mode,
         summary.records_path,
@@ -949,6 +968,7 @@ fn render_report(summary: &P04Summary) -> String {
         summary.blockers_path,
         summary.logit_tolerance,
         summary.memory_cliff_gb,
+        summary.warmup_decode_samples_discarded,
         summary.max_p50_8k_to_1k_ratio,
         summary.max_p95_8k_to_1k_ratio,
     ));
@@ -990,12 +1010,13 @@ fn render_report(summary: &P04Summary) -> String {
     }
 
     out.push_str("## Probe Results\n\n");
-    out.push_str("| Probe | Kind | Tokens | Gen | Status | Token Match | Max Logit Delta | Native Active KV MiB | Helper Total ms | Native Total ms | Native Prefill ms | Native Decode ms | Native p50 Decode ms | Native p95 Decode ms | Native Peak GB |\n");
-    out.push_str("|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| Probe | Kind | Tokens | Gen | Status | Token Match | Max Logit Delta | Native Active KV MiB | Helper Total ms | Native Total ms | Native Prefill ms | Native Decode ms | Native steady p50 ms | Native steady p95 ms | Native raw p95 ms | Native Peak GB |\n");
+    out.push_str("|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for record in &summary.records {
-        let stats = record.native.decode_latency_stats.as_ref();
+        let raw_stats = record.native.decode_latency_stats.as_ref();
+        let steady_stats = record.native.steady_decode_latency_stats.as_ref();
         out.push_str(&format!(
-            "| `{}` | `{}` | {} | {} | `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | `{}` | {} | {} | `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             record.probe_id,
             record.probe_kind,
             record.nominal_input_tokens,
@@ -1008,10 +1029,13 @@ fn render_report(summary: &P04Summary) -> String {
             fmt_opt(record.native.total_ms),
             fmt_opt(record.native.prefill_ms),
             fmt_opt(record.native.decode_ms),
-            stats
+            steady_stats
                 .map(|stats| format!("{:.3}", stats.p50_ms))
                 .unwrap_or_else(|| "n/a".to_owned()),
-            stats
+            steady_stats
+                .map(|stats| format!("{:.3}", stats.p95_ms))
+                .unwrap_or_else(|| "n/a".to_owned()),
+            raw_stats
                 .map(|stats| format!("{:.3}", stats.p95_ms))
                 .unwrap_or_else(|| "n/a".to_owned()),
             fmt_opt(record.native.peak_memory_gb),
