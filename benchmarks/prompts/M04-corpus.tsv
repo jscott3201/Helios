@@ -1,0 +1,3 @@
+# id	prompt	token_ids	max_new_tokens
+hello_smoke	Hello	9259	8
+hello_divergent_prefix	Hello after two generated reference tokens	9259,236772,236772	1
