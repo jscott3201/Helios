@@ -406,6 +406,10 @@ pub struct NativeLastHiddenView {
 }
 
 impl NativeLastHiddenView {
+    /// Returns the opaque native hidden-state pointer.
+    ///
+    /// The pointer is owned by the KV cache that produced the `StepResult` and is valid only until
+    /// that cache is reset, freed, or advanced by another native prefill/decode/verify call.
     pub fn as_ptr(self) -> *mut std::ffi::c_void {
         self.ptr.as_ptr()
     }
@@ -682,12 +686,34 @@ mod tests {
         assert_eq!(step.sequence_len, 1);
         assert_eq!(step.greedy_token, 236772);
         assert!(step.peak_memory_gb > 0.0);
+        assert!(step.native_last_hidden.is_some());
 
         let decode =
             decode_one(&target, &mut cache, step.greedy_token).expect("native decode should run");
         assert_eq!(decode.sequence_len, 2);
         assert_eq!(decode.greedy_token, 236772);
         assert!(decode.peak_memory_gb > 0.0);
+        assert!(decode.native_last_hidden.is_some());
+
+        let assistant_fixture = write_assistant_fixture();
+        let drafter_config = LoadConfig {
+            model_path: assistant_fixture.to_string_lossy().into_owned(),
+            model_id: Some("mlx-community/gemma-4-12B-it-qat-assistant-4bit".to_owned()),
+            model_revision: None,
+            expected_architecture: Some("gemma4_unified_assistant".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+        let drafter =
+            Drafter::load(&drafter_config, &target).expect("assistant manifest should load");
+        let err = draft_block(&drafter, &mut cache, NonZeroU32::new(1).expect("non-zero"))
+            .expect_err("assistant execution is still pending after shared views are present");
+        assert_eq!(err.status(), Status::UnsupportedConfig);
+        assert!(
+            err.message()
+                .contains("materialized last target hidden/shared views")
+        );
+        fs::remove_dir_all(assistant_fixture).expect("remove assistant fixture");
     }
 
     #[test]

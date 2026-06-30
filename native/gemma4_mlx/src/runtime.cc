@@ -62,6 +62,7 @@ struct NativeKvCache {
     uint64_t magic;
     Gemma4KvPolicy policy;
     std::vector<int32_t> native_tokens;
+    std::unique_ptr<gemma4d::NativeHiddenState> last_hidden;
 };
 
 struct NativeDrafter {
@@ -518,6 +519,7 @@ Gemma4Status gemma4_kv_create(const Gemma4KvPolicy* policy, Gemma4KvCache** out)
 
     cache->magic = kKvCacheMagic;
     cache->policy = *policy;
+    cache->last_hidden.reset();
     *out = cache;
     return ok();
 }
@@ -543,7 +545,8 @@ Gemma4Status gemma4_kv_reset(Gemma4KvCache* cache) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_reset received an invalid cache handle");
     }
 
-    (void)cache;
+    cache->native_tokens.clear();
+    cache->last_hidden.reset();
     return ok();
 }
 
@@ -581,9 +584,14 @@ Gemma4Status gemma4_prefill(
         }
         cache->native_tokens.assign(tokens, tokens + token_count);
         std::string native_error;
-        if (!target->native_model->forward_greedy(cache->native_tokens, out, &native_error)) {
+        if (!target->native_model->forward_greedy(
+                cache->native_tokens,
+                out,
+                &native_error,
+                &cache->last_hidden)) {
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
+        out->native_last_hidden = cache->last_hidden.get();
         target->sequence_len = out->sequence_len;
         return ok();
     }
@@ -620,9 +628,14 @@ Gemma4Status gemma4_decode_one(
         }
         cache->native_tokens.push_back(token);
         std::string native_error;
-        if (!target->native_model->forward_greedy(cache->native_tokens, out, &native_error)) {
+        if (!target->native_model->forward_greedy(
+                cache->native_tokens,
+                out,
+                &native_error,
+                &cache->last_hidden)) {
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
+        out->native_last_hidden = cache->last_hidden.get();
         target->sequence_len = out->sequence_len;
         return ok();
     }
@@ -722,13 +735,24 @@ Gemma4Status gemma4_mtp_draft_block(
             GEMMA4_ERR_UNSUPPORTED_CONFIG,
             "gemma4_mtp_draft_block requires a loaded Gemma 4 MTP assistant; smoke handles do not draft");
     }
+    if (cache->last_hidden == nullptr) {
+        *inout_count = 0;
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_mtp_draft_block requires materialized last target hidden/shared views; call gemma4_prefill or gemma4_decode_one first on the native target graph");
+    }
+    if (!cache->last_hidden->has_shared_kv()) {
+        *inout_count = 0;
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_mtp_draft_block requires both full-attention and sliding-attention shared KV views");
+    }
 
-    (void)cache;
     (void)out_tokens;
     *inout_count = 0;
     return fail(
         GEMMA4_ERR_UNSUPPORTED_CONFIG,
-        "native MTP drafter execution is not implemented; last target hidden/shared views are not materialized");
+        "native MTP drafter execution is not implemented for materialized last target hidden/shared views");
 }
 
 Gemma4Status gemma4_verify_tokens(
@@ -765,9 +789,14 @@ Gemma4Status gemma4_verify_tokens(
         }
         cache->native_tokens.insert(cache->native_tokens.end(), draft_tokens, draft_tokens + draft_count);
         std::string native_error;
-        if (!target->native_model->forward_greedy(cache->native_tokens, out, &native_error)) {
+        if (!target->native_model->forward_greedy(
+                cache->native_tokens,
+                out,
+                &native_error,
+                &cache->last_hidden)) {
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
+        out->native_last_hidden = cache->last_hidden.get();
         target->sequence_len = out->sequence_len;
         return ok();
     }

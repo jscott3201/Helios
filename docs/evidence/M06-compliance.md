@@ -5,14 +5,14 @@
 - Milestone: `milestones/M06-mtp-speculative-decoding.md`
 - Goal: `codex/goals/M06-mtp-speculative-decoding.goal.md`
 - Spec: `spec/05-speculative-decoding-mtp.md`
-- References: `references/acceptance-checklists.md`, `docs/decisions/0002-m06-mtp-fail-closed-until-native-hidden-state.md`
+- References: `references/acceptance-checklists.md`, `docs/decisions/0002-m06-mtp-fail-closed-until-native-assistant-execution.md`
 
 ## Task Matrix
 
 | ID | Requirement | Evidence | Status | Gap |
 |---|---|---|---|---|
 | M06-T01 | Add drafter load FFI function. | `native/gemma4_mlx/include/gemma4_mlx.h`; `native/gemma4_mlx/src/runtime.cc`; `crates/gemma4d-ffi/src/lib.rs`; `cargo test -p gemma4d-ffi`. | Complete | None. |
-| M06-T02 | Expose last target hidden state/shared views needed by drafter. | `Gemma4StepResult.native_last_hidden`; Rust `NativeLastHiddenView`; strict fail-closed draft message. | Partial | Field exists, but native target execution currently returns null and does not materialize shared views. |
+| M06-T02 | Expose last target hidden state/shared views needed by drafter. | `Gemma4StepResult.native_last_hidden`; Rust `NativeLastHiddenView`; `NativeHiddenState`; final full/sliding shared KV capture; gated native graph test. | Complete for opt-in native graph | Helper-backed path does not expose native views. |
 | M06-T03 | Implement draft block size 1, then 2. | `MtpConfig::draft_block_size`; `speculative_greedy`; engine tests; fixture report. | Complete for engine fixtures | Native assistant `draft_block` does not execute yet. |
 | M06-T04 | Implement verify/accept/rollback. | `speculative_greedy`; `MtpMetrics.rollback_count`; `mtp_block_size_2_matches_non_mtp_with_rollback`; fixture `block_size_2_rollback_exact`. | Complete for engine fixtures | Native verify exists; native assistant draft remains fail-closed. |
 | M06-T05 | Add MTP exactness tests against non-MTP greedy. | `cargo test -p gemma4d-engine --all-targets`; `benchmarks/out/M06/mtp-fixture-report.json`. | Complete | Fixture/scripted target scope only. |
@@ -32,8 +32,8 @@
 ## Spec Compliance Summary
 
 - Compliant: greedy-only fixture loop, block size 1/2 exactness, rollback behavior, acceptance metrics, adapter disable, compressed active KV disable, and TUI operator visibility.
-- Partial: native FFI interface and strict assistant artifact loading are present, but the native target+assistant loop is not executable because last hidden/shared KV views are not available.
-- Follow-up: complete native hidden/shared-state materialization and use it in `gemma4_mtp_draft_block`; then rerun exactness against real Gemma 4 target and assistant artifacts.
+- Partial: native FFI interface, strict assistant artifact loading, and native target hidden/shared-view materialization are present, but the native target+assistant loop is not executable because the assistant graph is not implemented.
+- Follow-up: implement native assistant tensor loading/forward using the materialized views in `gemma4_mtp_draft_block`; then rerun exactness against real Gemma 4 target and assistant artifacts.
 
 ## Risk
 

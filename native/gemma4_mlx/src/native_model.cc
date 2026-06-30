@@ -25,6 +25,18 @@
 
 namespace gemma4d {
 
+struct NativeHiddenState::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    mlx::core::array hidden;
+    std::optional<mlx::core::array> full_attention_key;
+    std::optional<mlx::core::array> full_attention_value;
+    std::optional<mlx::core::array> sliding_attention_key;
+    std::optional<mlx::core::array> sliding_attention_value;
+#endif
+    uint64_t sequence_len = 0;
+    uint32_t hidden_size = 0;
+};
+
 struct NativeTextModel::Impl {
 #ifdef GEMMA4D_MLX_AVAILABLE
     std::unordered_map<std::string, mlx::core::array> tensors;
@@ -177,6 +189,38 @@ std::optional<array> sliding_causal_mask(int sequence_len, int window_size) {
     return (linds >= rinds) && (linds < (rinds + window_size));
 }
 
+struct SharedKvArrays {
+    std::optional<array> full_attention_key;
+    std::optional<array> full_attention_value;
+    std::optional<array> sliding_attention_key;
+    std::optional<array> sliding_attention_value;
+};
+
+bool should_capture_shared_kv(uint32_t layer_idx, bool full_attention) {
+    if (full_attention) {
+        return layer_idx == 47;
+    }
+    return layer_idx == 46;
+}
+
+void capture_shared_kv(
+    SharedKvArrays* shared_kv,
+    uint32_t layer_idx,
+    bool full_attention,
+    const array& keys,
+    const array& values) {
+    if (shared_kv == nullptr || !should_capture_shared_kv(layer_idx, full_attention)) {
+        return;
+    }
+    if (full_attention) {
+        shared_kv->full_attention_key = keys;
+        shared_kv->full_attention_value = values;
+    } else {
+        shared_kv->sliding_attention_key = keys;
+        shared_kv->sliding_attention_value = values;
+    }
+}
+
 bool trace_layer0_detail_enabled();
 bool dump_selected_layer(uint32_t layer_idx);
 void trace_feature_stats(const char* label, const array& h, int sequence_len, int feature_dim, bool enabled);
@@ -188,7 +232,8 @@ array attention_forward(
     const NativeTextModel::Impl& impl,
     const array& x,
     uint32_t layer_idx,
-    int sequence_len) {
+    int sequence_len,
+    SharedKvArrays* shared_kv) {
     const bool full_attention = ((layer_idx + 1) % 6) == 0;
     const int head_dim = full_attention ? 512 : 256;
     const int n_heads = 16;
@@ -255,6 +300,7 @@ array attention_forward(
         dump_layer0_tensor("q_rope", queries);
     }
     trace_head_stats("layer0.q_rope", queries, sequence_len, head_dim, trace_layer0);
+    capture_shared_kv(shared_kv, layer_idx, full_attention, keys, values);
 
     const std::optional<array> mask = full_attention ? std::nullopt : sliding_causal_mask(sequence_len, 1024);
     const std::string mask_mode = mask.has_value() || sequence_len == 1 ? "" : "causal";
@@ -282,7 +328,12 @@ array attention_forward(
     return attn;
 }
 
-array layer_forward(const NativeTextModel::Impl& impl, const array& x, uint32_t layer_idx, int sequence_len) {
+array layer_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    int sequence_len,
+    SharedKvArrays* shared_kv) {
     const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
     const array residual = x;
     const bool trace_layer0 = layer_idx == 0 && trace_layer0_detail_enabled();
@@ -295,7 +346,7 @@ array layer_forward(const NativeTextModel::Impl& impl, const array& x, uint32_t 
         dump_layer0_tensor("input_norm", h);
     }
     trace_feature_stats("layer0.input_norm", h, sequence_len, 3840, trace_layer0);
-    h = attention_forward(impl, h, layer_idx, sequence_len);
+    h = attention_forward(impl, h, layer_idx, sequence_len, shared_kv);
     trace_feature_stats("layer0.attn_out", h, sequence_len, 3840, trace_layer0);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -463,7 +514,13 @@ void trace_hidden_stats(const char* label, const array& h, int sequence_len) {
     trace_feature_stats(label, h, sequence_len, 3840, trace_layer_stats_enabled());
 }
 
-array forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
+struct NativeForwardArrays {
+    array logits;
+    array last_hidden;
+    SharedKvArrays shared_kv;
+};
+
+NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
     if (tokens.empty()) {
         throw std::runtime_error("native forward requires at least one token");
     }
@@ -474,11 +531,12 @@ array forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<i
     const int sequence_len = static_cast<int>(tokens.size());
     array token_ids(tokens.begin(), {1, sequence_len}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
+    SharedKvArrays shared_kv;
     dump_hidden_tensor("embed", h);
     trace_hidden_stats("embed", h, sequence_len);
 
     for (uint32_t layer = 0; layer < 48; ++layer) {
-        h = layer_forward(impl, h, layer, sequence_len);
+        h = layer_forward(impl, h, layer, sequence_len, &shared_kv);
         const std::string label = "layer" + std::to_string(layer);
         dump_hidden_tensor(label.c_str(), h);
         trace_hidden_stats(label.c_str(), h, sequence_len);
@@ -490,7 +548,8 @@ array forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<i
     dump_hidden_tensor("final_norm", h);
     trace_hidden_stats("final_norm", h, sequence_len);
 
-    h = mlx::core::slice(h, {0, sequence_len - 1, 0}, {1, sequence_len, 3840});
+    array last_hidden = mlx::core::slice(h, {0, sequence_len - 1, 0}, {1, sequence_len, 3840});
+    h = last_hidden;
     const QuantizationSpec embed_quantization = quantization_for(impl, "language_model.model.embed_tokens");
     array logits = mlx::core::quantized_matmul(
         h,
@@ -505,7 +564,7 @@ array forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<i
     logits = model_dtype(mlx::core::tanh(logits / model_scalar(30.0f)) * model_scalar(30.0f));
     logits = mlx::core::reshape(logits, {262144});
     dump_hidden_tensor("logits", logits);
-    return logits;
+    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(shared_kv)};
 }
 
 bool trace_parity_logits_enabled() {
@@ -548,6 +607,34 @@ void trace_parity_logits(const std::vector<int32_t>& tokens, const array& logits
 #endif
 
 } // namespace
+
+NativeHiddenState::NativeHiddenState(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+NativeHiddenState::~NativeHiddenState() = default;
+
+NativeHiddenState::NativeHiddenState(NativeHiddenState&&) noexcept = default;
+
+NativeHiddenState& NativeHiddenState::operator=(NativeHiddenState&&) noexcept = default;
+
+uint64_t NativeHiddenState::sequence_len() const {
+    return impl_ == nullptr ? 0 : impl_->sequence_len;
+}
+
+uint32_t NativeHiddenState::hidden_size() const {
+    return impl_ == nullptr ? 0 : impl_->hidden_size;
+}
+
+bool NativeHiddenState::has_shared_kv() const {
+    if (impl_ == nullptr) {
+        return false;
+    }
+#ifndef GEMMA4D_MLX_AVAILABLE
+    return false;
+#else
+    return impl_->full_attention_key.has_value() && impl_->full_attention_value.has_value() &&
+        impl_->sliding_attention_key.has_value() && impl_->sliding_attention_value.has_value();
+#endif
+}
 
 NativeTextModel::NativeTextModel() : impl_(std::make_unique<Impl>()) {}
 
@@ -648,12 +735,16 @@ std::string NativeTextModel::summary() const {
 bool NativeTextModel::forward_greedy(
     const std::vector<int32_t>& tokens,
     Gemma4StepResult* out,
-    std::string* error) const {
+    std::string* error,
+    std::unique_ptr<NativeHiddenState>* last_hidden) const {
     if (out == nullptr || error == nullptr) {
         return false;
     }
     *out = Gemma4StepResult{};
     error->clear();
+    if (last_hidden != nullptr) {
+        last_hidden->reset();
+    }
 
 #ifndef GEMMA4D_MLX_AVAILABLE
     (void)tokens;
@@ -666,18 +757,36 @@ bool NativeTextModel::forward_greedy(
             return false;
         }
         mlx::core::reset_peak_memory();
-        array logits = forward_last_logits(*impl_, tokens);
+        NativeForwardArrays forward = forward_last_logits(*impl_, tokens);
+        array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits);
         array max_logit = to_float32(mlx::core::max(logits));
         mlx::core::eval({greedy, max_logit});
         trace_parity_logits(tokens, logits);
+
+        std::unique_ptr<NativeHiddenState> hidden;
+        if (last_hidden != nullptr) {
+            std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
+                std::move(forward.last_hidden),
+                std::move(forward.shared_kv.full_attention_key),
+                std::move(forward.shared_kv.full_attention_value),
+                std::move(forward.shared_kv.sliding_attention_key),
+                std::move(forward.shared_kv.sliding_attention_value),
+                static_cast<uint64_t>(tokens.size()),
+                3840,
+            });
+            hidden.reset(new NativeHiddenState(std::move(hidden_impl)));
+        }
 
         out->greedy_token = greedy.item<int>();
         out->greedy_logit = max_logit.item<float>();
         out->sequence_len = tokens.size();
         out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
         out->peak_rss_mb = 0.0f;
-        out->native_last_hidden = nullptr;
+        out->native_last_hidden = hidden.get();
+        if (last_hidden != nullptr) {
+            *last_hidden = std::move(hidden);
+        }
         return true;
     } catch (const std::exception& ex) {
         *error = std::string("native Gemma 4 forward failed: ") + ex.what();
