@@ -25,6 +25,7 @@ public:
     uint64_t sequence_len() const;
     uint32_t hidden_size() const;
     bool has_shared_kv() const;
+    std::unique_ptr<NativeHiddenState> clone() const;
 
 private:
     explicit NativeHiddenState(std::unique_ptr<Impl> impl);
@@ -50,6 +51,7 @@ public:
     void clear();
     uint64_t sequence_len() const;
     uint64_t active_bytes() const;
+    std::unique_ptr<NativeKvState> clone() const;
 
 private:
     std::unique_ptr<Impl> impl_;

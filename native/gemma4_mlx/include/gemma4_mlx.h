@@ -23,6 +23,7 @@ typedef enum Gemma4Status {
 typedef struct Gemma4Target Gemma4Target;
 typedef struct Gemma4Drafter Gemma4Drafter;
 typedef struct Gemma4KvCache Gemma4KvCache;
+typedef struct Gemma4KvSnapshot Gemma4KvSnapshot;
 typedef struct Gemma4Adapter Gemma4Adapter;
 
 typedef struct Gemma4VersionInfo {
@@ -76,6 +77,13 @@ typedef struct Gemma4StepResult {
     void* native_last_hidden;
 } Gemma4StepResult;
 
+typedef struct Gemma4KvSnapshotInfo {
+    uint64_t sequence_len;
+    uint64_t active_kv_bytes;
+    uint64_t token_count;
+    bool has_last_step;
+} Gemma4KvSnapshotInfo;
+
 Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out);
 Gemma4Status gemma4_get_last_error(char* buffer, size_t buffer_len);
 
@@ -85,6 +93,11 @@ Gemma4Status gemma4_free_target(Gemma4Target* target);
 Gemma4Status gemma4_kv_create(const Gemma4KvPolicy* policy, Gemma4KvCache** out);
 Gemma4Status gemma4_kv_free(Gemma4KvCache* cache);
 Gemma4Status gemma4_kv_reset(Gemma4KvCache* cache);
+Gemma4Status gemma4_kv_last_step(const Gemma4KvCache* cache, Gemma4StepResult* out);
+Gemma4Status gemma4_kv_snapshot_export(const Gemma4KvCache* cache, Gemma4KvSnapshot** out);
+Gemma4Status gemma4_kv_snapshot_import(Gemma4KvCache* cache, const Gemma4KvSnapshot* snapshot);
+Gemma4Status gemma4_kv_snapshot_info(const Gemma4KvSnapshot* snapshot, Gemma4KvSnapshotInfo* out);
+Gemma4Status gemma4_kv_snapshot_free(Gemma4KvSnapshot* snapshot);
 
 Gemma4Status gemma4_prefill(
     Gemma4Target* target,

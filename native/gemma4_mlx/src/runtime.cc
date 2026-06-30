@@ -36,6 +36,7 @@ namespace {
 constexpr uint64_t kTargetMagic = 0x47454d3444415447ULL;
 constexpr uint64_t kDrafterMagic = 0x47454d3444524146ULL;
 constexpr uint64_t kKvCacheMagic = 0x47454d344b564347ULL;
+constexpr uint64_t kKvSnapshotMagic = 0x47454d344b565347ULL;
 thread_local char g_last_error[512] = "";
 
 #ifdef GEMMA4D_MLX_AVAILABLE
@@ -64,6 +65,18 @@ struct NativeKvCache {
     std::vector<int32_t> native_tokens;
     std::unique_ptr<gemma4d::NativeKvState> native_kv_state;
     std::unique_ptr<gemma4d::NativeHiddenState> last_hidden;
+    bool has_last_step;
+    Gemma4StepResult last_step;
+};
+
+struct NativeKvSnapshot {
+    uint64_t magic;
+    Gemma4KvPolicy policy;
+    std::vector<int32_t> native_tokens;
+    std::unique_ptr<gemma4d::NativeKvState> native_kv_state;
+    std::unique_ptr<gemma4d::NativeHiddenState> last_hidden;
+    bool has_last_step;
+    Gemma4StepResult last_step;
 };
 
 struct NativeDrafter {
@@ -112,6 +125,26 @@ void clear_step_result(Gemma4StepResult* out) {
     if (out != nullptr) {
         std::memset(out, 0, sizeof(Gemma4StepResult));
     }
+}
+
+bool same_kv_policy(const Gemma4KvPolicy& left, const Gemma4KvPolicy& right) {
+    return left.active_mode == right.active_mode && left.ram_prefix_mode == right.ram_prefix_mode &&
+        left.ssd_prefix_mode == right.ssd_prefix_mode &&
+        left.block_size_tokens == right.block_size_tokens &&
+        left.quantized_kv_start == right.quantized_kv_start &&
+        left.compress_global_layers == right.compress_global_layers &&
+        left.compress_sliding_layers == right.compress_sliding_layers &&
+        left.keep_mtp_shared_layers_bf16 == right.keep_mtp_shared_layers_bf16 &&
+        left.allow_active_compressed_decode == right.allow_active_compressed_decode;
+}
+
+void remember_last_step(NativeKvCache* cache, const Gemma4StepResult* step) {
+    if (cache == nullptr || step == nullptr) {
+        return;
+    }
+    cache->last_step = *step;
+    cache->last_step.native_last_hidden = cache->last_hidden.get();
+    cache->has_last_step = true;
 }
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -396,6 +429,7 @@ Gemma4Status helper_command(NativeTarget* target, const std::string& command, Ge
 
 struct Gemma4Target : NativeTarget {};
 struct Gemma4KvCache : NativeKvCache {};
+struct Gemma4KvSnapshot : NativeKvSnapshot {};
 struct Gemma4Drafter : NativeDrafter {};
 struct Gemma4Adapter {};
 
@@ -524,6 +558,8 @@ Gemma4Status gemma4_kv_create(const Gemma4KvPolicy* policy, Gemma4KvCache** out)
     cache->magic = kKvCacheMagic;
     cache->policy = *policy;
     cache->last_hidden.reset();
+    cache->has_last_step = false;
+    clear_step_result(&cache->last_step);
     *out = cache;
     return ok();
 }
@@ -552,6 +588,123 @@ Gemma4Status gemma4_kv_reset(Gemma4KvCache* cache) {
     cache->native_tokens.clear();
     cache->native_kv_state.reset();
     cache->last_hidden.reset();
+    cache->has_last_step = false;
+    clear_step_result(&cache->last_step);
+    return ok();
+}
+
+Gemma4Status gemma4_kv_last_step(const Gemma4KvCache* cache, Gemma4StepResult* out) {
+    clear_step_result(out);
+
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_last_step requires a valid cache handle");
+    }
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_last_step requires a non-null step result");
+    }
+    if (!cache->has_last_step) {
+        return fail(GEMMA4_ERR_CACHE, "gemma4_kv_last_step requires a cache with a native prefill/decode result");
+    }
+
+    *out = cache->last_step;
+    out->native_last_hidden = cache->last_hidden.get();
+    return ok();
+}
+
+Gemma4Status gemma4_kv_snapshot_export(const Gemma4KvCache* cache, Gemma4KvSnapshot** out) {
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_export requires a non-null out pointer");
+    }
+    *out = nullptr;
+
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_export requires a valid cache handle");
+    }
+    if (cache->native_tokens.empty() || cache->native_kv_state == nullptr || !cache->has_last_step) {
+        return fail(
+            GEMMA4_ERR_CACHE,
+            "gemma4_kv_snapshot_export requires a cache populated by the native incremental path");
+    }
+
+    Gemma4KvSnapshot* snapshot = new (std::nothrow) Gemma4KvSnapshot{};
+    if (snapshot == nullptr) {
+        return fail(GEMMA4_ERR_RUNTIME, "gemma4_kv_snapshot_export could not allocate snapshot handle");
+    }
+
+    snapshot->magic = kKvSnapshotMagic;
+    snapshot->policy = cache->policy;
+    snapshot->native_tokens = cache->native_tokens;
+    snapshot->native_kv_state = cache->native_kv_state->clone();
+    snapshot->last_hidden = cache->last_hidden == nullptr ? nullptr : cache->last_hidden->clone();
+    snapshot->has_last_step = cache->has_last_step;
+    snapshot->last_step = cache->last_step;
+    snapshot->last_step.native_last_hidden = snapshot->last_hidden.get();
+    if (snapshot->native_kv_state == nullptr) {
+        delete snapshot;
+        return fail(GEMMA4_ERR_CACHE, "gemma4_kv_snapshot_export could not clone native KV state");
+    }
+
+    *out = snapshot;
+    return ok();
+}
+
+Gemma4Status gemma4_kv_snapshot_import(Gemma4KvCache* cache, const Gemma4KvSnapshot* snapshot) {
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_import requires a valid cache handle");
+    }
+    if (snapshot == nullptr || snapshot->magic != kKvSnapshotMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_import requires a valid snapshot handle");
+    }
+    if (!same_kv_policy(cache->policy, snapshot->policy)) {
+        return fail(GEMMA4_ERR_CACHE, "gemma4_kv_snapshot_import rejected incompatible KV policy");
+    }
+    if (snapshot->native_tokens.empty() || snapshot->native_kv_state == nullptr || !snapshot->has_last_step) {
+        return fail(GEMMA4_ERR_CACHE, "gemma4_kv_snapshot_import requires a populated native snapshot");
+    }
+
+    std::unique_ptr<gemma4d::NativeKvState> cloned_kv = snapshot->native_kv_state->clone();
+    if (cloned_kv == nullptr) {
+        return fail(GEMMA4_ERR_CACHE, "gemma4_kv_snapshot_import could not clone native KV state");
+    }
+    std::unique_ptr<gemma4d::NativeHiddenState> cloned_hidden =
+        snapshot->last_hidden == nullptr ? nullptr : snapshot->last_hidden->clone();
+
+    cache->native_tokens = snapshot->native_tokens;
+    cache->native_kv_state = std::move(cloned_kv);
+    cache->last_hidden = std::move(cloned_hidden);
+    cache->has_last_step = snapshot->has_last_step;
+    cache->last_step = snapshot->last_step;
+    cache->last_step.native_last_hidden = cache->last_hidden.get();
+    return ok();
+}
+
+Gemma4Status gemma4_kv_snapshot_info(const Gemma4KvSnapshot* snapshot, Gemma4KvSnapshotInfo* out) {
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_info requires a non-null out pointer");
+    }
+    std::memset(out, 0, sizeof(Gemma4KvSnapshotInfo));
+
+    if (snapshot == nullptr || snapshot->magic != kKvSnapshotMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_info requires a valid snapshot handle");
+    }
+
+    out->sequence_len = snapshot->native_kv_state == nullptr ? 0 : snapshot->native_kv_state->sequence_len();
+    out->active_kv_bytes = snapshot->native_kv_state == nullptr ? 0 : snapshot->native_kv_state->active_bytes();
+    out->token_count = snapshot->native_tokens.size();
+    out->has_last_step = snapshot->has_last_step;
+    return ok();
+}
+
+Gemma4Status gemma4_kv_snapshot_free(Gemma4KvSnapshot* snapshot) {
+    if (snapshot == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_free requires a non-null snapshot");
+    }
+    if (snapshot->magic != kKvSnapshotMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_free received an invalid snapshot handle");
+    }
+
+    snapshot->magic = 0;
+    delete snapshot;
     return ok();
 }
 
@@ -598,6 +751,7 @@ Gemma4Status gemma4_prefill(
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
         out->native_last_hidden = cache->last_hidden.get();
+        remember_last_step(cache, out);
         target->sequence_len = out->sequence_len;
         return ok();
     }
@@ -646,6 +800,7 @@ Gemma4Status gemma4_decode_one(
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
         out->native_last_hidden = cache->last_hidden.get();
+        remember_last_step(cache, out);
         target->sequence_len = out->sequence_len;
         return ok();
     }
@@ -861,6 +1016,7 @@ Gemma4Status gemma4_verify_tokens(
             out->peak_memory_gb = rebuilt_step.peak_memory_gb;
         }
         out->native_last_hidden = cache->last_hidden.get();
+        remember_last_step(cache, out);
         target->sequence_len = out->sequence_len;
         return ok();
     }

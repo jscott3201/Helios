@@ -39,6 +39,11 @@ mod raw {
     }
 
     #[repr(C)]
+    pub struct Gemma4KvSnapshot {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
     pub struct Gemma4VersionInfo {
         pub abi_version: u32,
         pub backend_name: *const c_char,
@@ -83,6 +88,15 @@ mod raw {
         pub native_last_hidden: *mut std::ffi::c_void,
     }
 
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Gemma4KvSnapshotInfo {
+        pub sequence_len: u64,
+        pub active_kv_bytes: u64,
+        pub token_count: u64,
+        pub has_last_step: bool,
+    }
+
     // SAFETY: These declarations mirror `native/gemma4_mlx/include/gemma4_mlx.h`.
     unsafe extern "C" {
         pub fn gemma4_runtime_version(out: *mut Gemma4VersionInfo) -> Gemma4Status;
@@ -98,6 +112,23 @@ mod raw {
         ) -> Gemma4Status;
         pub fn gemma4_kv_free(cache: *mut Gemma4KvCache) -> Gemma4Status;
         pub fn gemma4_kv_reset(cache: *mut Gemma4KvCache) -> Gemma4Status;
+        pub fn gemma4_kv_last_step(
+            cache: *const Gemma4KvCache,
+            out: *mut Gemma4StepResult,
+        ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_export(
+            cache: *const Gemma4KvCache,
+            out: *mut *mut Gemma4KvSnapshot,
+        ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_import(
+            cache: *mut Gemma4KvCache,
+            snapshot: *const Gemma4KvSnapshot,
+        ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_info(
+            snapshot: *const Gemma4KvSnapshot,
+            out: *mut Gemma4KvSnapshotInfo,
+        ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_free(snapshot: *mut Gemma4KvSnapshot) -> Gemma4Status;
         pub fn gemma4_prefill(
             target: *mut Gemma4Target,
             cache: *mut Gemma4KvCache,
@@ -399,12 +430,70 @@ impl KvCache {
         // SAFETY: `self.ptr` is an owned KV cache handle returned by `gemma4_kv_create`.
         check(unsafe { raw::gemma4_kv_reset(self.ptr.as_ptr()) })
     }
+
+    pub fn last_step(&self) -> Result<StepResult> {
+        let mut out = raw::Gemma4StepResult::default();
+        // SAFETY: `self.ptr` is an owned KV cache handle and `out` is writable.
+        check(unsafe { raw::gemma4_kv_last_step(self.ptr.as_ptr(), &mut out) })?;
+        Ok(out.into())
+    }
+
+    pub fn export_snapshot(&self) -> Result<KvSnapshot> {
+        let mut out = ptr::null_mut();
+        // SAFETY: `self.ptr` is an owned KV cache handle and `out` is writable.
+        check(unsafe { raw::gemma4_kv_snapshot_export(self.ptr.as_ptr(), &mut out) })?;
+        let ptr = NonNull::new(out).ok_or_else(|| Error {
+            status: Status::Runtime,
+            message: "gemma4_kv_snapshot_export returned OK with a null snapshot".to_owned(),
+        })?;
+        Ok(KvSnapshot { ptr })
+    }
+
+    pub fn import_snapshot(&mut self, snapshot: &KvSnapshot) -> Result<()> {
+        // SAFETY: handles come from safe wrappers and remain valid for the duration of the call.
+        check(unsafe { raw::gemma4_kv_snapshot_import(self.ptr.as_ptr(), snapshot.ptr.as_ptr()) })
+    }
 }
 
 impl Drop for KvCache {
     fn drop(&mut self) {
         // SAFETY: `self.ptr` is an owned KV cache handle returned by `gemma4_kv_create`.
         let status = unsafe { raw::gemma4_kv_free(self.ptr.as_ptr()) };
+        debug_assert_eq!(Status::from_raw(status), Status::Ok);
+    }
+}
+
+#[derive(Debug)]
+pub struct KvSnapshot {
+    ptr: NonNull<raw::Gemma4KvSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvSnapshotInfo {
+    pub sequence_len: u64,
+    pub active_kv_bytes: u64,
+    pub token_count: u64,
+    pub has_last_step: bool,
+}
+
+impl KvSnapshot {
+    pub fn info(&self) -> Result<KvSnapshotInfo> {
+        let mut out = raw::Gemma4KvSnapshotInfo::default();
+        // SAFETY: `self.ptr` is an owned snapshot handle and `out` is writable.
+        check(unsafe { raw::gemma4_kv_snapshot_info(self.ptr.as_ptr(), &mut out) })?;
+        Ok(KvSnapshotInfo {
+            sequence_len: out.sequence_len,
+            active_kv_bytes: out.active_kv_bytes,
+            token_count: out.token_count,
+            has_last_step: out.has_last_step,
+        })
+    }
+}
+
+impl Drop for KvSnapshot {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is an owned snapshot handle returned by `gemma4_kv_snapshot_export`.
+        let status = unsafe { raw::gemma4_kv_snapshot_free(self.ptr.as_ptr()) };
         debug_assert_eq!(Status::from_raw(status), Status::Ok);
     }
 }
@@ -623,6 +712,21 @@ mod tests {
         drop(drafter);
         drop(cache);
         drop(target);
+    }
+
+    #[test]
+    fn empty_kv_cache_rejects_snapshot_export_and_last_step() {
+        let cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+
+        let export_error = cache
+            .export_snapshot()
+            .expect_err("empty cache should not export a native snapshot");
+        assert_eq!(export_error.status(), Status::Cache);
+
+        let last_step_error = cache
+            .last_step()
+            .expect_err("empty cache should not have a native last step");
+        assert_eq!(last_step_error.status(), Status::Cache);
     }
 
     #[test]

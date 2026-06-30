@@ -1092,6 +1092,23 @@ bool NativeHiddenState::has_shared_kv() const {
 #endif
 }
 
+std::unique_ptr<NativeHiddenState> NativeHiddenState::clone() const {
+    if (impl_ == nullptr) {
+        return nullptr;
+    }
+    std::unique_ptr<NativeHiddenState::Impl> cloned_impl(new NativeHiddenState::Impl{});
+#ifdef GEMMA4D_MLX_AVAILABLE
+    cloned_impl->hidden = impl_->hidden;
+    cloned_impl->full_attention_key = impl_->full_attention_key;
+    cloned_impl->full_attention_value = impl_->full_attention_value;
+    cloned_impl->sliding_attention_key = impl_->sliding_attention_key;
+    cloned_impl->sliding_attention_value = impl_->sliding_attention_value;
+#endif
+    cloned_impl->sequence_len = impl_->sequence_len;
+    cloned_impl->hidden_size = impl_->hidden_size;
+    return std::unique_ptr<NativeHiddenState>(new NativeHiddenState(std::move(cloned_impl)));
+}
+
 NativeKvState::NativeKvState() : impl_(std::make_unique<Impl>()) {}
 
 NativeKvState::~NativeKvState() = default;
@@ -1116,6 +1133,19 @@ uint64_t NativeKvState::sequence_len() const {
 
 uint64_t NativeKvState::active_bytes() const {
     return impl_ == nullptr ? 0 : impl_->active_bytes;
+}
+
+std::unique_ptr<NativeKvState> NativeKvState::clone() const {
+    if (impl_ == nullptr) {
+        return nullptr;
+    }
+    std::unique_ptr<NativeKvState> cloned(new NativeKvState());
+#ifdef GEMMA4D_MLX_AVAILABLE
+    cloned->impl_->layers = impl_->layers;
+#endif
+    cloned->impl_->sequence_len = impl_->sequence_len;
+    cloned->impl_->active_bytes = impl_->active_bytes;
+    return cloned;
 }
 
 NativeTextModel::NativeTextModel() : impl_(std::make_unique<Impl>()) {}
