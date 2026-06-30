@@ -9,6 +9,7 @@ use gemma4d_tui::{
     TuiError,
     app::{Action, AppState, BenchmarkStatus, PageId, reduce},
     config::{ValidationStatus, validate_config_path},
+    profile_render,
     provider::{MockProvider, RuntimeProvider},
     seed_state,
     terminal::{TerminalLifecycle, TerminalOps, key_to_action},
@@ -149,6 +150,36 @@ fn disabled_feature_pages_render_dependency_messages() {
         assert!(snapshot.contains("Disabled until"));
         assert!(snapshot.contains(page.title()));
     }
+}
+
+#[test]
+fn render_profile_reports_p50_and_p95() {
+    let mut provider = MockProvider::default();
+    let config_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
+    let state = seed_state(&mut provider, config_path);
+    let profile = profile_render(&state, 3, 80, 24).unwrap();
+
+    assert_eq!(profile.iterations, 3);
+    assert_eq!((profile.width, profile.height), (80, 24));
+    assert!(profile.p95_us >= profile.p50_us);
+}
+
+#[test]
+fn terminal_lifecycle_restores_after_normal_quit() {
+    let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+    let ops = RecordingOps {
+        events: Rc::clone(&events),
+    };
+    let mut lifecycle = TerminalLifecycle::new(ops);
+
+    lifecycle.enter().unwrap();
+    lifecycle.restore().unwrap();
+
+    assert_eq!(
+        events.borrow().as_slice(),
+        ["enable_raw", "enter_alt", "leave_alt", "disable_raw"]
+    );
 }
 
 #[test]

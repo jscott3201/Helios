@@ -221,16 +221,15 @@ fn validate_tui_table(table: &toml::Table, diagnostics: &mut Vec<ConfigDiagnosti
         ));
     }
 
-    if let Some(confirm) = table
+    if table
         .get("confirm_destructive_actions")
         .and_then(toml::Value::as_bool)
+        .is_some_and(|confirm| !confirm)
     {
-        if !confirm {
-            diagnostics.push(ConfigDiagnostic::warning(
-                "[tui].confirm_destructive_actions",
-                "destructive confirmations are disabled",
-            ));
-        }
+        diagnostics.push(ConfigDiagnostic::warning(
+            "[tui].confirm_destructive_actions",
+            "destructive confirmations are disabled",
+        ));
     }
 }
 

@@ -10,6 +10,7 @@ use std::{
     fs,
     io::{self, IsTerminal},
     path::PathBuf,
+    time::Instant,
 };
 
 use app::{Action, AppState, PageId, ProviderKind, reduce};
@@ -60,6 +61,15 @@ pub enum CliCommand {
     Benchmark {
         #[arg(long)]
         out_dir: Option<PathBuf>,
+    },
+    /// Measure deterministic snapshot render latency and exit.
+    ProfileRender {
+        #[arg(long, default_value_t = 200)]
+        iterations: usize,
+        #[arg(long, default_value_t = 80)]
+        width: u16,
+        #[arg(long, default_value_t = 24)]
+        height: u16,
     },
 }
 
@@ -135,6 +145,19 @@ pub async fn run(cli: Cli) -> Result<RunOutcome, TuiError> {
                 evidence_paths: vec![path, record.report_path],
             })
         }
+        Some(CliCommand::ProfileRender {
+            iterations,
+            width,
+            height,
+        }) => {
+            let profile = profile_render(&state, *iterations, *width, *height)?;
+            let message = serde_json::to_string_pretty(&profile)
+                .map_err(|error| TuiError::Render(error.to_string()))?;
+            Ok(RunOutcome {
+                message,
+                evidence_paths: Vec::new(),
+            })
+        }
         None => {
             if cli.fail_after_init || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
                 terminal::run_interactive(
@@ -197,4 +220,48 @@ pub fn write_snapshots(
         }
     }
     Ok(paths)
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RenderProfile {
+    pub iterations: usize,
+    pub width: u16,
+    pub height: u16,
+    pub p50_us: u128,
+    pub p95_us: u128,
+}
+
+pub fn profile_render(
+    state: &AppState,
+    iterations: usize,
+    width: u16,
+    height: u16,
+) -> Result<RenderProfile, TuiError> {
+    if iterations == 0 {
+        return Err(TuiError::Render(
+            "profile-render requires at least one iteration".to_owned(),
+        ));
+    }
+
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let _snapshot = ui::render_snapshot(state, width, height)?;
+        samples.push(started.elapsed().as_micros());
+    }
+    samples.sort_unstable();
+    let p50_index = percentile_index(iterations, 50);
+    let p95_index = percentile_index(iterations, 95);
+    Ok(RenderProfile {
+        iterations,
+        width,
+        height,
+        p50_us: samples[p50_index],
+        p95_us: samples[p95_index],
+    })
+}
+
+fn percentile_index(len: usize, percentile: usize) -> usize {
+    let rank = (len * percentile).div_ceil(100);
+    rank.saturating_sub(1).min(len - 1)
 }
