@@ -29,7 +29,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P04 incremental native KV decode | Passed | `4f265cc` | `incremental_native_kv_vs_helper_cli` | `benchmarks/out/P04-incremental-native-kv/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p04-1782847670`; helper/default and native generated tokens matched on small prompts plus 1K/4K/8K probes; steady decode p50/p95 stayed flat across 8x context growth. |
 | 2026-06-30 | P05 true native MTP verification | Passed | `57ac3a6` | `native_target_and_native_mtp_ffi` | `benchmarks/out/P05-native-mtp/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p05-1782849629`; real native target+assistant FFI loop matched non-MTP native output for block sizes 1 and 2, then auto-disabled because acceptance was 0.000. |
 | 2026-06-30 | P06 real RAM prefix cache | Passed | `e5e61ad` | `native_ram_prefix_snapshot_ffi` | `benchmarks/out/P06-real-ram-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p06-1782851001`; native RAM snapshot restore matched fresh-prefill logits and continued decode at 4K/8K/16K, with wrong model/adapter/cache-mode namespace rejection. |
-| 2026-06-30 | P07 real SSD prefix cache | Passed | `fecd52e` | `native_ssd_prefix_snapshot_payload` | `benchmarks/out/P07-real-ssd-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p07-1782852956`; real SSD safetensors payload restore improved warm TTFT at 4K/8K/16K, rejected namespace/corruption/mid-decode fetches, and keeps SSD disabled by default pending broader variance data. |
+| 2026-06-30 | P07 real SSD prefix cache | Passed | `9a4cd13` | `native_ssd_prefix_snapshot_payload` | `benchmarks/out/P07-real-ssd-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p07-1782853459`; real SSD safetensors payload restore improved warm TTFT at 4K/8K/16K, rejected namespace/corruption/mid-decode fetches, and keeps SSD disabled by default pending broader variance data. |
 
 ## P00 Baseline Snapshot
 
@@ -229,12 +229,12 @@ P07 persists the real native KV snapshot payload to SSD in safetensors format.
 checksummed and imported only after before-prefill SSD metadata restore succeeds.
 Mid-decode SSD restore is rejected before payload read/import.
 
-Claim inventory from the `fecd52e` run:
+Claim inventory from the `9a4cd13` run:
 
 | Category | Result |
 |---|---|
 | Exactness | 4K, 8K, and 16K restored-prefix last-step greedy token/logit matched fresh prefill; one continued `decode_one` after restore also matched the cold-cache continuation. |
-| Warm TTFT | Warm SSD restore was faster than cold prefill at every measured context: `3.760x` at 4K, `7.982x` at 8K, and `18.296x` at 16K. |
+| Warm TTFT | Warm SSD restore was faster than cold prefill at every measured context: `3.615x` at 4K, `7.835x` at 8K, and `18.174x` at 16K. |
 | Payload format | Each run wrote SSD metadata plus a real safetensors payload with checksum, cache mode, namespace hash, KV layout, shape metadata, and per-layer attention metadata. |
 | Rejection safety | Wrong model, wrong adapter, wrong cache mode, corrupted payload, and mid-decode restore were rejected for every measured context. |
 | Cache accounting | Each context recorded metadata bytes, payload bytes, restore latency metrics, and zero mid-decode SSD fetches. |
@@ -245,9 +245,9 @@ Native SSD prefix-cache probe results:
 
 | Context | Cold TTFT ms | Warm SSD TTFT ms | Speedup | Payload MiB | Metadata Read/Write bytes | Payload Read/Write bytes | Mid-Decode Fetches |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 4K | 11067.681 | 2943.237 | 3.760x | 424.045 | 52735/52735 | 444643887/444643887 | 0 |
-| 8K | 29098.354 | 3645.568 | 7.982x | 528.065 | 52735/52735 | 553716282/553716282 | 0 |
-| 16K | 92645.409 | 5063.722 | 18.296x | 736.104 | 53070/53070 | 771861096/771861096 | 0 |
+| 4K | 10567.721 | 2923.475 | 3.615x | 424.045 | 52735/52735 | 444643887/444643887 | 0 |
+| 8K | 28582.644 | 3647.974 | 7.835x | 528.065 | 52735/52735 | 553716282/553716282 | 0 |
+| 16K | 92350.582 | 5081.531 | 18.174x | 736.104 | 53070/53070 | 771861096/771861096 | 0 |
 
 ## Measurement Changes
 
