@@ -34,12 +34,12 @@ impl MtpConfig {
                 "draft_block_size must be greater than zero".to_owned(),
             ));
         }
-        if let Some(adapter_id) = &self.adapter_id {
-            if adapter_id != "none" {
-                return Ok(Some(format!(
-                    "MTP disabled because adapter '{adapter_id}' is active"
-                )));
-            }
+        if let Some(adapter_id) = &self.adapter_id
+            && adapter_id != "none"
+        {
+            return Ok(Some(format!(
+                "MTP disabled because adapter '{adapter_id}' is active"
+            )));
         }
         if self.active_kv_compressed {
             return Ok(Some(
