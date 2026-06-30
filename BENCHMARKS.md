@@ -32,6 +32,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P07 real SSD prefix cache | Passed | `9a4cd13` | `native_ssd_prefix_snapshot_payload` | `benchmarks/out/P07-real-ssd-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p07-1782853459`; real SSD safetensors payload restore improved warm TTFT at 4K/8K/16K, rejected namespace/corruption/mid-decode fetches, and keeps SSD disabled by default pending broader variance data. |
 | 2026-06-30 | P08 real KV compression gates | Passed | `5993b86` | `native_kv_prefix_payload_compression` | `benchmarks/out/P08-kv-compression/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p08-1782855932`; q8 full-attention payload compression passed continued-decode quality gates at 4K/8K/16K, q4 reduced payload bytes but failed greedy agreement, and compressed active decode remains disabled. |
 | 2026-06-30 | P09 real LoRA adapter hot path | Passed | `8723d50` | `native_lora_adapter_hot_path` | `benchmarks/out/P09-real-lora-adapter/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p09-1782857770747`; trusted local rank-16 q_proj/v_proj LoRA fixture loaded into real native inference, changed greedy-logit output, rejected wrong manifests, isolated adapter KV namespace, measured load/hotswap/residency, and disabled MTP while active. |
+| 2026-06-30 | P10 TUI live optimization console | Passed | `4ee1ccd` plus local P10 harness changes | `localhost_http_server_tui_provider_stub_backend` | `benchmarks/out/P10-tui-live-console/{tui-report.md,metrics.json,snapshots/}` | Command `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`; 18 snapshots, render p95 `1731 us` below `20000 us`, server health `ok`, latest benchmark report surfaced from the provider. |
 
 ## P00 Baseline Snapshot
 
@@ -313,6 +314,25 @@ Native adapter generation results:
 | `adapter` | 128 | 2 | 544.963 | 156.611 | 701.574 | 236772 | 18.375000 | `236772,236772,236772` |
 | `base_after_clear` | 128 | 2 | 307.862 | 150.023 | 457.885 | 236772 | 18.625000 | `236772,236772,236772` |
 
+## P10 TUI Live Console Snapshot
+
+P10 drives the Ratatui console through the HTTP provider against a spawned
+localhost `gemma4d-server` instance. The TUI remains provider-only; the
+benchmark harness owns server startup and shutdown.
+
+| Field | Value |
+|---|---|
+| Command | `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console` |
+| Report | `benchmarks/out/P10-tui-live-console/tui-report.md` |
+| Metrics JSON | `benchmarks/out/P10-tui-live-console/metrics.json` |
+| Snapshot count | `18` |
+| Render p50 / p95 / threshold | `1373 us` / `1731 us` / `20000 us` |
+| Server health | `ok`, `model_loaded=true` |
+| Live timing | load `0.000 ms`, prefill `0.120 ms`, TTFT `3.000 ms`, decode `0.180 ms` |
+| Throughput | `1000.000 tok/s` over prefill `12` and decode `18` tokens |
+| Cache / MTP | cache `stub`, active KV `0`, MTP `disabled` with adapter gate shown |
+| Adapter residency | `1` loaded adapter, `2551` resident bytes |
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -336,6 +356,7 @@ Native adapter generation results:
 | 2026-06-30 | Added P08 real KV compression benchmark harness and goal contract. The harness compares BF16/q8/q4 real native prefix payloads at 4K/8K/16K, records payload memory reduction, warm restore latency, continued-decode greedy agreement/logit delta, active KV memory, and Planar/Iso disabled status. | `crates/gemma4d-bench/examples/p08_kv_compression.rs`, `codex/goals/P08-kv-compression.goal.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit`. |
 | 2026-06-30 | Added native PEFT LoRA adapter load/activate/clear/free through the narrow C ABI and safe Rust wrappers. The native graph applies active LoRA deltas inside target `quantized_linear`, shape-validates adapter A/B tensors against loaded Gemma 4 weights, and fails MTP closed while an adapter is active. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P09 benchmark run. |
 | 2026-06-30 | Added P09 real LoRA adapter benchmark harness and goal contract. The harness creates a trusted local deterministic rank-16 adapter fixture with real Gemma 4 q_proj/v_proj shapes, imports it through the adapter registry, runs base/adapter/post-clear native generation, records load/hotswap/residency latency, checks manifest rejection, KV namespace isolation, and MTP-disabled behavior. | `crates/gemma4d-bench/examples/p09_real_lora_adapter.rs`, `codex/goals/P09-real-lora-adapter-hot-path.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p09_real_lora_adapter -- --out-dir benchmarks/out/P09-real-lora-adapter --model-path artifacts/models/gemma-4-12B-it-4bit`. |
+| 2026-06-30 | Added P10 TUI live optimization console metrics, report writer, and benchmark harness. The TUI parses provider-only HTTP metrics for load/prefill/decode timing, throughput, memory, cache, MTP, adapters, server health, and latest benchmark report; the harness starts a localhost server and writes `tui-report.md`, `metrics.json`, and snapshots. | `crates/gemma4d-tui/src/{app.rs,provider.rs,ui.rs,lib.rs}`, `crates/gemma4d-tui/tests/m05_acceptance.rs`, `crates/gemma4d-bench/examples/p10_tui_live_console.rs`, `crates/gemma4d-bench/Cargo.toml` | `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`. |
 
 ## Verification Gates
 
@@ -378,6 +399,8 @@ Native adapter generation results:
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p09_real_lora_adapter -- --out-dir benchmarks/out/P09-real-lora-adapter --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P09 records, summary, report, and blocker report with no blockers at clean SHA `8723d50`. |
 | 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused post-P09 test coverage for FFI wrappers and benchmark harness after ledger update. |
 | 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed after P09 changes. |
+| 2026-06-30 | `cargo test -p gemma4d-tui --all-targets` | Passed | Focused P10 TUI coverage for live HTTP metrics, required page snapshots, render p95 reporting, and terminal lifecycle tests. |
+| 2026-06-30 | `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console` | Passed | Spawned localhost server, drove the TUI over `HttpProvider`, wrote `tui-report.md`, `metrics.json`, and 18 snapshots; render p95 `1731 us` under `20000 us`. |
 
 ## Current Claim Boundaries
 
@@ -431,3 +454,9 @@ Native adapter generation results:
 - P09 adapter output evidence is a greedy-logit delta on the measured 128-token
   deterministic prompt; generated token IDs did not differ in the final default
   run, though the shorter smoke run changed the prefill greedy token.
+- P10 validates the TUI live optimization console against a localhost HTTP
+  server with the stub backend. It is a provider/API and render-latency claim,
+  not a native model throughput claim.
+- P10 render latency is for deterministic 120x40 snapshot rendering in the
+  artifact run. It does not measure interactive terminal overhead or long-running
+  operator sessions.

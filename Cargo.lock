@@ -646,6 +646,7 @@ dependencies = [
  "gemma4d-kv",
  "gemma4d-server",
  "gemma4d-tokenizer",
+ "gemma4d-tui",
  "serde",
  "serde_json",
 ]
