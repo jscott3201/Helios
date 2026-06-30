@@ -467,6 +467,7 @@ fn build_prompt_for_target(
     let positions = char_positions(&body);
     let mut low = 0usize;
     let mut high = positions.len().saturating_sub(1);
+    let mut best_body = String::new();
     let mut best_prompt = render_prompt(spec, seed, "");
     let mut best_count = counter.count_tokens(&best_prompt)?;
 
@@ -476,6 +477,7 @@ fn build_prompt_for_target(
         let candidate = render_prompt(spec, seed, candidate_body);
         let count = counter.count_tokens(&candidate)?;
         if count <= spec.target_context_tokens {
+            best_body = candidate_body.to_owned();
             best_prompt = candidate;
             best_count = count;
             low = mid + 1;
@@ -493,6 +495,41 @@ fn build_prompt_for_target(
         )));
     }
 
+    if best_count < spec.target_context_tokens {
+        (best_prompt, best_count) =
+            pad_prompt_to_target(spec, seed, best_body, best_count, counter)?;
+    }
+
+    Ok((best_prompt, best_count))
+}
+
+fn pad_prompt_to_target(
+    spec: &WorkloadSpec,
+    seed: u64,
+    mut body: String,
+    mut best_count: usize,
+    counter: &mut TokenizerCounter,
+) -> Result<(String, usize), CliError> {
+    let mut best_prompt = render_prompt(spec, seed, &body);
+    let fragments = [" a", " b", " c", " d", " 0", " 1", ".", "\n"];
+    while best_count < spec.target_context_tokens {
+        let mut progressed = false;
+        for fragment in fragments {
+            let candidate_body = format!("{body}{fragment}");
+            let candidate = render_prompt(spec, seed, &candidate_body);
+            let count = counter.count_tokens(&candidate)?;
+            if count > best_count && count <= spec.target_context_tokens {
+                body = candidate_body;
+                best_prompt = candidate;
+                best_count = count;
+                progressed = true;
+                break;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
     Ok((best_prompt, best_count))
 }
 

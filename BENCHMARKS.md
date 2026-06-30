@@ -366,7 +366,7 @@ only generates prompts and token metadata; it does not run model inference.
 | Workloads | `13` |
 | Families | `adapter_expert`, `benchmark_qa`, `chat_short`, `code_review_rust`, `long_repo_pack`, `mtp_candidate`, `prefix_reuse_edit`, `tool_json` |
 | Target context tokens | `1024`, `4096`, `8192`, `16384`, `24576` |
-| Actual context tokens | exact target match for every workload using `mlx_lm.utils.load_tokenizer:TokenizerWrapper` |
+| Actual context tokens | tokenizer-measured with `mlx_lm.utils.load_tokenizer:TokenizerWrapper`; 12 workloads match target exactly and `benchmark_qa_4k_001` measures `4095` against the `4096` target |
 | Seed base | `20260630`; per-record seeds `20260630` through `20260642` |
 | Decision | `accept_candidate` |
 | Blockers | none recorded |
