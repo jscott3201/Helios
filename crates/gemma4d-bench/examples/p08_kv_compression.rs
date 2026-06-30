@@ -939,7 +939,7 @@ fn capture_environment() -> Environment {
             .map(|version| version.backend_version.clone())
             .unwrap_or_else(|| "unavailable".to_owned()),
         git_commit: command_output("git", &["rev-parse", "--short", "HEAD"]),
-        git_status_short: command_output("git", &["status", "--short"]),
+        git_status_short: command_output_allow_empty("git", &["status", "--short"]),
         hw_memsize_bytes: sysctl_hw_memsize(),
     }
 }
@@ -1018,6 +1018,15 @@ fn file_sha_or_unavailable(path: &Path) -> String {
 }
 
 fn command_output(command: &str, args: &[&str]) -> String {
+    let value = command_output_allow_empty(command, args);
+    if value.is_empty() {
+        "unavailable".to_owned()
+    } else {
+        value
+    }
+}
+
+fn command_output_allow_empty(command: &str, args: &[&str]) -> String {
     Command::new(command)
         .args(args)
         .output()
@@ -1029,7 +1038,6 @@ fn command_output(command: &str, args: &[&str]) -> String {
                 None
             }
         })
-        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unavailable".to_owned())
 }
 
