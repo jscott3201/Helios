@@ -12,3 +12,7 @@ hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
+
+[features]
+default = []
+planar-iso-experiments = []

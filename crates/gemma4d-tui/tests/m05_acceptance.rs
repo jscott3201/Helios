@@ -153,7 +153,7 @@ fn disabled_feature_pages_render_dependency_messages() {
 }
 
 #[test]
-fn cache_page_renders_m07_accounting_summary() {
+fn cache_page_renders_cache_accounting_and_compression_summary() {
     let mut provider = MockProvider::default();
     let config_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
@@ -162,12 +162,15 @@ fn cache_page_renders_m07_accounting_summary() {
 
     let snapshot = render_snapshot(&state, 80, 24).unwrap();
     assert!(snapshot.contains("Cache"));
-    assert!(snapshot.contains("ram_prefix_bf16"));
+    assert!(snapshot.contains("bf16_default"));
     assert!(snapshot.contains("RAM resident"));
     assert!(snapshot.contains("restore failures"));
     assert!(snapshot.contains("SSD enabled"));
     assert!(snapshot.contains("bytes read"));
     assert!(snapshot.contains("mid-decode fetches 0"));
+    assert!(snapshot.contains("Compression q8"));
+    assert!(snapshot.contains("BF16 default yes"));
+    assert!(snapshot.contains("Planar/Iso feature_disabled_default"));
 }
 
 #[test]

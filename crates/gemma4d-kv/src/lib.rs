@@ -13,13 +13,15 @@ pub const CRATE_NAME: &str = "gemma4d-kv";
 pub const KV_LAYOUT_VERSION: u32 = 1;
 pub const SSD_MANIFEST_VERSION: u32 = 1;
 pub const SSD_BLOCK_FILE_VERSION: u32 = 1;
+pub const M09_MIN_Q8_LOGIT_COSINE: f64 = 0.999;
+pub const M09_MIN_Q4_LOGIT_COSINE: f64 = 0.98;
 
 const SSD_INDEX_FILE: &str = "index.json";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub fn bootstrap_status() -> &'static str {
-    "m08-ssd-cold-prefix-cache"
+    "m09-kv-compression-research"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +94,18 @@ impl CacheMode {
             Self::MlxAffineQ4 => "mlx_affine_q4",
         }
     }
+
+    pub fn bits_per_value(self) -> u8 {
+        match self {
+            Self::Bf16 => 16,
+            Self::MlxAffineQ8 => 8,
+            Self::MlxAffineQ4 => 4,
+        }
+    }
+
+    pub fn is_compressed(self) -> bool {
+        self != Self::Bf16
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +158,11 @@ impl KvNamespace {
             mlx_version: "m07-fixture-mlx".to_owned(),
             engine_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
+    }
+
+    pub fn with_cache_mode(mut self, cache_mode: CacheMode) -> Self {
+        self.cache_mode = cache_mode;
+        self
     }
 }
 
@@ -296,6 +315,7 @@ impl RamPrefixBlock {
             sequence_start,
             sequence_end,
         )?;
+        let cache_mode = namespace.cache_mode;
         let payload = StoredPrefixPayload {
             token_count: key.token_count(),
             greedy_token: observation.greedy_token,
@@ -306,7 +326,7 @@ impl RamPrefixBlock {
             key,
             namespace,
             byte_len,
-            layers: default_gemma4_layers(sequence_start, sequence_end, CacheMode::Bf16),
+            layers: default_gemma4_layers(sequence_start, sequence_end, cache_mode),
             native_handle: None,
             payload,
             payload_checksum,
@@ -393,6 +413,147 @@ pub struct SsdCacheAccountingSnapshot {
     pub ssd_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionWorkload {
+    SimpleChat,
+    JsonToolFixture,
+    CodeReview,
+}
+
+impl CompressionWorkload {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SimpleChat => "simple_chat",
+            Self::JsonToolFixture => "json_tool_fixture",
+            Self::CodeReview => "code_review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompressionQualityResult {
+    pub mode: CacheMode,
+    pub workload: CompressionWorkload,
+    pub sequence_len: u64,
+    pub logit_cosine: f64,
+    pub greedy_agreement: bool,
+    pub bf16_bytes: u64,
+    pub compressed_bytes: u64,
+    pub memory_delta_bytes: i64,
+    pub memory_reduction: f64,
+    pub accepted: bool,
+    pub gate: CompressionQualityGate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CompressionQualityGate {
+    pub min_logit_cosine: f64,
+    pub require_greedy_agreement: bool,
+    pub experimental: bool,
+}
+
+impl CompressionQualityGate {
+    pub fn for_mode(mode: CacheMode) -> Self {
+        match mode {
+            CacheMode::Bf16 => Self {
+                min_logit_cosine: 1.0,
+                require_greedy_agreement: true,
+                experimental: false,
+            },
+            CacheMode::MlxAffineQ8 => Self {
+                min_logit_cosine: M09_MIN_Q8_LOGIT_COSINE,
+                require_greedy_agreement: true,
+                experimental: false,
+            },
+            CacheMode::MlxAffineQ4 => Self {
+                min_logit_cosine: M09_MIN_Q4_LOGIT_COSINE,
+                require_greedy_agreement: true,
+                experimental: false,
+            },
+        }
+    }
+}
+
+pub fn evaluate_compression_fixture(
+    sequence_len: u64,
+    workload: CompressionWorkload,
+    mode: CacheMode,
+) -> CompressionQualityResult {
+    let bf16_logits = fixture_logits(sequence_len, workload);
+    let reconstructed = affine_reconstruct(&bf16_logits, mode);
+    let logit_cosine = cosine_similarity(&bf16_logits, &reconstructed);
+    let greedy_agreement = argmax(&bf16_logits) == argmax(&reconstructed);
+    let bf16_bytes = estimated_kv_bytes_for_mode(sequence_len, CacheMode::Bf16);
+    let compressed_bytes = estimated_kv_bytes_for_mode(sequence_len, mode);
+    let gate = CompressionQualityGate::for_mode(mode);
+    let accepted = logit_cosine >= gate.min_logit_cosine
+        && (!gate.require_greedy_agreement || greedy_agreement)
+        && !gate.experimental;
+    CompressionQualityResult {
+        mode,
+        workload,
+        sequence_len,
+        logit_cosine,
+        greedy_agreement,
+        bf16_bytes,
+        compressed_bytes,
+        memory_delta_bytes: compressed_bytes as i64 - bf16_bytes as i64,
+        memory_reduction: if bf16_bytes == 0 {
+            0.0
+        } else {
+            1.0 - (compressed_bytes as f64 / bf16_bytes as f64)
+        },
+        accepted,
+        gate,
+    }
+}
+
+#[cfg(feature = "planar-iso-experiments")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentalCompressionMode {
+    Planar4,
+    Planar3,
+    Iso4,
+    Iso3,
+}
+
+#[cfg(feature = "planar-iso-experiments")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentalCompressionPlan {
+    pub mode: ExperimentalCompressionMode,
+    pub feature_flag: &'static str,
+    pub k_only_global_prefix: bool,
+    pub accepted: bool,
+    pub reason: String,
+}
+
+#[cfg(feature = "planar-iso-experiments")]
+impl ExperimentalCompressionPlan {
+    pub fn candidates() -> Vec<Self> {
+        [
+            ExperimentalCompressionMode::Planar4,
+            ExperimentalCompressionMode::Planar3,
+            ExperimentalCompressionMode::Iso4,
+            ExperimentalCompressionMode::Iso3,
+        ]
+        .into_iter()
+        .map(|mode| Self {
+            mode,
+            feature_flag: "planar-iso-experiments",
+            k_only_global_prefix: matches!(
+                mode,
+                ExperimentalCompressionMode::Planar4 | ExperimentalCompressionMode::Planar3
+            ),
+            accepted: false,
+            reason: "M09 keeps Planar/Iso behind the experiment feature until quality gates pass"
+                .to_owned(),
+        })
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsdRestorePhase {
     BeforePrefill,
@@ -472,6 +633,42 @@ struct LayerChecksumInputs<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressionManifestMetadata {
+    pub mode: CacheMode,
+    pub algorithm: String,
+    pub bits_per_value: u8,
+    pub affine_scale_format: Option<String>,
+    pub experimental: bool,
+    pub namespace_hash_includes_mode: bool,
+}
+
+impl CompressionManifestMetadata {
+    pub fn for_mode(mode: CacheMode) -> Self {
+        let (algorithm, affine_scale_format, experimental) = match mode {
+            CacheMode::Bf16 => ("bf16", None, false),
+            CacheMode::MlxAffineQ8 => (
+                "mlx_affine_quantized",
+                Some("per-block fp32 scale+bias"),
+                false,
+            ),
+            CacheMode::MlxAffineQ4 => (
+                "mlx_affine_quantized",
+                Some("per-block fp32 scale+bias"),
+                false,
+            ),
+        };
+        Self {
+            mode,
+            algorithm: algorithm.to_owned(),
+            bits_per_value: mode.bits_per_value(),
+            affine_scale_format: affine_scale_format.map(str::to_owned),
+            experimental,
+            namespace_hash_includes_mode: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedKvManifest {
     pub manifest_version: u32,
     pub block_file_version: u32,
@@ -491,6 +688,7 @@ pub struct PersistedKvManifest {
     pub namespace_hash: NamespaceHash,
     pub block_id: BlockId,
     pub cache_mode: CacheMode,
+    pub compression: CompressionManifestMetadata,
     pub block_size_tokens: u64,
     pub sequence_start: u64,
     pub sequence_end: u64,
@@ -520,6 +718,7 @@ impl PersistedKvManifest {
             namespace_hash: block.key.namespace_hash.clone(),
             block_id: block.key.block_id.clone(),
             cache_mode: block.namespace.cache_mode,
+            compression: CompressionManifestMetadata::for_mode(block.namespace.cache_mode),
             block_size_tokens: block.key.block_size_tokens.get(),
             sequence_start: block.key.sequence_start,
             sequence_end: block.key.sequence_end,
@@ -556,6 +755,17 @@ impl PersistedKvManifest {
         }
         if self.block_id != block.key.block_id {
             return Err(Error::InvalidManifest("block id mismatch".to_owned()));
+        }
+        if self.cache_mode != block.namespace.cache_mode || self.compression.mode != self.cache_mode
+        {
+            return Err(Error::InvalidManifest(
+                "compression mode mismatch".to_owned(),
+            ));
+        }
+        if !self.compression.namespace_hash_includes_mode {
+            return Err(Error::InvalidManifest(
+                "compression mode is not declared as namespace-scoped".to_owned(),
+            ));
         }
         if self.block_size_tokens != block.key.block_size_tokens.get() {
             return Err(Error::InvalidManifest("block size mismatch".to_owned()));
@@ -1125,18 +1335,105 @@ pub fn fresh_prefill_fixture(sequence_len: u64) -> PrefillObservation {
 }
 
 pub fn fixture_block(sequence_len: u64, block_size_tokens: NonZeroU64) -> Result<RamPrefixBlock> {
+    fixture_block_with_mode(sequence_len, block_size_tokens, CacheMode::Bf16)
+}
+
+pub fn fixture_block_with_mode(
+    sequence_len: u64,
+    block_size_tokens: NonZeroU64,
+    cache_mode: CacheMode,
+) -> Result<RamPrefixBlock> {
     let namespace = KvNamespace::fixture(sequence_len);
+    let namespace = namespace.with_cache_mode(cache_mode);
     let observation = fresh_prefill_fixture(sequence_len);
-    let byte_len = estimated_bf16_kv_bytes(sequence_len);
+    let byte_len = estimated_kv_bytes_for_mode(sequence_len, cache_mode);
     RamPrefixBlock::from_observation(namespace, 0, block_size_tokens, 0, observation, byte_len)
         .map(|block| block.with_native_handle(sequence_len))
 }
 
 pub fn estimated_bf16_kv_bytes(token_count: u64) -> u64 {
+    estimated_kv_bytes_for_mode(token_count, CacheMode::Bf16)
+}
+
+pub fn estimated_kv_bytes_for_mode(token_count: u64, cache_mode: CacheMode) -> u64 {
     const LAYERS: u64 = 48;
-    const BYTES_PER_BF16: u64 = 2;
     const APPROX_KV_WIDTH: u64 = 16 * 256 * 2;
-    token_count * LAYERS * APPROX_KV_WIDTH * BYTES_PER_BF16
+    let values = token_count * LAYERS * APPROX_KV_WIDTH;
+    match cache_mode {
+        CacheMode::Bf16 => values * 2,
+        CacheMode::MlxAffineQ8 => values + compression_metadata_overhead(token_count),
+        CacheMode::MlxAffineQ4 => values.div_ceil(2) + compression_metadata_overhead(token_count),
+    }
+}
+
+fn compression_metadata_overhead(token_count: u64) -> u64 {
+    const LAYERS: u64 = 48;
+    const SCALE_AND_BIAS_BYTES: u64 = 8;
+    LAYERS * SCALE_AND_BIAS_BYTES + (token_count / 1024).max(1) * 64
+}
+
+fn fixture_logits(sequence_len: u64, workload: CompressionWorkload) -> Vec<f32> {
+    let mut logits = Vec::with_capacity(128);
+    for index in 0..128_u32 {
+        let input = format!("{}:{sequence_len}:{index}", workload.label());
+        let digest = sha256_bytes(b"gemma4d:m09:logits:v1\0", input.as_bytes());
+        let raw = u32::from_le_bytes(
+            hex::decode(&digest[..8])
+                .expect("hex")
+                .try_into()
+                .expect("four bytes"),
+        );
+        let centered = (raw as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        logits.push(centered * 3.0 + (index as f32 % 7.0) * 0.03);
+    }
+    let greedy_index = (fresh_prefill_fixture(sequence_len).greedy_token as usize) % logits.len();
+    logits[greedy_index] += 18.0;
+    logits
+}
+
+fn affine_reconstruct(values: &[f32], mode: CacheMode) -> Vec<f32> {
+    if mode == CacheMode::Bf16 || values.is_empty() {
+        return values.to_vec();
+    }
+    let levels = match mode {
+        CacheMode::Bf16 => unreachable!(),
+        CacheMode::MlxAffineQ8 => 255.0,
+        CacheMode::MlxAffineQ4 => 15.0,
+    };
+    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let scale = ((max - min) / levels).max(f32::EPSILON);
+    values
+        .iter()
+        .map(|value| {
+            let quantized = ((*value - min) / scale).round().clamp(0.0, levels);
+            quantized * scale + min
+        })
+        .collect()
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> f64 {
+    let (mut dot, mut left_norm, mut right_norm) = (0.0, 0.0, 0.0);
+    for (left, right) in left.iter().zip(right.iter()) {
+        let left = *left as f64;
+        let right = *right as f64;
+        dot += left * right;
+        left_norm += left * left;
+        right_norm += right * right;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
+fn argmax(values: &[f32]) -> Option<usize> {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
 }
 
 pub fn default_gemma4_layers(
@@ -1257,9 +1554,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reports_m08_status() {
+    fn reports_m09_status() {
         assert_eq!(CRATE_NAME, "gemma4d-kv");
-        assert_eq!(bootstrap_status(), "m08-ssd-cold-prefix-cache");
+        assert_eq!(bootstrap_status(), "m09-kv-compression-research");
     }
 
     #[test]
@@ -1541,6 +1838,76 @@ mod tests {
         assert_eq!(summary.bytes_read, 0);
         assert_eq!(summary.mid_decode_fetches, 0);
         cleanup_temp_dir(root);
+    }
+
+    #[test]
+    fn bf16_fallback_remains_default_cache_mode() {
+        let namespace = KvNamespace::fixture(1024);
+        assert_eq!(namespace.cache_mode, CacheMode::Bf16);
+        let block =
+            fixture_block(1024, NonZeroU64::new(1024).expect("non-zero")).expect("fixture block");
+        assert_eq!(block.namespace.cache_mode, CacheMode::Bf16);
+        assert!(
+            block
+                .layers
+                .iter()
+                .all(|layer| layer.compression == CacheMode::Bf16)
+        );
+    }
+
+    #[test]
+    fn q8_q4_change_namespace_and_manifest_compression_metadata() {
+        let block_size = NonZeroU64::new(16 * 1024).expect("non-zero");
+        let bf16 =
+            fixture_block_with_mode(16 * 1024, block_size, CacheMode::Bf16).expect("bf16 block");
+        let q8 = fixture_block_with_mode(16 * 1024, block_size, CacheMode::MlxAffineQ8)
+            .expect("q8 block");
+        let q4 = fixture_block_with_mode(16 * 1024, block_size, CacheMode::MlxAffineQ4)
+            .expect("q4 block");
+
+        assert_ne!(bf16.key.namespace_hash, q8.key.namespace_hash);
+        assert_ne!(q8.key.namespace_hash, q4.key.namespace_hash);
+        assert_ne!(bf16.key.block_id, q8.key.block_id);
+        assert_ne!(q8.key.block_id, q4.key.block_id);
+
+        let q8_manifest = PersistedKvManifest::from_block(&q8).expect("q8 manifest");
+        let q4_manifest = PersistedKvManifest::from_block(&q4).expect("q4 manifest");
+        assert_eq!(q8_manifest.compression.mode, CacheMode::MlxAffineQ8);
+        assert_eq!(q8_manifest.compression.bits_per_value, 8);
+        assert!(q8_manifest.compression.namespace_hash_includes_mode);
+        assert_eq!(q4_manifest.compression.mode, CacheMode::MlxAffineQ4);
+        assert_eq!(q4_manifest.compression.bits_per_value, 4);
+        assert!(q4.byte_len < q8.byte_len);
+        assert!(q8.byte_len < bf16.byte_len);
+    }
+
+    #[test]
+    fn q8_q4_quality_gates_record_quality_and_memory_deltas() {
+        for mode in [CacheMode::MlxAffineQ8, CacheMode::MlxAffineQ4] {
+            let summary =
+                evaluate_compression_fixture(16 * 1024, CompressionWorkload::JsonToolFixture, mode);
+            assert!(
+                summary.accepted,
+                "{mode:?} should pass fixture gate: {summary:?}"
+            );
+            assert!(summary.greedy_agreement);
+            assert!(summary.logit_cosine >= summary.gate.min_logit_cosine);
+            assert!(summary.memory_delta_bytes < 0);
+            assert!(summary.memory_reduction > 0.0);
+        }
+    }
+
+    #[cfg(feature = "planar-iso-experiments")]
+    #[test]
+    fn planar_iso_interface_stays_experimental_by_default() {
+        let candidates = ExperimentalCompressionPlan::candidates();
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates.iter().all(|candidate| !candidate.accepted));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.feature_flag == "planar-iso-experiments")
+        );
     }
 
     fn temp_cache_dir(label: &str) -> std::path::PathBuf {

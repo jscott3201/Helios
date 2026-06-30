@@ -13,6 +13,7 @@
     "tokenizer_sha256",
     "chat_template_sha256",
     "cache_mode",
+    "compression",
     "namespace_hash",
     "block_id",
     "block_size_tokens",
@@ -70,6 +71,39 @@
     },
     "cache_mode": {
       "type": "string"
+    },
+    "compression": {
+      "type": "object",
+      "required": [
+        "mode",
+        "algorithm",
+        "bits_per_value",
+        "experimental",
+        "namespace_hash_includes_mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "algorithm": {
+          "type": "string"
+        },
+        "bits_per_value": {
+          "type": "integer"
+        },
+        "affine_scale_format": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "experimental": {
+          "type": "boolean"
+        },
+        "namespace_hash_includes_mode": {
+          "type": "boolean"
+        }
+      }
     },
     "namespace_hash": {
       "type": "string"

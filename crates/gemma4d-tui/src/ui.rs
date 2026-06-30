@@ -235,6 +235,7 @@ fn render_cache(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let cache = &state.cache;
     let ram = cache.ram;
     let ssd = cache.ssd;
+    let compression = &cache.compression;
     let lines = vec![
         Line::from(vec![
             Span::styled("Status ", Style::default().fg(Color::Gray)),
@@ -288,6 +289,29 @@ fn render_cache(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Line::from(format!(
             "SSD failures {} | corruptions {} | mid-decode fetches {}",
             ssd.restore_failures, ssd.corruptions, ssd.mid_decode_fetches
+        )),
+        Line::from(format!(
+            "Compression q8 cosine {:.6} | q4 cosine {:.6}",
+            compression.q8_min_logit_cosine, compression.q4_min_logit_cosine
+        )),
+        Line::from(format!(
+            "Compression memory q8 {:.1}% | q4 {:.1}% | BF16 default {}",
+            compression.q8_memory_reduction * 100.0,
+            compression.q4_memory_reduction * 100.0,
+            if compression.bf16_default {
+                "yes"
+            } else {
+                "no"
+            }
+        )),
+        Line::from(format!(
+            "Namespace by mode {} | Planar/Iso {}",
+            if compression.namespace_hashes_unique_by_mode {
+                "isolated"
+            } else {
+                "shared"
+            },
+            compression.planar_iso_status
         )),
         Line::from(cache.note.clone()),
     ];

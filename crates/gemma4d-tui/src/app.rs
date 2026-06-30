@@ -132,10 +132,48 @@ pub struct CacheSnapshot {
     pub namespace_hash: Option<String>,
     pub ram: CacheAccountingSnapshot,
     pub ssd: SsdCacheAccountingSnapshot,
+    pub compression: CompressionSnapshot,
     pub active_kv_bytes: u64,
     pub restored_tokens: u64,
     pub rejected_namespaces: u64,
     pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompressionSnapshot {
+    pub bf16_default: bool,
+    pub q8_min_logit_cosine: f64,
+    pub q4_min_logit_cosine: f64,
+    pub q8_memory_reduction: f64,
+    pub q4_memory_reduction: f64,
+    pub namespace_hashes_unique_by_mode: bool,
+    pub planar_iso_status: String,
+}
+
+impl CompressionSnapshot {
+    pub fn disabled() -> Self {
+        Self {
+            bf16_default: true,
+            q8_min_logit_cosine: 0.0,
+            q4_min_logit_cosine: 0.0,
+            q8_memory_reduction: 0.0,
+            q4_memory_reduction: 0.0,
+            namespace_hashes_unique_by_mode: true,
+            planar_iso_status: "disabled".to_owned(),
+        }
+    }
+
+    pub fn mock_m09() -> Self {
+        Self {
+            bf16_default: true,
+            q8_min_logit_cosine: 0.999_941_945_454_655_4,
+            q4_min_logit_cosine: 0.982_667_226_802_970_6,
+            q8_memory_reduction: 0.499_999_903_142_452_13,
+            q4_memory_reduction: 0.749_999_903_142_452_5,
+            namespace_hashes_unique_by_mode: true,
+            planar_iso_status: "feature_disabled_default".to_owned(),
+        }
+    }
 }
 
 impl CacheSnapshot {
@@ -174,6 +212,7 @@ impl CacheSnapshot {
                 mid_decode_fetches: 0,
                 ssd_enabled: false,
             },
+            compression: CompressionSnapshot::disabled(),
             active_kv_bytes: 0,
             restored_tokens: 0,
             rejected_namespaces: 0,
@@ -181,12 +220,12 @@ impl CacheSnapshot {
         }
     }
 
-    pub fn mock_m08() -> Self {
+    pub fn mock_m09() -> Self {
         Self {
-            status: "ssd-prefix-ready".to_owned(),
-            cache_mode: "ram_prefix_bf16+ssd_cold_prefix_bf16".to_owned(),
+            status: "compression-evaluated".to_owned(),
+            cache_mode: "bf16_default+mlx_affine_q8+mlx_affine_q4".to_owned(),
             block_size_tokens: 16 * 1024,
-            namespace_hash: Some("m08-mock-namespace".to_owned()),
+            namespace_hash: Some("m09-mock-namespace".to_owned()),
             ram: CacheAccountingSnapshot {
                 budget_bytes: 64 * 1024 * 1024 * 1024,
                 resident_bytes: 12 * 1024 * 1024 * 1024,
@@ -216,10 +255,11 @@ impl CacheSnapshot {
                 mid_decode_fetches: 0,
                 ssd_enabled: true,
             },
+            compression: CompressionSnapshot::mock_m09(),
             active_kv_bytes: 3 * 1024 * 1024 * 1024,
-            restored_tokens: 1_024 + 4_096 + 8_192 + 16_384,
+            restored_tokens: 16_384 + 32_768 + 65_536,
             rejected_namespaces: 16,
-            note: "M08 SSD restore matrix passes for 1K/4K/8K/16K; no mid-decode fetch".to_owned(),
+            note: "M09 q8/q4 fixture gates pass; Planar/Iso remains experimental".to_owned(),
         }
     }
 }
