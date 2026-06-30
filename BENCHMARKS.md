@@ -30,7 +30,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P05 true native MTP verification | Passed | `57ac3a6` | `native_target_and_native_mtp_ffi` | `benchmarks/out/P05-native-mtp/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p05-1782849629`; real native target+assistant FFI loop matched non-MTP native output for block sizes 1 and 2, then auto-disabled because acceptance was 0.000. |
 | 2026-06-30 | P06 real RAM prefix cache | Passed | `e5e61ad` | `native_ram_prefix_snapshot_ffi` | `benchmarks/out/P06-real-ram-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p06-1782851001`; native RAM snapshot restore matched fresh-prefill logits and continued decode at 4K/8K/16K, with wrong model/adapter/cache-mode namespace rejection. |
 | 2026-06-30 | P07 real SSD prefix cache | Passed | `9a4cd13` | `native_ssd_prefix_snapshot_payload` | `benchmarks/out/P07-real-ssd-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p07-1782853459`; real SSD safetensors payload restore improved warm TTFT at 4K/8K/16K, rejected namespace/corruption/mid-decode fetches, and keeps SSD disabled by default pending broader variance data. |
-| 2026-06-30 | P08 real KV compression gates | Passed | `59d695e` | `native_kv_prefix_payload_compression` | `benchmarks/out/P08-kv-compression/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p08-1782855472`; q8 full-attention payload compression passed continued-decode quality gates at 4K/8K/16K, q4 reduced payload bytes but failed greedy agreement, and compressed active decode remains disabled. |
+| 2026-06-30 | P08 real KV compression gates | Passed | `5993b86` | `native_kv_prefix_payload_compression` | `benchmarks/out/P08-kv-compression/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p08-1782855932`; q8 full-attention payload compression passed continued-decode quality gates at 4K/8K/16K, q4 reduced payload bytes but failed greedy agreement, and compressed active decode remains disabled. |
 
 ## P00 Baseline Snapshot
 
@@ -258,7 +258,7 @@ global/full-attention KV tensors; sliding-window KV tensors and hidden state sta
 BF16. Payloads are decompressed to BF16 before import, so active compressed
 decode remains disabled and active KV memory is unchanged.
 
-Claim inventory from the `59d695e` run:
+Claim inventory from the `5993b86` run:
 
 | Category | Result |
 |---|---|
@@ -275,15 +275,15 @@ Native KV compression probe results:
 
 | Context | Mode | Gate | Greedy Agree | Logit Delta | Payload MiB | Payload Reduction | Warm Restore ms | Decode ms | Active KV Reduction |
 |---:|---|---|---|---:|---:|---:|---:|---:|---:|
-| 4K | `bf16` | `true` | `true` | 0.000000 | 424.045 | 0.000% | 5.053 | 238.636 | 0.000% |
-| 4K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 392.068 | 7.541% | 1.375 | 119.922 | 0.000% |
-| 4K | `mlx_affine_q4` | `false` | `false` | 0.250000 | 376.067 | 11.314% | 1.158 | 128.155 | 0.000% |
-| 8K | `bf16` | `true` | `true` | 0.000000 | 528.065 | 0.000% | 1.727 | 393.314 | 0.000% |
-| 8K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 464.087 | 12.116% | 1.952 | 193.031 | 0.000% |
-| 8K | `mlx_affine_q4` | `false` | `false` | 1.500000 | 432.087 | 18.175% | 1.960 | 186.615 | 0.000% |
-| 16K | `bf16` | `true` | `true` | 0.000000 | 736.104 | 0.000% | 3.078 | 4653.521 | 0.000% |
-| 16K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 608.126 | 17.386% | 5.698 | 310.456 | 0.000% |
-| 16K | `mlx_affine_q4` | `false` | `false` | 1.937500 | 544.126 | 26.080% | 5.496 | 167.399 | 0.000% |
+| 4K | `bf16` | `true` | `true` | 0.000000 | 424.045 | 0.000% | 5.156 | 234.680 | 0.000% |
+| 4K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 392.068 | 7.541% | 1.353 | 128.176 | 0.000% |
+| 4K | `mlx_affine_q4` | `false` | `false` | 0.250000 | 376.067 | 11.314% | 1.439 | 122.283 | 0.000% |
+| 8K | `bf16` | `true` | `true` | 0.000000 | 528.065 | 0.000% | 4.236 | 478.155 | 0.000% |
+| 8K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 464.087 | 12.116% | 2.135 | 162.893 | 0.000% |
+| 8K | `mlx_affine_q4` | `false` | `false` | 1.500000 | 432.087 | 18.175% | 1.930 | 207.608 | 0.000% |
+| 16K | `bf16` | `true` | `true` | 0.000000 | 736.104 | 0.000% | 3.543 | 8354.318 | 0.000% |
+| 16K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 608.126 | 17.386% | 3.270 | 360.565 | 0.000% |
+| 16K | `mlx_affine_q4` | `false` | `false` | 1.937500 | 544.126 | 26.080% | 6.373 | 178.773 | 0.000% |
 
 ## Measurement Changes
 
@@ -340,7 +340,7 @@ Native KV compression probe results:
 | 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P08 compressed snapshot API and benchmark changes. |
 | 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P08 FFI wrappers and benchmark harness. |
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Required MLX build gate for compressed native snapshot payload API. |
-| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P08 records, summary, report, and blocker report with no blockers at clean SHA `59d695e`. |
+| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P08 records, summary, report, and blocker report with no blockers at clean SHA `5993b86`. |
 
 ## Current Claim Boundaries
 
