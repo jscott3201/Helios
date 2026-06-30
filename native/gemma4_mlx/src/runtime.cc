@@ -822,44 +822,21 @@ Gemma4Status gemma4_verify_tokens(
                 "gemma4_verify_tokens requires a prefilled native target cache");
         }
 
-        std::vector<int32_t> committed_tokens = cache->native_tokens;
+        std::vector<int32_t> committed_tokens;
         std::unique_ptr<gemma4d::NativeHiddenState> committed_hidden;
-        Gemma4StepResult committed_step{};
         std::string native_error;
-        if (!target->native_model->forward_greedy(
-                committed_tokens,
-                &committed_step,
+        if (!target->native_model->verify_draft_block(
+                cache->native_tokens,
+                draft_tokens,
+                draft_count,
+                &committed_tokens,
+                out,
                 &native_error,
                 &committed_hidden)) {
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
-        float peak_memory_gb = committed_step.peak_memory_gb;
-
-        for (size_t index = 0; index < draft_count; ++index) {
-            const int32_t target_token = committed_step.greedy_token;
-            const bool accepted = draft_tokens[index] == target_token;
-            committed_tokens.push_back(target_token);
-
-            committed_hidden.reset();
-            if (!target->native_model->forward_greedy(
-                    committed_tokens,
-                    &committed_step,
-                    &native_error,
-                    &committed_hidden)) {
-                return fail(GEMMA4_ERR_RUNTIME, native_error);
-            }
-            if (committed_step.peak_memory_gb > peak_memory_gb) {
-                peak_memory_gb = committed_step.peak_memory_gb;
-            }
-            if (!accepted) {
-                break;
-            }
-        }
-
-        committed_step.peak_memory_gb = peak_memory_gb;
         cache->native_tokens = std::move(committed_tokens);
         cache->last_hidden = std::move(committed_hidden);
-        *out = committed_step;
         out->native_last_hidden = cache->last_hidden.get();
         target->sequence_len = out->sequence_len;
         return ok();

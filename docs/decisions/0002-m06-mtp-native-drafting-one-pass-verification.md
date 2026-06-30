@@ -1,4 +1,4 @@
-# Decision Record: M06 MTP Native Drafting With Iterative Exact Verification
+# Decision Record: M06 MTP Native Drafting With One-Pass Verification
 
 - Status: accepted
 - Date: 2026-06-30
@@ -14,9 +14,9 @@ The public MTP assistant artifact uses a distinct `gemma4_unified_assistant` con
 
 Implement and test the M06 speculative decoding state machine, metrics, rollback, auto-disable, TUI payload, target hidden/shared-view materialization, and FFI contracts now. Strict drafter load validates the real assistant artifact shape and returns a drafter handle only for assistant manifests.
 
-The native drafter now loads real assistant tensors and `gemma4_mtp_draft_block` executes block-size 1 and 2 assistant draft generation against the materialized target hidden/shared KV views. `gemma4_verify_tokens` verifies against a temporary native target prefix, commits matching draft tokens, commits the target greedy fallback token on first mismatch, and never appends rejected draft tokens to the cache.
+The native drafter now loads real assistant tensors and `gemma4_mtp_draft_block` executes block-size 1 and 2 assistant draft generation against the materialized target hidden/shared KV views. `gemma4_verify_tokens` runs one native target forward over the accepted prefix plus draft block, compares draft tokens against the target greedy tokens at the corresponding positions, commits matching draft tokens, commits the target greedy fallback token on first mismatch, and never appends rejected draft tokens to the cache.
 
-For M06, native verification is iterative/full-recompute rather than one-pass over the draft block. This preserves exactness against the current native non-MTP decode path while avoiding a one-pass implementation that would depend on target masking/KV work outside this milestone.
+Native full-attention target layers use causal masking for multi-token forwards so verification logits for prefix positions cannot attend to future draft tokens.
 
 ## Consequences
 
@@ -24,7 +24,7 @@ For M06, native verification is iterative/full-recompute rather than one-pass ov
 - The TUI can show MTP acceptance, rollback, and auto-disable state.
 - Native Gemma 4 assistant draft generation now runs for real artifacts in the opt-in native graph.
 - Real Gemma 4 target+assistant draft verification now has exact accept/rollback semantics for block size 1/2.
-- One-pass/KV-backed verification remains a performance follow-up, not a correctness prerequisite for M06.
+- KV-backed verification remains a performance follow-up, not a correctness prerequisite for M06.
 
 ## Evidence
 

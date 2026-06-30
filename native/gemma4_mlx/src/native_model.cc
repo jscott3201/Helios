@@ -323,7 +323,7 @@ array attention_forward(
     capture_shared_kv(shared_kv, layer_idx, full_attention, keys, values);
 
     const std::optional<array> mask = full_attention ? std::nullopt : sliding_causal_mask(sequence_len, 1024);
-    const std::string mask_mode = mask.has_value() || sequence_len == 1 ? "" : "causal";
+    const std::string mask_mode = sequence_len == 1 || mask.has_value() ? "" : "causal";
     array output = mlx::core::fast::scaled_dot_product_attention(
         queries,
         keys,
@@ -534,13 +534,26 @@ void trace_hidden_stats(const char* label, const array& h, int sequence_len) {
     trace_feature_stats(label, h, sequence_len, 3840, trace_layer_stats_enabled());
 }
 
+struct NativeHiddenArrays {
+    array hidden;
+    SharedKvArrays shared_kv;
+};
+
 struct NativeForwardArrays {
     array logits;
     array last_hidden;
     SharedKvArrays shared_kv;
 };
 
-NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
+struct NativeVerifyArrays {
+    std::vector<int32_t> greedy_tokens;
+    std::vector<float> greedy_logits;
+    array last_hidden;
+    SharedKvArrays shared_kv;
+    float peak_memory_gb = 0.0f;
+};
+
+NativeHiddenArrays forward_hidden(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
     if (tokens.empty()) {
         throw std::runtime_error("native forward requires at least one token");
     }
@@ -568,8 +581,10 @@ NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const
     dump_hidden_tensor("final_norm", h);
     trace_hidden_stats("final_norm", h, sequence_len);
 
-    array last_hidden = mlx::core::slice(h, {0, sequence_len - 1, 0}, {1, sequence_len, 3840});
-    h = last_hidden;
+    return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
+}
+
+array target_logits_for_hidden(const NativeTextModel::Impl& impl, const array& h) {
     const QuantizationSpec embed_quantization = quantization_for(impl, "language_model.model.embed_tokens");
     array logits = mlx::core::quantized_matmul(
         h,
@@ -581,10 +596,66 @@ NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const
         static_cast<int>(embed_quantization.bits),
         "affine");
     logits = model_dtype(logits);
-    logits = model_dtype(mlx::core::tanh(logits / model_scalar(30.0f)) * model_scalar(30.0f));
+    return model_dtype(mlx::core::tanh(logits / model_scalar(30.0f)) * model_scalar(30.0f));
+}
+
+NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
+    NativeHiddenArrays forward = forward_hidden(impl, tokens);
+    const int sequence_len = static_cast<int>(tokens.size());
+    array last_hidden = mlx::core::slice(forward.hidden, {0, sequence_len - 1, 0}, {1, sequence_len, 3840});
+    array logits = target_logits_for_hidden(impl, last_hidden);
     logits = mlx::core::reshape(logits, {262144});
     dump_hidden_tensor("logits", logits);
-    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(shared_kv)};
+    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(forward.shared_kv)};
+}
+
+NativeVerifyArrays forward_verify_logits(
+    const NativeTextModel::Impl& impl,
+    const std::vector<int32_t>& tokens,
+    size_t first_position,
+    size_t position_count) {
+    if (position_count == 0) {
+        throw std::runtime_error("native MTP verify requires at least one logit position");
+    }
+    if (first_position + position_count > tokens.size()) {
+        throw std::runtime_error("native MTP verify logit positions exceed token context");
+    }
+    if (first_position + position_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native MTP verify position exceeds MLX shape limits");
+    }
+
+    mlx::core::reset_peak_memory();
+    NativeHiddenArrays forward = forward_hidden(impl, tokens);
+    const int first = static_cast<int>(first_position);
+    const int stop = static_cast<int>(first_position + position_count);
+    array selected_hidden = mlx::core::slice(forward.hidden, {0, first, 0}, {1, stop, 3840});
+    array logits = target_logits_for_hidden(impl, selected_hidden);
+    array greedy = mlx::core::argmax(logits, -1);
+    array greedy_logits = to_float32(mlx::core::max(logits, -1));
+    array last_hidden = mlx::core::slice(
+        forward.hidden,
+        {0, static_cast<int>(tokens.size() - 1), 0},
+        {1, static_cast<int>(tokens.size()), 3840});
+    mlx::core::eval({greedy, greedy_logits, last_hidden});
+
+    std::vector<int32_t> greedy_tokens;
+    std::vector<float> greedy_logits_out;
+    greedy_tokens.reserve(position_count);
+    greedy_logits_out.reserve(position_count);
+    const int* token_data = greedy.data<int>();
+    const float* logit_data = greedy_logits.data<float>();
+    for (size_t index = 0; index < position_count; ++index) {
+        greedy_tokens.push_back(static_cast<int32_t>(token_data[index]));
+        greedy_logits_out.push_back(logit_data[index]);
+    }
+    const float peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
+    return NativeVerifyArrays{
+        std::move(greedy_tokens),
+        std::move(greedy_logits_out),
+        std::move(last_hidden),
+        std::move(forward.shared_kv),
+        peak_memory_gb,
+    };
 }
 
 array target_token_embedding(const NativeTextModel::Impl& impl, int32_t token_id) {
@@ -941,6 +1012,131 @@ bool NativeTextModel::forward_greedy(
         return false;
     } catch (...) {
         *error = "native Gemma 4 forward failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+bool NativeTextModel::verify_draft_block(
+    const std::vector<int32_t>& context_tokens,
+    const int32_t* draft_tokens,
+    size_t draft_count,
+    std::vector<int32_t>* committed_tokens,
+    Gemma4StepResult* out,
+    std::string* error,
+    std::unique_ptr<NativeHiddenState>* last_hidden) const {
+    if (committed_tokens == nullptr || out == nullptr || error == nullptr) {
+        return false;
+    }
+    committed_tokens->clear();
+    *out = Gemma4StepResult{};
+    error->clear();
+    if (last_hidden != nullptr) {
+        last_hidden->reset();
+    }
+    if (context_tokens.empty()) {
+        *error = "native MTP verify requires a non-empty accepted context";
+        return false;
+    }
+    if (draft_count == 0 || draft_tokens == nullptr) {
+        *error = "native MTP verify requires at least one draft token";
+        return false;
+    }
+    if (draft_count > 2) {
+        *error = "native MTP verify currently supports draft_count <= 2 for M06";
+        return false;
+    }
+    if (context_tokens.size() + draft_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        *error = "native MTP verify token count exceeds MLX shape limits";
+        return false;
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)draft_tokens;
+    (void)last_hidden;
+    *error = "native Gemma 4 graph was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->language_tensor_count == 0) {
+            *error = "native Gemma 4 model state is not loaded";
+            return false;
+        }
+
+        std::vector<int32_t> candidate_tokens = context_tokens;
+        candidate_tokens.insert(candidate_tokens.end(), draft_tokens, draft_tokens + draft_count);
+        NativeVerifyArrays verified = forward_verify_logits(
+            *impl_,
+            candidate_tokens,
+            context_tokens.size() - 1,
+            draft_count + 1);
+
+        size_t accepted_count = 0;
+        bool rejected = false;
+        int32_t fallback_token = 0;
+        for (size_t index = 0; index < draft_count; ++index) {
+            const int32_t target_token = verified.greedy_tokens[index];
+            if (draft_tokens[index] == target_token) {
+                ++accepted_count;
+                continue;
+            }
+            rejected = true;
+            fallback_token = target_token;
+            break;
+        }
+
+        if (rejected) {
+            std::vector<int32_t> fallback_tokens = context_tokens;
+            fallback_tokens.insert(fallback_tokens.end(), draft_tokens, draft_tokens + accepted_count);
+            fallback_tokens.push_back(fallback_token);
+
+            Gemma4StepResult fallback_step{};
+            std::unique_ptr<NativeHiddenState> fallback_hidden;
+            if (!forward_greedy(fallback_tokens, &fallback_step, error, &fallback_hidden)) {
+                return false;
+            }
+            if (fallback_step.peak_memory_gb < verified.peak_memory_gb) {
+                fallback_step.peak_memory_gb = verified.peak_memory_gb;
+            }
+            *committed_tokens = std::move(fallback_tokens);
+            *out = fallback_step;
+            if (last_hidden != nullptr) {
+                *last_hidden = std::move(fallback_hidden);
+                out->native_last_hidden = last_hidden->get();
+            }
+            return true;
+        }
+
+        std::unique_ptr<NativeHiddenState> hidden;
+        if (last_hidden != nullptr) {
+            std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
+                std::move(verified.last_hidden),
+                std::move(verified.shared_kv.full_attention_key),
+                std::move(verified.shared_kv.full_attention_value),
+                std::move(verified.shared_kv.sliding_attention_key),
+                std::move(verified.shared_kv.sliding_attention_value),
+                static_cast<uint64_t>(candidate_tokens.size()),
+                3840,
+            });
+            hidden.reset(new NativeHiddenState(std::move(hidden_impl)));
+        }
+
+        *committed_tokens = std::move(candidate_tokens);
+        out->greedy_token = verified.greedy_tokens[draft_count];
+        out->greedy_logit = verified.greedy_logits[draft_count];
+        out->sequence_len = committed_tokens->size();
+        out->peak_memory_gb = verified.peak_memory_gb;
+        out->peak_rss_mb = 0.0f;
+        out->native_last_hidden = hidden.get();
+        if (last_hidden != nullptr) {
+            *last_hidden = std::move(hidden);
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native Gemma 4 MTP verify failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native Gemma 4 MTP verify failed with an unknown exception";
         return false;
     }
 #endif
