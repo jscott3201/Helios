@@ -65,6 +65,8 @@ typedef struct Gemma4KvPolicy {
 typedef struct Gemma4StepResult {
     int32_t greedy_token;
     float greedy_logit;
+    float peak_memory_gb;
+    float peak_rss_mb;
     uint64_t sequence_len;
     void* native_last_hidden;
 } Gemma4StepResult;

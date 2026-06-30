@@ -1,8 +1,35 @@
 #include "gemma4_mlx.h"
+#include "model_manifest.h"
+#include "native_model.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
+#include <filesystem>
+#include <memory>
 #include <new>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
+
+#ifdef GEMMA4D_MLX_AVAILABLE
+#include <mlx/version.h>
+#endif
+
+#define GEMMA4D_STRINGIFY_DETAIL(value) #value
+#define GEMMA4D_STRINGIFY(value) GEMMA4D_STRINGIFY_DETAIL(value)
+
+#ifndef GEMMA4D_MLX_LM_HELPER_PATH
+#define GEMMA4D_MLX_LM_HELPER_PATH "native/gemma4_mlx/scripts/gemma4d_mlx_lm_helper.py"
+#endif
+
+#ifndef GEMMA4D_MLX_LM_PYTHON
+#define GEMMA4D_MLX_LM_PYTHON "/opt/homebrew/opt/mlx-lm/libexec/bin/python"
+#endif
 
 namespace {
 
@@ -10,13 +37,30 @@ constexpr uint64_t kTargetMagic = 0x47454d3444415447ULL;
 constexpr uint64_t kKvCacheMagic = 0x47454d344b564347ULL;
 thread_local char g_last_error[512] = "";
 
+#ifdef GEMMA4D_MLX_AVAILABLE
+constexpr const char* kBackendVersion =
+    "m03-mlx-build-gated-mlx-" GEMMA4D_STRINGIFY(MLX_VERSION_MAJOR) "." GEMMA4D_STRINGIFY(
+        MLX_VERSION_MINOR) "." GEMMA4D_STRINGIFY(MLX_VERSION_PATCH);
+#else
+constexpr const char* kBackendVersion = "m03-smoke-no-mlx";
+#endif
+
 struct NativeTarget {
     uint64_t magic;
+    bool model_loaded;
+    bool use_native_graph;
+    uint64_t sequence_len;
+    gemma4d::Gemma4ModelManifest manifest;
+    std::unique_ptr<gemma4d::NativeTextModel> native_model;
+    pid_t helper_pid;
+    FILE* helper_in;
+    FILE* helper_out;
 };
 
 struct NativeKvCache {
     uint64_t magic;
     Gemma4KvPolicy policy;
+    std::vector<int32_t> native_tokens;
 };
 
 void store_error(const char* message) {
@@ -25,6 +69,11 @@ void store_error(const char* message) {
 
 Gemma4Status fail(Gemma4Status status, const char* message) {
     store_error(message);
+    return status;
+}
+
+Gemma4Status fail(Gemma4Status status, const std::string& message) {
+    store_error(message.c_str());
     return status;
 }
 
@@ -37,10 +86,297 @@ bool is_empty(const char* value) {
     return value == nullptr || value[0] == '\0';
 }
 
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+        std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0 &&
+        std::strcmp(value, "OFF") != 0;
+}
+
 void clear_step_result(Gemma4StepResult* out) {
     if (out != nullptr) {
         std::memset(out, 0, sizeof(Gemma4StepResult));
     }
+}
+
+bool has_safetensors_file(const std::filesystem::path& model_dir) {
+    std::error_code error;
+    std::filesystem::directory_iterator current(model_dir, error);
+    std::filesystem::directory_iterator end;
+    while (!error && current != end) {
+        const std::filesystem::directory_entry& entry = *current;
+        if (entry.is_regular_file(error) && entry.path().extension() == ".safetensors") {
+            return true;
+        }
+        current.increment(error);
+    }
+    return false;
+}
+
+std::string errno_message(const char* action) {
+    std::ostringstream message;
+    message << action << ": " << std::strerror(errno);
+    return message.str();
+}
+
+Gemma4Status validate_strict_model_artifacts(const char* model_path) {
+    std::error_code error;
+    const std::filesystem::path path(model_path);
+
+    if (!std::filesystem::exists(path, error)) {
+        return fail(GEMMA4_ERR_MODEL_LOAD, "model_path does not exist: " + path.string());
+    }
+    if (!std::filesystem::is_directory(path, error)) {
+        return fail(GEMMA4_ERR_MODEL_LOAD, "model_path is not a directory: " + path.string());
+    }
+    if (!std::filesystem::exists(path / "config.json", error)) {
+        return fail(GEMMA4_ERR_MODEL_LOAD, "model_path is missing config.json: " + path.string());
+    }
+    if (!std::filesystem::exists(path / "tokenizer.json", error)) {
+        return fail(GEMMA4_ERR_MODEL_LOAD, "model_path is missing tokenizer.json: " + path.string());
+    }
+    if (!has_safetensors_file(path)) {
+        return fail(
+            GEMMA4_ERR_MODEL_LOAD,
+            "model_path is missing one or more .safetensors weight shards: " + path.string());
+    }
+
+    return GEMMA4_OK;
+}
+
+bool read_helper_line(NativeTarget* target, std::string* line) {
+    line->clear();
+    if (target == nullptr || target->helper_out == nullptr) {
+        return false;
+    }
+
+    char buffer[4096];
+    if (std::fgets(buffer, sizeof(buffer), target->helper_out) == nullptr) {
+        return false;
+    }
+    *line = buffer;
+    while (!line->empty() && line->back() != '\n') {
+        if (std::fgets(buffer, sizeof(buffer), target->helper_out) == nullptr) {
+            break;
+        }
+        *line += buffer;
+    }
+    return true;
+}
+
+std::string json_string_value(const std::string& line, const char* key) {
+    const std::string needle = std::string("\"") + key + "\":\"";
+    const size_t start = line.find(needle);
+    if (start == std::string::npos) {
+        return "";
+    }
+    const size_t value_start = start + needle.size();
+    const size_t value_end = line.find('"', value_start);
+    if (value_end == std::string::npos) {
+        return "";
+    }
+    return line.substr(value_start, value_end - value_start);
+}
+
+bool json_ok(const std::string& line) {
+    return line.find("\"ok\":true") != std::string::npos;
+}
+
+bool json_number_slice(const std::string& line, const char* key, std::string* out) {
+    const std::string needle = std::string("\"") + key + "\":";
+    const size_t start = line.find(needle);
+    if (start == std::string::npos) {
+        return false;
+    }
+    size_t value_start = start + needle.size();
+    size_t value_end = value_start;
+    while (value_end < line.size()) {
+        const char c = line[value_end];
+        if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') {
+            ++value_end;
+        } else {
+            break;
+        }
+    }
+    if (value_end == value_start) {
+        return false;
+    }
+    *out = line.substr(value_start, value_end - value_start);
+    return true;
+}
+
+bool parse_step_response(const std::string& line, Gemma4StepResult* out) {
+    if (!json_ok(line)) {
+        return false;
+    }
+
+    std::string value;
+    if (!json_number_slice(line, "greedy_token", &value)) {
+        return false;
+    }
+    out->greedy_token = std::stoi(value);
+
+    if (!json_number_slice(line, "greedy_logit", &value)) {
+        return false;
+    }
+    out->greedy_logit = std::stof(value);
+
+    if (json_number_slice(line, "peak_memory_gb", &value)) {
+        out->peak_memory_gb = std::stof(value);
+    }
+
+    if (json_number_slice(line, "peak_rss_mb", &value)) {
+        out->peak_rss_mb = std::stof(value);
+    }
+
+    if (!json_number_slice(line, "sequence_len", &value)) {
+        return false;
+    }
+    out->sequence_len = std::stoull(value);
+    out->native_last_hidden = nullptr;
+    return true;
+}
+
+void stop_helper(NativeTarget* target) {
+    if (target == nullptr) {
+        return;
+    }
+
+    if (target->helper_in != nullptr) {
+        std::fputs("{\"cmd\":\"shutdown\"}\n", target->helper_in);
+        std::fflush(target->helper_in);
+        if (target->helper_out != nullptr) {
+            std::string ignored;
+            read_helper_line(target, &ignored);
+        }
+    }
+    if (target->helper_in != nullptr) {
+        std::fclose(target->helper_in);
+        target->helper_in = nullptr;
+    }
+    if (target->helper_out != nullptr) {
+        std::fclose(target->helper_out);
+        target->helper_out = nullptr;
+    }
+    if (target->helper_pid > 0) {
+        int status = 0;
+        waitpid(target->helper_pid, &status, 0);
+        target->helper_pid = -1;
+    }
+}
+
+Gemma4Status start_helper(NativeTarget* target, const char* model_path) {
+    int to_child[2] = {-1, -1};
+    int from_child[2] = {-1, -1};
+    if (pipe(to_child) != 0) {
+        return fail(GEMMA4_ERR_RUNTIME, errno_message("pipe to helper failed"));
+    }
+    if (pipe(from_child) != 0) {
+        close(to_child[0]);
+        close(to_child[1]);
+        return fail(GEMMA4_ERR_RUNTIME, errno_message("pipe from helper failed"));
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(to_child[0]);
+        close(to_child[1]);
+        close(from_child[0]);
+        close(from_child[1]);
+        return fail(GEMMA4_ERR_RUNTIME, errno_message("fork helper failed"));
+    }
+
+    if (pid == 0) {
+        dup2(to_child[0], STDIN_FILENO);
+        dup2(from_child[1], STDOUT_FILENO);
+        close(to_child[0]);
+        close(to_child[1]);
+        close(from_child[0]);
+        close(from_child[1]);
+
+        const char* python = std::getenv("GEMMA4D_MLX_LM_PYTHON");
+        if (python == nullptr || python[0] == '\0') {
+            python = GEMMA4D_MLX_LM_PYTHON;
+        }
+        const char* helper = std::getenv("GEMMA4D_MLX_LM_HELPER");
+        if (helper == nullptr || helper[0] == '\0') {
+            helper = GEMMA4D_MLX_LM_HELPER_PATH;
+        }
+        execl(python, python, helper, model_path, static_cast<char*>(nullptr));
+        std::fprintf(stderr, "failed to exec Gemma4D MLX-LM helper: %s\n", std::strerror(errno));
+        _exit(127);
+    }
+
+    close(to_child[0]);
+    close(from_child[1]);
+
+    target->helper_pid = pid;
+    target->helper_in = fdopen(to_child[1], "w");
+    target->helper_out = fdopen(from_child[0], "r");
+    if (target->helper_in == nullptr || target->helper_out == nullptr) {
+        stop_helper(target);
+        return fail(GEMMA4_ERR_RUNTIME, errno_message("fdopen helper pipe failed"));
+    }
+
+    std::string line;
+    if (!read_helper_line(target, &line)) {
+        stop_helper(target);
+        return fail(GEMMA4_ERR_MODEL_LOAD, "MLX-LM helper exited before reporting readiness");
+    }
+    if (!json_ok(line)) {
+        std::string error = json_string_value(line, "error");
+        stop_helper(target);
+        return fail(
+            GEMMA4_ERR_MODEL_LOAD,
+            error.empty() ? "MLX-LM helper failed to load model" : error);
+    }
+
+    target->model_loaded = true;
+    return ok();
+}
+
+std::string tokens_json(const int32_t* tokens, size_t token_count) {
+    std::ostringstream json;
+    json << '[';
+    for (size_t i = 0; i < token_count; ++i) {
+        if (i != 0) {
+            json << ',';
+        }
+        json << tokens[i];
+    }
+    json << ']';
+    return json.str();
+}
+
+Gemma4Status helper_command(NativeTarget* target, const std::string& command, Gemma4StepResult* out) {
+    if (target->helper_in == nullptr || target->helper_out == nullptr) {
+        return fail(GEMMA4_ERR_RUNTIME, "MLX-LM helper is not running");
+    }
+    if (std::fputs(command.c_str(), target->helper_in) == EOF || std::fputc('\n', target->helper_in) == EOF) {
+        return fail(GEMMA4_ERR_RUNTIME, errno_message("write to MLX-LM helper failed"));
+    }
+    if (std::fflush(target->helper_in) != 0) {
+        return fail(GEMMA4_ERR_RUNTIME, errno_message("flush to MLX-LM helper failed"));
+    }
+
+    std::string line;
+    if (!read_helper_line(target, &line)) {
+        return fail(GEMMA4_ERR_RUNTIME, "MLX-LM helper exited while waiting for a response");
+    }
+    if (!json_ok(line)) {
+        std::string error = json_string_value(line, "error");
+        return fail(
+            GEMMA4_ERR_RUNTIME,
+            error.empty() ? "MLX-LM helper command failed" : error);
+    }
+    if (!parse_step_response(line, out)) {
+        return fail(GEMMA4_ERR_RUNTIME, "MLX-LM helper returned an invalid step response");
+    }
+    target->sequence_len = out->sequence_len;
+    return ok();
 }
 
 } // namespace
@@ -57,7 +393,7 @@ Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
 
     out->abi_version = 1;
     out->backend_name = "gemma4_mlx";
-    out->backend_version = "m01-ffi-smoke";
+    out->backend_version = kBackendVersion;
     return ok();
 }
 
@@ -92,6 +428,50 @@ Gemma4Status gemma4_load_target(const Gemma4LoadConfig* config, Gemma4Target** o
     }
 
     target->magic = kTargetMagic;
+    target->model_loaded = false;
+    target->use_native_graph = false;
+    target->sequence_len = 0;
+    target->manifest = gemma4d::Gemma4ModelManifest{};
+    target->native_model.reset();
+    target->helper_pid = -1;
+    target->helper_in = nullptr;
+    target->helper_out = nullptr;
+
+    if (!config->allow_unsupported_config) {
+        Gemma4Status status = validate_strict_model_artifacts(config->model_path);
+        if (status != GEMMA4_OK) {
+            delete target;
+            return status;
+        }
+        std::string manifest_error;
+        if (!gemma4d::load_gemma4_model_manifest(config->model_path, &target->manifest, &manifest_error)) {
+            delete target;
+            return fail(
+                GEMMA4_ERR_UNSUPPORTED_CONFIG,
+                "unsupported Gemma 4 model manifest: " + manifest_error);
+        }
+        if (env_flag_enabled("GEMMA4D_USE_NATIVE_GRAPH")) {
+            std::string native_error;
+            if (!gemma4d::NativeTextModel::load(
+                    config->model_path,
+                    target->manifest,
+                    &target->native_model,
+                    &native_error)) {
+                delete target;
+                return fail(GEMMA4_ERR_MODEL_LOAD, native_error);
+            }
+            target->use_native_graph = true;
+            target->model_loaded = true;
+            *out = target;
+            return ok();
+        }
+        status = start_helper(target, config->model_path);
+        if (status != GEMMA4_OK) {
+            delete target;
+            return status;
+        }
+    }
+
     *out = target;
     return ok();
 }
@@ -105,6 +485,7 @@ Gemma4Status gemma4_free_target(Gemma4Target* target) {
     }
 
     target->magic = 0;
+    stop_helper(target);
     delete target;
     return ok();
 }
@@ -154,6 +535,7 @@ Gemma4Status gemma4_kv_reset(Gemma4KvCache* cache) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_reset received an invalid cache handle");
     }
 
+    (void)cache;
     return ok();
 }
 
@@ -177,8 +559,29 @@ Gemma4Status gemma4_prefill(
     if (token_count > 0 && tokens == nullptr) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_prefill requires tokens when token_count > 0");
     }
+    if (token_count == 0) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_prefill requires at least one token");
+    }
+    if (!target->model_loaded) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_prefill requires a loaded Gemma 4 target model; smoke handles do not execute");
+    }
+    if (target->use_native_graph) {
+        if (target->native_model == nullptr) {
+            return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 model state is missing");
+        }
+        cache->native_tokens.assign(tokens, tokens + token_count);
+        std::string native_error;
+        if (!target->native_model->forward_greedy(cache->native_tokens, out, &native_error)) {
+            return fail(GEMMA4_ERR_RUNTIME, native_error);
+        }
+        target->sequence_len = out->sequence_len;
+        return ok();
+    }
 
-    return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, "gemma4_prefill is not implemented in M01 smoke runtime");
+    std::string command = "{\"cmd\":\"prefill\",\"tokens\":" + tokens_json(tokens, token_count) + "}";
+    return helper_command(target, command, out);
 }
 
 Gemma4Status gemma4_decode_one(
@@ -198,6 +601,25 @@ Gemma4Status gemma4_decode_one(
     if (out == nullptr) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_decode_one requires a non-null step result");
     }
+    if (!target->model_loaded) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_decode_one requires a loaded Gemma 4 target model; smoke handles do not execute");
+    }
+    if (target->use_native_graph) {
+        if (target->native_model == nullptr) {
+            return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 model state is missing");
+        }
+        cache->native_tokens.push_back(token);
+        std::string native_error;
+        if (!target->native_model->forward_greedy(cache->native_tokens, out, &native_error)) {
+            return fail(GEMMA4_ERR_RUNTIME, native_error);
+        }
+        target->sequence_len = out->sequence_len;
+        return ok();
+    }
 
-    return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, "gemma4_decode_one is not implemented in M01 smoke runtime");
+    std::ostringstream command;
+    command << "{\"cmd\":\"decode_one\",\"token\":" << token << "}";
+    return helper_command(target, command.str(), out);
 }

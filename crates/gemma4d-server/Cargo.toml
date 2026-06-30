@@ -7,4 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[[bin]]
+name = "gemma4d"
+path = "src/main.rs"
+
 [dependencies]
+gemma4d-ffi = { version = "0.1.0", path = "../gemma4d-ffi" }

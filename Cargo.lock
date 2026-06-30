@@ -110,6 +110,9 @@ version = "0.1.0"
 [[package]]
 name = "gemma4d-server"
 version = "0.1.0"
+dependencies = [
+ "gemma4d-ffi",
+]
 
 [[package]]
 name = "gemma4d-tokenizer"

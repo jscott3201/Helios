@@ -19,6 +19,22 @@ fn main() {
         "cargo:rerun-if-changed={}",
         native_dir.join("src/runtime.cc").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("src/model_manifest.cc").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("src/model_manifest.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("src/native_model.cc").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("src/native_model.h").display()
+    );
     println!("cargo:rerun-if-env-changed=GEMMA4D_REQUIRE_MLX");
 
     fs::create_dir_all(&build_dir).expect("native build directory can be created");
@@ -31,8 +47,11 @@ fn main() {
         .arg(&build_dir)
         .arg("-DCMAKE_BUILD_TYPE=Debug");
 
-    if env::var_os("GEMMA4D_REQUIRE_MLX").is_some() {
+    let require_mlx = env::var_os("GEMMA4D_REQUIRE_MLX").is_some();
+    if require_mlx {
         configure.arg("-DGEMMA4D_REQUIRE_MLX=ON");
+    } else {
+        configure.arg("-DGEMMA4D_REQUIRE_MLX=OFF");
     }
 
     run(&mut configure, "configure native gemma4_mlx");
@@ -43,6 +62,10 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=gemma4_mlx");
+    if require_mlx {
+        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+        println!("cargo:rustc-link-lib=dylib=mlx");
+    }
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-lib=c++");

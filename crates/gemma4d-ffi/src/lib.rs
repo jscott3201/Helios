@@ -67,6 +67,8 @@ mod raw {
     pub struct Gemma4StepResult {
         pub greedy_token: i32,
         pub greedy_logit: f32,
+        pub peak_memory_gb: f32,
+        pub peak_rss_mb: f32,
         pub sequence_len: u64,
         pub native_last_hidden: *mut std::ffi::c_void,
     }
@@ -333,7 +335,28 @@ impl Drop for KvCache {
     }
 }
 
-pub fn smoke_prefill(target: &Target, cache: &mut KvCache, tokens: &[i32]) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepResult {
+    pub greedy_token: i32,
+    pub greedy_logit: f32,
+    pub peak_memory_gb: f32,
+    pub peak_rss_mb: f32,
+    pub sequence_len: u64,
+}
+
+impl From<raw::Gemma4StepResult> for StepResult {
+    fn from(value: raw::Gemma4StepResult) -> Self {
+        Self {
+            greedy_token: value.greedy_token,
+            greedy_logit: value.greedy_logit,
+            peak_memory_gb: value.peak_memory_gb,
+            peak_rss_mb: value.peak_rss_mb,
+            sequence_len: value.sequence_len,
+        }
+    }
+}
+
+pub fn prefill(target: &Target, cache: &mut KvCache, tokens: &[i32]) -> Result<StepResult> {
     let mut out = raw::Gemma4StepResult::default();
     let token_ptr = if tokens.is_empty() {
         ptr::null()
@@ -350,15 +373,27 @@ pub fn smoke_prefill(target: &Target, cache: &mut KvCache, tokens: &[i32]) -> Re
             tokens.len(),
             &mut out,
         )
-    })
+    })?;
+
+    Ok(out.into())
 }
 
-pub fn smoke_decode_one(target: &Target, cache: &mut KvCache, token: i32) -> Result<()> {
+pub fn decode_one(target: &Target, cache: &mut KvCache, token: i32) -> Result<StepResult> {
     let mut out = raw::Gemma4StepResult::default();
     // SAFETY: handles come from safe wrappers and `out` is writable for the duration of the call.
     check(unsafe {
         raw::gemma4_decode_one(target.ptr.as_ptr(), cache.ptr.as_ptr(), token, &mut out)
-    })
+    })?;
+
+    Ok(out.into())
+}
+
+pub fn smoke_prefill(target: &Target, cache: &mut KvCache, tokens: &[i32]) -> Result<()> {
+    prefill(target, cache, tokens).map(|_| ())
+}
+
+pub fn smoke_decode_one(target: &Target, cache: &mut KvCache, token: i32) -> Result<()> {
+    decode_one(target, cache, token).map(|_| ())
 }
 
 fn check(status: raw::Gemma4Status) -> Result<()> {
@@ -413,7 +448,7 @@ mod tests {
         let version = runtime_version().expect("runtime version should be available");
         assert_eq!(version.abi_version, 1);
         assert_eq!(version.backend_name, "gemma4_mlx");
-        assert_eq!(version.backend_version, "m01-ffi-smoke");
+        assert!(version.backend_version.starts_with("m03-"));
     }
 
     #[test]
@@ -440,11 +475,84 @@ mod tests {
         let prefill =
             smoke_prefill(&target, &mut cache, &[1, 2, 3]).expect_err("M01 prefill is a stub");
         assert_eq!(prefill.status(), Status::UnsupportedConfig);
-        assert!(prefill.message().contains("not implemented in M01"));
+        assert!(
+            prefill
+                .message()
+                .contains("requires a loaded Gemma 4 target model")
+        );
 
         let decode = smoke_decode_one(&target, &mut cache, 1).expect_err("M01 decode is a stub");
         assert_eq!(decode.status(), Status::UnsupportedConfig);
-        assert!(decode.message().contains("not implemented in M01"));
+        assert!(
+            decode
+                .message()
+                .contains("requires a loaded Gemma 4 target model")
+        );
+    }
+
+    #[test]
+    fn strict_load_reports_missing_model_path() {
+        let config = LoadConfig {
+            model_path: "/tmp/gemma4d-missing-model-path-for-test".to_owned(),
+            model_id: Some("mlx-community/gemma-4-12B-it-4bit".to_owned()),
+            model_revision: None,
+            expected_architecture: Some("gemma4".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let err = Target::load(&config).expect_err("strict load should reject missing model path");
+        assert_eq!(err.status(), Status::ModelLoad);
+        assert!(err.message().contains("model_path does not exist"));
+    }
+
+    #[test]
+    #[ignore = "M03 defers native chunked/KV parity while the native graph uses full recompute"]
+    fn chunked_prefill_matches_unchunked_for_full_model() {
+        panic!("pending full-model chunked prefill equivalence test");
+    }
+
+    #[test]
+    fn native_graph_prefills_one_token_when_explicitly_enabled() {
+        if std::env::var_os("GEMMA4D_FULL_MODEL_TESTS").is_none()
+            || std::env::var_os("GEMMA4D_USE_NATIVE_GRAPH").is_none()
+        {
+            return;
+        }
+
+        let version = runtime_version().expect("runtime version should be available");
+        assert_ne!(
+            version.backend_version, "m03-smoke-no-mlx",
+            "native graph full-model tests require GEMMA4D_REQUIRE_MLX=1 at build time"
+        );
+
+        let model_path = std::env::var("GEMMA4D_MODEL_PATH")
+            .unwrap_or_else(|_| "artifacts/models/gemma-4-12B-it-4bit".to_owned());
+        if !std::path::Path::new(&model_path).exists() {
+            return;
+        }
+
+        let config = LoadConfig {
+            model_path,
+            model_id: Some("mlx-community/gemma-4-12B-it-4bit".to_owned()),
+            model_revision: None,
+            expected_architecture: Some("gemma4".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let target = Target::load(&config).expect("native target model should load");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let step = prefill(&target, &mut cache, &[9259]).expect("native prefill should run");
+        assert_eq!(step.sequence_len, 1);
+        assert_eq!(step.greedy_token, 236772);
+        assert!(step.peak_memory_gb > 0.0);
+
+        let decode =
+            decode_one(&target, &mut cache, step.greedy_token).expect("native decode should run");
+        assert_eq!(decode.sequence_len, 2);
+        assert_eq!(decode.greedy_token, 236772);
+        assert!(decode.peak_memory_gb > 0.0);
     }
 
     #[test]
