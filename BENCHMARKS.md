@@ -30,6 +30,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P05 true native MTP verification | Passed | `57ac3a6` | `native_target_and_native_mtp_ffi` | `benchmarks/out/P05-native-mtp/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p05-1782849629`; real native target+assistant FFI loop matched non-MTP native output for block sizes 1 and 2, then auto-disabled because acceptance was 0.000. |
 | 2026-06-30 | P06 real RAM prefix cache | Passed | `e5e61ad` | `native_ram_prefix_snapshot_ffi` | `benchmarks/out/P06-real-ram-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p06-1782851001`; native RAM snapshot restore matched fresh-prefill logits and continued decode at 4K/8K/16K, with wrong model/adapter/cache-mode namespace rejection. |
 | 2026-06-30 | P07 real SSD prefix cache | Passed | `9a4cd13` | `native_ssd_prefix_snapshot_payload` | `benchmarks/out/P07-real-ssd-prefix-cache/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p07-1782853459`; real SSD safetensors payload restore improved warm TTFT at 4K/8K/16K, rejected namespace/corruption/mid-decode fetches, and keeps SSD disabled by default pending broader variance data. |
+| 2026-06-30 | P08 real KV compression gates | Passed | `59d695e` | `native_kv_prefix_payload_compression` | `benchmarks/out/P08-kv-compression/{records.jsonl,summary.json,report.md,blockers.md}` | Run ID `p08-1782855472`; q8 full-attention payload compression passed continued-decode quality gates at 4K/8K/16K, q4 reduced payload bytes but failed greedy agreement, and compressed active decode remains disabled. |
 
 ## P00 Baseline Snapshot
 
@@ -249,6 +250,41 @@ Native SSD prefix-cache probe results:
 | 8K | 28582.644 | 3647.974 | 7.835x | 528.065 | 52735/52735 | 553716282/553716282 | 0 |
 | 16K | 92350.582 | 5081.531 | 18.174x | 736.104 | 53070/53070 | 771861096/771861096 | 0 |
 
+## P08 Real KV Compression Snapshot
+
+P08 measures compression on real native KV prefix payloads rather than fixture
+logits. The native compressed snapshot writer applies MLX affine q8/q4 only to
+global/full-attention KV tensors; sliding-window KV tensors and hidden state stay
+BF16. Payloads are decompressed to BF16 before import, so active compressed
+decode remains disabled and active KV memory is unchanged.
+
+Claim inventory from the `59d695e` run:
+
+| Category | Result |
+|---|---|
+| BF16 exactness | BF16 safetensors payload restore and one continued `decode_one` matched the cold BF16 continuation at 4K, 8K, and 16K. |
+| q8 quality | q8 passed continued-decode greedy agreement at all measured contexts with greedy-logit delta `0.250000`. |
+| q4 quality | q4 reduced payload size at all measured contexts but failed continued-decode greedy agreement at 4K, 8K, and 16K; it must stay disabled pending better quality evidence. |
+| Payload memory | q8 payload reduction was `7.541%`, `12.116%`, and `17.386%` at 4K/8K/16K. q4 payload reduction was `11.314%`, `18.175%`, and `26.080%`. |
+| Active memory | Active KV reduction was `0.000%` for BF16/q8/q4 because compressed SSD payloads restore into BF16 active decode state. |
+| Planar/Iso | Planar/Iso remains feature-disabled by default and has no reportable P08 evidence. |
+| Default recommendation | `keep_compressed_active_decode_disabled`. |
+| Runtime blockers | None recorded. |
+
+Native KV compression probe results:
+
+| Context | Mode | Gate | Greedy Agree | Logit Delta | Payload MiB | Payload Reduction | Warm Restore ms | Decode ms | Active KV Reduction |
+|---:|---|---|---|---:|---:|---:|---:|---:|---:|
+| 4K | `bf16` | `true` | `true` | 0.000000 | 424.045 | 0.000% | 5.053 | 238.636 | 0.000% |
+| 4K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 392.068 | 7.541% | 1.375 | 119.922 | 0.000% |
+| 4K | `mlx_affine_q4` | `false` | `false` | 0.250000 | 376.067 | 11.314% | 1.158 | 128.155 | 0.000% |
+| 8K | `bf16` | `true` | `true` | 0.000000 | 528.065 | 0.000% | 1.727 | 393.314 | 0.000% |
+| 8K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 464.087 | 12.116% | 1.952 | 193.031 | 0.000% |
+| 8K | `mlx_affine_q4` | `false` | `false` | 1.500000 | 432.087 | 18.175% | 1.960 | 186.615 | 0.000% |
+| 16K | `bf16` | `true` | `true` | 0.000000 | 736.104 | 0.000% | 3.078 | 4653.521 | 0.000% |
+| 16K | `mlx_affine_q8` | `true` | `true` | 0.250000 | 608.126 | 17.386% | 5.698 | 310.456 | 0.000% |
+| 16K | `mlx_affine_q4` | `false` | `false` | 1.937500 | 544.126 | 26.080% | 5.496 | 167.399 | 0.000% |
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -268,6 +304,8 @@ Native SSD prefix-cache probe results:
 | 2026-06-30 | Added P06 real RAM prefix-cache benchmark harness and goal contract. The harness validates namespace-gated restore, imports real native snapshots, compares restored last-step and continued decode parity, and records warm TTFT/cache accounting for 4K/8K/16K. | `crates/gemma4d-bench/examples/p06_real_ram_prefix_cache.rs`, `codex/goals/P06-real-ram-prefix-cache.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p06_real_ram_prefix_cache -- --out-dir benchmarks/out/P06-real-ram-prefix-cache --model-path artifacts/models/gemma-4-12B-it-4bit`. |
 | 2026-06-30 | Added native SSD KV snapshot payload save/load through the narrow C ABI using safetensors-compatible files and safe Rust `KvSnapshot` wrappers. The payload path is failure-closed for non-MLX builds. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P07 benchmark run. |
 | 2026-06-30 | Added P07 real SSD prefix-cache benchmark harness and goal contract. The harness writes SSD metadata plus real native safetensors payloads, restores before prefill only, verifies restored last-step and continued decode parity, records IO/latency metrics, and exercises namespace, corruption, and mid-decode rejection paths. | `crates/gemma4d-bench/examples/p07_real_ssd_prefix_cache.rs`, `codex/goals/P07-real-ssd-prefix-cache.goal.md`, `crates/gemma4d-bench/Cargo.toml` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `make verify`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p07_real_ssd_prefix_cache -- --out-dir benchmarks/out/P07-real-ssd-prefix-cache --cache-dir benchmarks/out/P07-real-ssd-prefix-cache/ssd-cache --model-path artifacts/models/gemma-4-12B-it-4bit`. |
+| 2026-06-30 | Added native compressed KV snapshot payload save through the narrow C ABI. The writer applies MLX affine q8 or packed q4 to selected KV tensors, records per-tensor min/scale metadata, keeps hidden/sliding tensors BF16 for P08 full-attention-only mode, and transparently reconstructs BF16 tensors on snapshot load. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `native/gemma4_mlx/src/native_model.h`, `native/gemma4_mlx/src/runtime.cc`, `crates/gemma4d-ffi/src/lib.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --all-targets`; `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run`; P08 benchmark run. |
+| 2026-06-30 | Added P08 real KV compression benchmark harness and goal contract. The harness compares BF16/q8/q4 real native prefix payloads at 4K/8K/16K, records payload memory reduction, warm restore latency, continued-decode greedy agreement/logit delta, active KV memory, and Planar/Iso disabled status. | `crates/gemma4d-bench/examples/p08_kv_compression.rs`, `codex/goals/P08-kv-compression.goal.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit`. |
 
 ## Verification Gates
 
@@ -299,6 +337,10 @@ Native SSD prefix-cache probe results:
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p06_real_ram_prefix_cache -- --out-dir benchmarks/out/P06-real-ram-prefix-cache --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P06 records, summary, report, and blocker report with no blockers at clean SHA `e5e61ad`. |
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_FULL_MODEL_TESTS=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo test -p gemma4d-ffi native_graph_prefills_one_token_when_explicitly_enabled -- --nocapture` | Passed | Required escalated Metal access; covers real native target/assistant FFI path and committed-token metadata assertions. |
 | 2026-06-30 | `make verify` | Passed | Sandboxed run failed only at localhost bind with `Operation not permitted`; escalated rerun passed. |
+| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after P08 compressed snapshot API and benchmark changes. |
+| 2026-06-30 | `cargo test -p gemma4d-ffi -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for P08 FFI wrappers and benchmark harness. |
+| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Required MLX build gate for compressed native snapshot payload API. |
+| 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example p08_kv_compression -- --out-dir benchmarks/out/P08-kv-compression --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Required escalated Metal access; wrote P08 records, summary, report, and blocker report with no blockers at clean SHA `59d695e`. |
 
 ## Current Claim Boundaries
 

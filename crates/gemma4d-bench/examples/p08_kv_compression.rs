@@ -663,12 +663,13 @@ fn restore_and_score_mode(
 }
 
 fn policy_for_mode(mode: BenchMode) -> KvPolicy {
-    let mut policy = KvPolicy::default();
-    policy.ssd_prefix_mode = mode.ffi_mode();
-    policy.compress_global_layers = mode.compresses_full_attention();
-    policy.compress_sliding_layers = false;
-    policy.allow_active_compressed_decode = false;
-    policy
+    KvPolicy {
+        ssd_prefix_mode: mode.ffi_mode(),
+        compress_global_layers: mode.compresses_full_attention(),
+        compress_sliding_layers: false,
+        allow_active_compressed_decode: false,
+        ..Default::default()
+    }
 }
 
 fn context_gate(records: &[ModeRecord]) -> ContextGate {
