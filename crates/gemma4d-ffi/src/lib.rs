@@ -568,6 +568,12 @@ fn optional_ptr(value: &Option<CString>) -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        io::Write,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn runtime_version_reports_smoke_backend() {
@@ -740,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn drafter_strict_load_auto_disable_evidence() {
+    fn drafter_strict_load_reports_missing_path() {
         let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
         let config = LoadConfig {
             model_path: "/tmp/gemma4d-missing-drafter".to_owned(),
@@ -751,9 +757,32 @@ mod tests {
             allow_unsupported_config: false,
         };
 
-        let err = Drafter::load(&config, &target).expect_err("M06 drafter must fail closed");
+        let err = Drafter::load(&config, &target).expect_err("strict drafter load should fail");
+        assert_eq!(err.status(), Status::ModelLoad);
+        assert!(err.message().contains("model_path does not exist"));
+    }
+
+    #[test]
+    fn drafter_strict_load_accepts_assistant_manifest_then_draft_fails_closed() {
+        let fixture = write_assistant_fixture();
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let config = LoadConfig {
+            model_path: fixture.to_string_lossy().into_owned(),
+            model_id: Some("mlx-community/gemma-4-12B-it-qat-assistant-4bit".to_owned()),
+            model_revision: None,
+            expected_architecture: Some("gemma4_unified_assistant".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let drafter = Drafter::load(&config, &target).expect("assistant manifest should load");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let err = draft_block(&drafter, &mut cache, NonZeroU32::new(1).expect("non-zero"))
+            .expect_err("native MTP execution should fail closed until hidden views exist");
         assert_eq!(err.status(), Status::UnsupportedConfig);
-        assert!(err.message().contains("MTP assistant execution"));
+        assert!(err.message().contains("last target hidden/shared views"));
+
+        fs::remove_dir_all(fixture).expect("remove assistant fixture");
     }
 
     #[test]
@@ -777,5 +806,105 @@ mod tests {
         let err = verify_tokens(&target, &mut cache, &[]).expect_err("empty verify should fail");
         assert_eq!(err.status(), Status::InvalidArgument);
         assert!(err.message().contains("at least one draft token"));
+    }
+
+    fn write_assistant_fixture() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        dir.push(format!("gemma4d-assistant-fixture-{unique}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create assistant fixture dir");
+        fs::write(dir.join("config.json"), assistant_config_json())
+            .expect("write assistant config");
+        fs::write(dir.join("tokenizer.json"), "{}").expect("write assistant tokenizer");
+        write_safetensors_header(&dir.join("model.safetensors"), assistant_tensor_keys());
+        dir
+    }
+
+    fn assistant_config_json() -> &'static str {
+        r#"{
+  "architectures": ["Gemma4UnifiedAssistantForCausalLM"],
+  "backbone_hidden_size": 3840,
+  "model_type": "gemma4_unified_assistant",
+  "quantization": {
+    "group_size": 64,
+    "bits": 4,
+    "mode": "affine"
+  },
+  "text_config": {
+    "attention_k_eq_v": true,
+    "hidden_size": 1024,
+    "intermediate_size": 8192,
+    "model_type": "gemma4_unified_text",
+    "num_attention_heads": 16,
+    "num_global_key_value_heads": 1,
+    "num_hidden_layers": 4,
+    "num_key_value_heads": 8,
+    "num_kv_shared_layers": 4,
+    "sliding_window": 1024,
+    "tie_word_embeddings": true,
+    "vocab_size": 262144
+  }
+}"#
+    }
+
+    fn assistant_tensor_keys() -> Vec<String> {
+        let mut keys = vec![
+            "model.embed_tokens.weight".to_owned(),
+            "model.embed_tokens.scales".to_owned(),
+            "model.embed_tokens.biases".to_owned(),
+            "model.norm.weight".to_owned(),
+            "pre_projection.weight".to_owned(),
+            "pre_projection.scales".to_owned(),
+            "pre_projection.biases".to_owned(),
+            "post_projection.weight".to_owned(),
+            "post_projection.scales".to_owned(),
+            "post_projection.biases".to_owned(),
+        ];
+        for layer in 0..4 {
+            let base = format!("model.layers.{layer}");
+            keys.extend([
+                format!("{base}.input_layernorm.weight"),
+                format!("{base}.post_attention_layernorm.weight"),
+                format!("{base}.pre_feedforward_layernorm.weight"),
+                format!("{base}.post_feedforward_layernorm.weight"),
+                format!("{base}.layer_scalar"),
+                format!("{base}.self_attn.q_norm.weight"),
+            ]);
+            for projection in [
+                "self_attn.q_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                let prefix = format!("{base}.{projection}");
+                keys.extend([
+                    format!("{prefix}.weight"),
+                    format!("{prefix}.scales"),
+                    format!("{prefix}.biases"),
+                ]);
+            }
+        }
+        keys
+    }
+
+    fn write_safetensors_header(path: &std::path::Path, keys: Vec<String>) {
+        let mut header = "{\"__metadata__\":{\"format\":\"mlx\"}".to_owned();
+        for key in keys {
+            header.push_str(",\"");
+            header.push_str(&key);
+            header.push_str("\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,0]}");
+        }
+        header.push('}');
+
+        let mut file = fs::File::create(path).expect("create safetensors fixture");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("write safetensors header length");
+        file.write_all(header.as_bytes())
+            .expect("write safetensors header");
     }
 }

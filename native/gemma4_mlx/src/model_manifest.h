@@ -14,12 +14,15 @@ struct QuantizationSpec {
 };
 
 struct Gemma4ModelManifest {
+    bool is_assistant = false;
+    uint32_t backbone_hidden_size = 0;
     uint32_t hidden_size = 0;
     uint32_t intermediate_size = 0;
     uint32_t num_hidden_layers = 0;
     uint32_t num_attention_heads = 0;
     uint32_t num_key_value_heads = 0;
     uint32_t num_global_key_value_heads = 0;
+    uint32_t num_kv_shared_layers = 0;
     uint32_t vocab_size = 0;
     uint32_t sliding_window = 0;
     uint32_t quantization_bits = 0;
@@ -40,6 +43,11 @@ struct Gemma4ModelManifest {
 };
 
 bool load_gemma4_model_manifest(
+    const std::filesystem::path& model_path,
+    Gemma4ModelManifest* out,
+    std::string* error);
+
+bool load_gemma4_mtp_assistant_manifest(
     const std::filesystem::path& model_path,
     Gemma4ModelManifest* out,
     std::string* error);

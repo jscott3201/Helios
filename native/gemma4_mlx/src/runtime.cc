@@ -68,6 +68,7 @@ struct NativeDrafter {
     uint64_t magic;
     bool model_loaded;
     std::string model_path;
+    gemma4d::Gemma4ModelManifest manifest;
 };
 
 void store_error(const char* message) {
@@ -658,12 +659,23 @@ Gemma4Status gemma4_load_drafter(
     drafter->magic = kDrafterMagic;
     drafter->model_loaded = false;
     drafter->model_path = config->model_path;
+    drafter->manifest = gemma4d::Gemma4ModelManifest{};
 
     if (!config->allow_unsupported_config) {
-        delete drafter;
-        return fail(
-            GEMMA4_ERR_UNSUPPORTED_CONFIG,
-            "Gemma 4 MTP assistant execution is not implemented in the native backend; MTP must auto-disable");
+        Gemma4Status status = validate_strict_model_artifacts(config->model_path);
+        if (status != GEMMA4_OK) {
+            delete drafter;
+            return status;
+        }
+        std::string manifest_error;
+        if (!gemma4d::load_gemma4_mtp_assistant_manifest(
+                config->model_path, &drafter->manifest, &manifest_error)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_UNSUPPORTED_CONFIG,
+                "unsupported Gemma 4 drafter manifest: " + manifest_error);
+        }
+        drafter->model_loaded = true;
     }
 
     *out = drafter;
@@ -714,7 +726,9 @@ Gemma4Status gemma4_mtp_draft_block(
     (void)cache;
     (void)out_tokens;
     *inout_count = 0;
-    return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, "native MTP drafter execution is not implemented");
+    return fail(
+        GEMMA4_ERR_UNSUPPORTED_CONFIG,
+        "native MTP drafter execution is not implemented; last target hidden/shared views are not materialized");
 }
 
 Gemma4Status gemma4_verify_tokens(
