@@ -76,6 +76,7 @@ mod raw {
         pub peak_memory_gb: f32,
         pub peak_rss_mb: f32,
         pub sequence_len: u64,
+        pub active_kv_bytes: u64,
         pub native_last_hidden: *mut std::ffi::c_void,
     }
 
@@ -427,6 +428,7 @@ pub struct StepResult {
     pub peak_memory_gb: f32,
     pub peak_rss_mb: f32,
     pub sequence_len: u64,
+    pub active_kv_bytes: u64,
     pub native_last_hidden: Option<NativeLastHiddenView>,
 }
 
@@ -438,6 +440,7 @@ impl From<raw::Gemma4StepResult> for StepResult {
             peak_memory_gb: value.peak_memory_gb,
             peak_rss_mb: value.peak_rss_mb,
             sequence_len: value.sequence_len,
+            active_kv_bytes: value.active_kv_bytes,
             native_last_hidden: NonNull::new(value.native_last_hidden)
                 .map(|ptr| NativeLastHiddenView { ptr }),
         }
@@ -691,6 +694,7 @@ mod tests {
         assert_eq!(step.sequence_len, 1);
         assert_eq!(step.greedy_token, 236772);
         assert!(step.peak_memory_gb > 0.0);
+        assert!(step.active_kv_bytes > 0);
         assert!(step.native_last_hidden.is_some());
 
         let mut baseline_cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");

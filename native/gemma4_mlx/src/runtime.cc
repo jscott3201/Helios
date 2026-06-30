@@ -62,6 +62,7 @@ struct NativeKvCache {
     uint64_t magic;
     Gemma4KvPolicy policy;
     std::vector<int32_t> native_tokens;
+    std::unique_ptr<gemma4d::NativeKvState> native_kv_state;
     std::unique_ptr<gemma4d::NativeHiddenState> last_hidden;
 };
 
@@ -247,6 +248,7 @@ bool parse_step_response(const std::string& line, Gemma4StepResult* out) {
         return false;
     }
     out->sequence_len = std::stoull(value);
+    out->active_kv_bytes = 0;
     out->native_last_hidden = nullptr;
     return true;
 }
@@ -548,6 +550,7 @@ Gemma4Status gemma4_kv_reset(Gemma4KvCache* cache) {
     }
 
     cache->native_tokens.clear();
+    cache->native_kv_state.reset();
     cache->last_hidden.reset();
     return ok();
 }
@@ -586,10 +589,11 @@ Gemma4Status gemma4_prefill(
         }
         cache->native_tokens.assign(tokens, tokens + token_count);
         std::string native_error;
-        if (!target->native_model->forward_greedy(
+        if (!target->native_model->prefill_incremental(
                 cache->native_tokens,
                 out,
                 &native_error,
+                &cache->native_kv_state,
                 &cache->last_hidden)) {
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
@@ -628,10 +632,14 @@ Gemma4Status gemma4_decode_one(
         if (target->native_model == nullptr) {
             return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 model state is missing");
         }
+        if (cache->native_kv_state == nullptr) {
+            return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 incremental decode requires a prior prefill");
+        }
         cache->native_tokens.push_back(token);
         std::string native_error;
-        if (!target->native_model->forward_greedy(
-                cache->native_tokens,
+        if (!target->native_model->decode_incremental(
+                token,
+                cache->native_kv_state.get(),
                 out,
                 &native_error,
                 &cache->last_hidden)) {
@@ -823,7 +831,6 @@ Gemma4Status gemma4_verify_tokens(
         }
 
         std::vector<int32_t> committed_tokens;
-        std::unique_ptr<gemma4d::NativeHiddenState> committed_hidden;
         std::string native_error;
         if (!target->native_model->verify_draft_block(
                 cache->native_tokens,
@@ -832,11 +839,27 @@ Gemma4Status gemma4_verify_tokens(
                 &committed_tokens,
                 out,
                 &native_error,
-                &committed_hidden)) {
+                nullptr)) {
             return fail(GEMMA4_ERR_RUNTIME, native_error);
         }
         cache->native_tokens = std::move(committed_tokens);
-        cache->last_hidden = std::move(committed_hidden);
+        std::unique_ptr<gemma4d::NativeKvState> rebuilt_kv_state;
+        std::unique_ptr<gemma4d::NativeHiddenState> rebuilt_hidden;
+        Gemma4StepResult rebuilt_step{};
+        if (!target->native_model->prefill_incremental(
+                cache->native_tokens,
+                &rebuilt_step,
+                &native_error,
+                &rebuilt_kv_state,
+                &rebuilt_hidden)) {
+            return fail(GEMMA4_ERR_RUNTIME, native_error);
+        }
+        cache->native_kv_state = std::move(rebuilt_kv_state);
+        cache->last_hidden = std::move(rebuilt_hidden);
+        out->active_kv_bytes = rebuilt_step.active_kv_bytes;
+        if (out->peak_memory_gb < rebuilt_step.peak_memory_gb) {
+            out->peak_memory_gb = rebuilt_step.peak_memory_gb;
+        }
         out->native_last_hidden = cache->last_hidden.get();
         target->sequence_len = out->sequence_len;
         return ok();

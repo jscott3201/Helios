@@ -37,6 +37,19 @@ struct NativeHiddenState::Impl {
     uint32_t hidden_size = 0;
 };
 
+struct NativeKvState::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    struct Layer {
+        bool full_attention = false;
+        std::optional<mlx::core::array> key;
+        std::optional<mlx::core::array> value;
+    };
+    std::vector<Layer> layers;
+#endif
+    uint64_t sequence_len = 0;
+    uint64_t active_bytes = 0;
+};
+
 struct NativeTextModel::Impl {
 #ifdef GEMMA4D_MLX_AVAILABLE
     std::unordered_map<std::string, mlx::core::array> tensors;
@@ -216,6 +229,47 @@ struct SharedKvArrays {
     std::optional<array> sliding_attention_value;
 };
 
+constexpr int kTargetLayerCount = 48;
+constexpr int kHiddenSize = 3840;
+constexpr int kSlidingWindowSize = 1024;
+constexpr uint64_t kBf16Bytes = 2;
+
+bool target_layer_full_attention(uint32_t layer_idx) {
+    return ((layer_idx + 1) % 6) == 0;
+}
+
+uint64_t estimate_target_kv_bytes(uint64_t sequence_len) {
+    const uint64_t full_layer_count = 8;
+    const uint64_t sliding_layer_count = kTargetLayerCount - full_layer_count;
+    const uint64_t sliding_len = std::min<uint64_t>(sequence_len, kSlidingWindowSize);
+    const uint64_t full_layer_bytes = sequence_len * 1 * 512 * kBf16Bytes * 2;
+    const uint64_t sliding_layer_bytes = sliding_len * 8 * 256 * kBf16Bytes * 2;
+    return full_layer_count * full_layer_bytes + sliding_layer_count * sliding_layer_bytes;
+}
+
+void store_target_layer_kv(
+    NativeKvState::Impl::Layer* layer,
+    bool full_attention,
+    const array& keys,
+    const array& values,
+    int sequence_len,
+    int n_kv_heads,
+    int head_dim) {
+    if (layer == nullptr) {
+        return;
+    }
+    layer->full_attention = full_attention;
+    if (full_attention || sequence_len <= kSlidingWindowSize) {
+        layer->key = keys;
+        layer->value = values;
+    } else {
+        const int start = sequence_len - kSlidingWindowSize;
+        layer->key = mlx::core::slice(keys, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
+        layer->value = mlx::core::slice(values, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
+    }
+    mlx::core::eval({*layer->key, *layer->value});
+}
+
 bool should_capture_shared_kv(uint32_t layer_idx, bool full_attention) {
     if (full_attention) {
         return layer_idx == 47;
@@ -253,8 +307,9 @@ array attention_forward(
     const array& x,
     uint32_t layer_idx,
     int sequence_len,
-    SharedKvArrays* shared_kv) {
-    const bool full_attention = ((layer_idx + 1) % 6) == 0;
+    SharedKvArrays* shared_kv,
+    NativeKvState::Impl::Layer* target_kv = nullptr) {
+    const bool full_attention = target_layer_full_attention(layer_idx);
     const int head_dim = full_attention ? 512 : 256;
     const int n_heads = 16;
     const int n_kv_heads = full_attention ? 1 : 8;
@@ -321,6 +376,7 @@ array attention_forward(
     }
     trace_head_stats("layer0.q_rope", queries, sequence_len, head_dim, trace_layer0);
     capture_shared_kv(shared_kv, layer_idx, full_attention, keys, values);
+    store_target_layer_kv(target_kv, full_attention, keys, values, sequence_len, n_kv_heads, head_dim);
 
     const std::optional<array> mask = full_attention ? std::nullopt : sliding_causal_mask(sequence_len, 1024);
     const std::string mask_mode = sequence_len == 1 || mask.has_value() ? "" : "causal";
@@ -353,7 +409,8 @@ array layer_forward(
     const array& x,
     uint32_t layer_idx,
     int sequence_len,
-    SharedKvArrays* shared_kv) {
+    SharedKvArrays* shared_kv,
+    NativeKvState::Impl::Layer* target_kv = nullptr) {
     const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
     const array residual = x;
     const bool trace_layer0 = layer_idx == 0 && trace_layer0_detail_enabled();
@@ -366,7 +423,7 @@ array layer_forward(
         dump_layer0_tensor("input_norm", h);
     }
     trace_feature_stats("layer0.input_norm", h, sequence_len, 3840, trace_layer0);
-    h = attention_forward(impl, h, layer_idx, sequence_len, shared_kv);
+    h = attention_forward(impl, h, layer_idx, sequence_len, shared_kv, target_kv);
     trace_feature_stats("layer0.attn_out", h, sequence_len, 3840, trace_layer0);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -422,6 +479,118 @@ array layer_forward(
     }
     trace_feature_stats("layer0.layer_scalar", h, sequence_len, 3840, trace_layer0);
     return h;
+}
+
+array target_attention_decode_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    uint64_t previous_sequence_len,
+    NativeKvState::Impl::Layer* target_kv,
+    SharedKvArrays* shared_kv) {
+    if (target_kv == nullptr || !target_kv->key.has_value() || !target_kv->value.has_value()) {
+        throw std::runtime_error("native incremental decode requires materialized per-layer KV state");
+    }
+    const bool full_attention = target_layer_full_attention(layer_idx);
+    const int head_dim = full_attention ? 512 : 256;
+    const int n_heads = 16;
+    const int n_kv_heads = full_attention ? 1 : 8;
+    const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
+
+    array queries = quantized_linear(impl, x, base + ".self_attn.q_proj");
+    queries = mlx::core::reshape(queries, {1, 1, n_heads, head_dim});
+    queries = model_dtype(mlx::core::fast::rms_norm(
+        queries,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.q_norm.weight")),
+        1e-6f));
+    queries = mlx::core::transpose(queries, {0, 2, 1, 3});
+    queries = apply_rope(queries, full_attention, head_dim, static_cast<int>(previous_sequence_len));
+
+    array keys = quantized_linear(impl, x, base + ".self_attn.k_proj");
+    keys = mlx::core::reshape(keys, {1, 1, n_kv_heads, head_dim});
+    array values = keys;
+    if (!full_attention) {
+        values = quantized_linear(impl, x, base + ".self_attn.v_proj");
+        values = mlx::core::reshape(values, {1, 1, n_kv_heads, head_dim});
+    }
+    keys = model_dtype(mlx::core::fast::rms_norm(
+        keys,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.k_norm.weight")),
+        1e-6f));
+    keys = mlx::core::transpose(keys, {0, 2, 1, 3});
+    keys = apply_rope(keys, full_attention, head_dim, static_cast<int>(previous_sequence_len));
+    values = model_dtype(mlx::core::fast::rms_norm(values, std::nullopt, 1e-6f));
+    values = mlx::core::transpose(values, {0, 2, 1, 3});
+
+    array cached_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
+    array cached_values = mlx::core::concatenate({*target_kv->value, values}, 2);
+    if (!full_attention) {
+        const uint64_t combined_len = std::min<uint64_t>(previous_sequence_len, kSlidingWindowSize) + 1;
+        if (combined_len > kSlidingWindowSize) {
+            cached_keys = mlx::core::slice(
+                cached_keys,
+                {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
+                {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+            cached_values = mlx::core::slice(
+                cached_values,
+                {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
+                {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+        }
+    }
+    target_kv->full_attention = full_attention;
+    target_kv->key = cached_keys;
+    target_kv->value = cached_values;
+    mlx::core::eval({*target_kv->key, *target_kv->value});
+    capture_shared_kv(shared_kv, layer_idx, full_attention, *target_kv->key, *target_kv->value);
+
+    array output = mlx::core::fast::scaled_dot_product_attention(
+        queries,
+        *target_kv->key,
+        *target_kv->value,
+        1.0f,
+        "",
+        std::nullopt);
+    output = mlx::core::transpose(output, {0, 2, 1, 3});
+    output = mlx::core::reshape(output, {1, 1, n_heads * head_dim});
+    return quantized_linear(impl, output, base + ".self_attn.o_proj");
+}
+
+array target_layer_decode_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    uint64_t previous_sequence_len,
+    NativeKvState::Impl::Layer* target_kv,
+    SharedKvArrays* shared_kv) {
+    const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
+    const array residual = x;
+
+    array h = model_dtype(mlx::core::fast::rms_norm(
+        x,
+        std::optional<array>(tensor_or_throw(impl, base + ".input_layernorm.weight")),
+        1e-6f));
+    h = target_attention_decode_forward(impl, h, layer_idx, previous_sequence_len, target_kv, shared_kv);
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(residual + h);
+
+    const array mlp_residual = h;
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".pre_feedforward_layernorm.weight")),
+        1e-6f));
+    array gate = quantized_linear(impl, h, base + ".mlp.gate_proj");
+    array up = quantized_linear(impl, h, base + ".mlp.up_proj");
+    h = model_dtype(geglu(gate, up));
+    h = quantized_linear(impl, h, base + ".mlp.down_proj");
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_feedforward_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(mlp_residual + h);
+    return model_dtype(h * tensor_or_throw(impl, base + ".layer_scalar"));
 }
 
 bool trace_layer_stats_enabled() {
@@ -553,7 +722,10 @@ struct NativeVerifyArrays {
     float peak_memory_gb = 0.0f;
 };
 
-NativeHiddenArrays forward_hidden(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
+NativeHiddenArrays forward_hidden(
+    const NativeTextModel::Impl& impl,
+    const std::vector<int32_t>& tokens,
+    NativeKvState::Impl* target_kv = nullptr) {
     if (tokens.empty()) {
         throw std::runtime_error("native forward requires at least one token");
     }
@@ -565,11 +737,22 @@ NativeHiddenArrays forward_hidden(const NativeTextModel::Impl& impl, const std::
     array token_ids(tokens.begin(), {1, sequence_len}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
+    if (target_kv != nullptr) {
+        target_kv->layers.clear();
+        target_kv->layers.reserve(kTargetLayerCount);
+        target_kv->sequence_len = 0;
+        target_kv->active_bytes = 0;
+    }
     dump_hidden_tensor("embed", h);
     trace_hidden_stats("embed", h, sequence_len);
 
-    for (uint32_t layer = 0; layer < 48; ++layer) {
-        h = layer_forward(impl, h, layer, sequence_len, &shared_kv);
+    for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
+        NativeKvState::Impl::Layer* layer_kv = nullptr;
+        if (target_kv != nullptr) {
+            target_kv->layers.emplace_back();
+            layer_kv = &target_kv->layers.back();
+        }
+        h = layer_forward(impl, h, layer, sequence_len, &shared_kv, layer_kv);
         const std::string label = "layer" + std::to_string(layer);
         dump_hidden_tensor(label.c_str(), h);
         trace_hidden_stats(label.c_str(), h, sequence_len);
@@ -580,6 +763,10 @@ NativeHiddenArrays forward_hidden(const NativeTextModel::Impl& impl, const std::
         1e-6f));
     dump_hidden_tensor("final_norm", h);
     trace_hidden_stats("final_norm", h, sequence_len);
+    if (target_kv != nullptr) {
+        target_kv->sequence_len = tokens.size();
+        target_kv->active_bytes = estimate_target_kv_bytes(tokens.size());
+    }
 
     return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
 }
@@ -607,6 +794,56 @@ NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const
     logits = mlx::core::reshape(logits, {262144});
     dump_hidden_tensor("logits", logits);
     return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(forward.shared_kv)};
+}
+
+NativeForwardArrays prefill_last_logits(
+    const NativeTextModel::Impl& impl,
+    const std::vector<int32_t>& tokens,
+    NativeKvState::Impl* target_kv) {
+    NativeHiddenArrays forward = forward_hidden(impl, tokens, target_kv);
+    const int sequence_len = static_cast<int>(tokens.size());
+    array last_hidden = mlx::core::slice(forward.hidden, {0, sequence_len - 1, 0}, {1, sequence_len, 3840});
+    array logits = target_logits_for_hidden(impl, last_hidden);
+    logits = mlx::core::reshape(logits, {262144});
+    dump_hidden_tensor("logits", logits);
+    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(forward.shared_kv)};
+}
+
+NativeForwardArrays decode_last_logits(
+    const NativeTextModel::Impl& impl,
+    int32_t token,
+    NativeKvState::Impl* target_kv) {
+    if (target_kv == nullptr || target_kv->sequence_len == 0 || target_kv->layers.size() != kTargetLayerCount) {
+        throw std::runtime_error("native incremental decode requires a populated target KV cache");
+    }
+    if (target_kv->sequence_len > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native incremental decode position exceeds MLX shape limits");
+    }
+
+    const uint64_t previous_sequence_len = target_kv->sequence_len;
+    std::vector<int32_t> ids = {token};
+    array token_ids(ids.begin(), {1, 1}, mlx::core::int32);
+    array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
+    SharedKvArrays shared_kv;
+
+    for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
+        h = target_layer_decode_forward(
+            impl,
+            h,
+            layer,
+            previous_sequence_len,
+            &target_kv->layers[layer],
+            &shared_kv);
+    }
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
+        1e-6f));
+    array logits = target_logits_for_hidden(impl, h);
+    logits = mlx::core::reshape(logits, {262144});
+    target_kv->sequence_len = previous_sequence_len + 1;
+    target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
+    return NativeForwardArrays{std::move(logits), std::move(h), std::move(shared_kv)};
 }
 
 NativeVerifyArrays forward_verify_logits(
@@ -855,6 +1092,32 @@ bool NativeHiddenState::has_shared_kv() const {
 #endif
 }
 
+NativeKvState::NativeKvState() : impl_(std::make_unique<Impl>()) {}
+
+NativeKvState::~NativeKvState() = default;
+
+NativeKvState::NativeKvState(NativeKvState&&) noexcept = default;
+
+NativeKvState& NativeKvState::operator=(NativeKvState&&) noexcept = default;
+
+void NativeKvState::clear() {
+    if (impl_ != nullptr) {
+#ifdef GEMMA4D_MLX_AVAILABLE
+        impl_->layers.clear();
+#endif
+        impl_->sequence_len = 0;
+        impl_->active_bytes = 0;
+    }
+}
+
+uint64_t NativeKvState::sequence_len() const {
+    return impl_ == nullptr ? 0 : impl_->sequence_len;
+}
+
+uint64_t NativeKvState::active_bytes() const {
+    return impl_ == nullptr ? 0 : impl_->active_bytes;
+}
+
 NativeTextModel::NativeTextModel() : impl_(std::make_unique<Impl>()) {}
 
 NativeTextModel::~NativeTextModel() = default;
@@ -1012,6 +1275,158 @@ bool NativeTextModel::forward_greedy(
         return false;
     } catch (...) {
         *error = "native Gemma 4 forward failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+bool NativeTextModel::prefill_incremental(
+    const std::vector<int32_t>& tokens,
+    Gemma4StepResult* out,
+    std::string* error,
+    std::unique_ptr<NativeKvState>* kv_state,
+    std::unique_ptr<NativeHiddenState>* last_hidden) const {
+    if (out == nullptr || error == nullptr || kv_state == nullptr) {
+        return false;
+    }
+    *out = Gemma4StepResult{};
+    error->clear();
+    kv_state->reset();
+    if (last_hidden != nullptr) {
+        last_hidden->reset();
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)tokens;
+    *error = "native Gemma 4 graph was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->language_tensor_count == 0) {
+            *error = "native Gemma 4 model state is not loaded";
+            return false;
+        }
+        if (tokens.empty()) {
+            *error = "native incremental prefill requires at least one token";
+            return false;
+        }
+        if (tokens.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            *error = "native incremental prefill token count exceeds MLX shape limits";
+            return false;
+        }
+
+        mlx::core::reset_peak_memory();
+        std::unique_ptr<NativeKvState> state(new NativeKvState());
+        NativeForwardArrays forward = prefill_last_logits(*impl_, tokens, state->impl_.get());
+        array logits = std::move(forward.logits);
+        array greedy = mlx::core::argmax(logits);
+        array max_logit = to_float32(mlx::core::max(logits));
+        mlx::core::eval({greedy, max_logit});
+        trace_parity_logits(tokens, logits);
+
+        std::unique_ptr<NativeHiddenState> hidden;
+        if (last_hidden != nullptr) {
+            std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
+                std::move(forward.last_hidden),
+                std::move(forward.shared_kv.full_attention_key),
+                std::move(forward.shared_kv.full_attention_value),
+                std::move(forward.shared_kv.sliding_attention_key),
+                std::move(forward.shared_kv.sliding_attention_value),
+                static_cast<uint64_t>(tokens.size()),
+                kHiddenSize,
+            });
+            hidden.reset(new NativeHiddenState(std::move(hidden_impl)));
+        }
+
+        out->greedy_token = greedy.item<int>();
+        out->greedy_logit = max_logit.item<float>();
+        out->sequence_len = tokens.size();
+        out->active_kv_bytes = state->active_bytes();
+        out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
+        out->peak_rss_mb = 0.0f;
+        out->native_last_hidden = hidden.get();
+        *kv_state = std::move(state);
+        if (last_hidden != nullptr) {
+            *last_hidden = std::move(hidden);
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native Gemma 4 incremental prefill failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native Gemma 4 incremental prefill failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+bool NativeTextModel::decode_incremental(
+    int32_t token,
+    NativeKvState* kv_state,
+    Gemma4StepResult* out,
+    std::string* error,
+    std::unique_ptr<NativeHiddenState>* last_hidden) const {
+    if (out == nullptr || error == nullptr || kv_state == nullptr) {
+        return false;
+    }
+    *out = Gemma4StepResult{};
+    error->clear();
+    if (last_hidden != nullptr) {
+        last_hidden->reset();
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)token;
+    *error = "native Gemma 4 graph was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->language_tensor_count == 0) {
+            *error = "native Gemma 4 model state is not loaded";
+            return false;
+        }
+        if (kv_state->impl_ == nullptr || kv_state->sequence_len() == 0) {
+            *error = "native incremental decode requires a prior native prefill";
+            return false;
+        }
+
+        mlx::core::reset_peak_memory();
+        NativeForwardArrays forward = decode_last_logits(*impl_, token, kv_state->impl_.get());
+        array logits = std::move(forward.logits);
+        array greedy = mlx::core::argmax(logits);
+        array max_logit = to_float32(mlx::core::max(logits));
+        mlx::core::eval({greedy, max_logit});
+
+        std::unique_ptr<NativeHiddenState> hidden;
+        if (last_hidden != nullptr) {
+            std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
+                std::move(forward.last_hidden),
+                std::move(forward.shared_kv.full_attention_key),
+                std::move(forward.shared_kv.full_attention_value),
+                std::move(forward.shared_kv.sliding_attention_key),
+                std::move(forward.shared_kv.sliding_attention_value),
+                kv_state->sequence_len(),
+                kHiddenSize,
+            });
+            hidden.reset(new NativeHiddenState(std::move(hidden_impl)));
+        }
+
+        out->greedy_token = greedy.item<int>();
+        out->greedy_logit = max_logit.item<float>();
+        out->sequence_len = kv_state->sequence_len();
+        out->active_kv_bytes = kv_state->active_bytes();
+        out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
+        out->peak_rss_mb = 0.0f;
+        out->native_last_hidden = hidden.get();
+        if (last_hidden != nullptr) {
+            *last_hidden = std::move(hidden);
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native Gemma 4 incremental decode failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native Gemma 4 incremental decode failed with an unknown exception";
         return false;
     }
 #endif

@@ -1156,6 +1156,7 @@ fn real_generation_metrics_json(summary: &GenerateSummary) -> serde_json::Value 
         "mlx_cache_memory_gb": null,
         "peak_memory_gb": summary.peak_memory_gb,
         "peak_rss_mb": summary.peak_rss_mb,
+        "active_kv_bytes": summary.active_kv_bytes,
     })
 }
 

@@ -45,6 +45,7 @@ pub struct GenerateSummary {
     pub decode_token_latencies: Vec<Duration>,
     pub peak_memory_gb: f32,
     pub peak_rss_mb: f32,
+    pub active_kv_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,6 +589,7 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
     let ttft = prefill;
     let mut peak_memory_gb = step.peak_memory_gb;
     let mut peak_rss_mb = step.peak_rss_mb;
+    let mut active_kv_bytes = step.active_kv_bytes;
 
     let mut generated_tokens = Vec::with_capacity(options.max_new_tokens);
     let mut generated_logits = Vec::with_capacity(options.max_new_tokens);
@@ -603,6 +605,7 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
             decode_token_latencies.push(token_started.elapsed());
             peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
             peak_rss_mb = peak_rss_mb.max(step.peak_rss_mb);
+            active_kv_bytes = active_kv_bytes.max(step.active_kv_bytes);
         }
     }
     let decode = decode_started.elapsed();
@@ -620,6 +623,7 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
         decode_token_latencies,
         peak_memory_gb,
         peak_rss_mb,
+        active_kv_bytes,
     })
 }
 
@@ -902,7 +906,7 @@ impl GenerateSummary {
 
     fn to_text(&self) -> String {
         format!(
-            "generated_tokens={:?} input_tokens={} model_load_ms={:.3} prefill_ms={:.3} ttft_ms={:.3} decode_ms={:.3} total_ms={:.3} decode_tps={:.3} peak_memory_gb={:.3} peak_rss_mb={:.1}",
+            "generated_tokens={:?} input_tokens={} model_load_ms={:.3} prefill_ms={:.3} ttft_ms={:.3} decode_ms={:.3} total_ms={:.3} decode_tps={:.3} peak_memory_gb={:.3} peak_rss_mb={:.1} active_kv_bytes={}",
             self.generated_tokens,
             self.input_tokens,
             self.model_load_ms(),
@@ -913,12 +917,13 @@ impl GenerateSummary {
             self.decode_tps(),
             self.peak_memory_gb,
             self.peak_rss_mb,
+            self.active_kv_bytes,
         )
     }
 
     fn to_json(&self) -> String {
         format!(
-            "{{\"input_tokens\":{},\"generated_tokens\":{:?},\"generated_logits\":{:?},\"model_load_ms\":{:.3},\"prefill_ms\":{:.3},\"ttft_ms\":{:.3},\"decode_ms\":{:.3},\"total_ms\":{:.3},\"decode_tps\":{:.3},\"decode_token_latencies_ms\":{},\"mlx_active_memory_gb\":null,\"mlx_cache_memory_gb\":null,\"peak_memory_gb\":{:.3},\"peak_rss_mb\":{:.1}}}",
+            "{{\"input_tokens\":{},\"generated_tokens\":{:?},\"generated_logits\":{:?},\"model_load_ms\":{:.3},\"prefill_ms\":{:.3},\"ttft_ms\":{:.3},\"decode_ms\":{:.3},\"total_ms\":{:.3},\"decode_tps\":{:.3},\"decode_token_latencies_ms\":{},\"mlx_active_memory_gb\":null,\"mlx_cache_memory_gb\":null,\"peak_memory_gb\":{:.3},\"peak_rss_mb\":{:.1},\"active_kv_bytes\":{}}}",
             self.input_tokens,
             self.generated_tokens,
             self.generated_logits,
@@ -931,6 +936,7 @@ impl GenerateSummary {
             self.decode_latency_ms_json(),
             self.peak_memory_gb,
             self.peak_rss_mb,
+            self.active_kv_bytes,
         )
     }
 }

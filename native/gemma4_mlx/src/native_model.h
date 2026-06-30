@@ -35,6 +35,28 @@ private:
     friend class NativeTextModel;
 };
 
+class NativeKvState {
+public:
+    struct Impl;
+
+    NativeKvState();
+    ~NativeKvState();
+
+    NativeKvState(const NativeKvState&) = delete;
+    NativeKvState& operator=(const NativeKvState&) = delete;
+    NativeKvState(NativeKvState&&) noexcept;
+    NativeKvState& operator=(NativeKvState&&) noexcept;
+
+    void clear();
+    uint64_t sequence_len() const;
+    uint64_t active_bytes() const;
+
+private:
+    std::unique_ptr<Impl> impl_;
+
+    friend class NativeTextModel;
+};
+
 class NativeTextModel {
 public:
     struct Impl;
@@ -58,6 +80,20 @@ public:
 
     bool forward_greedy(
         const std::vector<int32_t>& tokens,
+        Gemma4StepResult* out,
+        std::string* error,
+        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+
+    bool prefill_incremental(
+        const std::vector<int32_t>& tokens,
+        Gemma4StepResult* out,
+        std::string* error,
+        std::unique_ptr<NativeKvState>* kv_state,
+        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+
+    bool decode_incremental(
+        int32_t token,
+        NativeKvState* kv_state,
         Gemma4StepResult* out,
         std::string* error,
         std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
