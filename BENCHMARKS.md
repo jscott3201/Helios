@@ -35,6 +35,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P10 TUI live optimization console | Passed | `4ee1ccd` plus local P10 harness changes | `localhost_http_server_tui_provider_stub_backend` | `benchmarks/out/P10-tui-live-console/{tui-report.md,metrics.json,snapshots/}` | Command `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`; 18 snapshots, render p95 `1731 us` below `20000 us`, server health `ok`, latest benchmark report surfaced from the provider. |
 | 2026-06-30 | P11 model revision and manifest pinning | Passed | final SHA recorded in generated manifest | `manifest_capture_local_artifact_identity` | `benchmarks/out/P11-manifest-pinning/{manifest.json,report.md}` | Command `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; target and drafter revisions are explicitly pinned in `tiny16.toml` to local artifact SHA-256s because local revision metadata is unavailable. |
 | 2026-06-30 | XR00 real-context workload corpus | Passed | final SHA recorded in generated summary | `real_context_corpus_tokenizer_count_only` | `benchmarks/workloads/real-contexts/{workloads.jsonl,prompts/*.txt}` and `benchmarks/out/XR00-real-workload-corpus/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630`; no model execution or runtime optimization. |
+| 2026-06-30 | XR01 real-context A/B harness | Passed | final SHA recorded in generated summary | `real_context_ab_harness_dry_run_plus_helper_smoke` | `benchmarks/out/XR01-real-context-ab-harness/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2`; writes dry-run and real helper smoke records for the XR00 corpus schema, no runtime optimization. |
 
 ## P00 Baseline Snapshot
 
@@ -371,6 +372,27 @@ only generates prompts and token metadata; it does not run model inference.
 | Decision | `accept_candidate` |
 | Blockers | none recorded |
 
+## XR01 Real-Context A/B Harness Snapshot
+
+XR01 adds the reusable harness for running explicit baseline/candidate variants
+against the XR00 corpus. The final evidence accepts the harness schema and
+smoke command paths only; it is not a performance win claim.
+
+| Field | Value |
+|---|---|
+| Command | `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2` |
+| CI/offline dry-run command | `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode dry-run --out-dir benchmarks/out/XR01-real-context-ab-harness-dry-run --max-workloads 1 --max-new-tokens 2` |
+| Workload manifest | `benchmarks/workloads/real-contexts/workloads.jsonl` |
+| Evidence | `benchmarks/out/XR01-real-context-ab-harness/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Selected smoke workload | `chat_short_1k_001` |
+| Variants | `baseline` and `candidate`, both explicit `helper` backend configs with cache/MTP/adapter disabled |
+| Records | `4`: two dry-run records and two real model smoke records |
+| Required fields | p50/p95/p99 decode latency, prefill, total, peak memory, active KV bytes, output token IDs, and correctness gate status are present in every record |
+| Correctness | candidate output token IDs match baseline output token IDs for dry-run and real smoke records |
+| Model artifact | `artifacts/models/gemma-4-12B-it-4bit`, local artifact SHA-256 recorded in `summary.json` |
+| Decision | `accept_candidate` |
+| Blockers | none recorded |
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -397,6 +419,7 @@ only generates prompts and token metadata; it does not run model inference.
 | 2026-06-30 | Added P10 TUI live optimization console metrics, report writer, and benchmark harness. The TUI parses provider-only HTTP metrics for load/prefill/decode timing, throughput, memory, cache, MTP, adapters, server health, and latest benchmark report; the harness starts a localhost server and writes `tui-report.md`, `metrics.json`, and snapshots. | `crates/gemma4d-tui/src/{app.rs,provider.rs,ui.rs,lib.rs}`, `crates/gemma4d-tui/tests/m05_acceptance.rs`, `crates/gemma4d-bench/examples/p10_tui_live_console.rs`, `crates/gemma4d-bench/Cargo.toml` | `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench --example p10_tui_live_console -- --out-dir benchmarks/out/P10-tui-live-console`. |
 | 2026-06-30 | Added `gemma4d-bench manifest`, reusable manifest capture structs, SHA-256 model identity in generic benchmark reports, P00 local artifact identity fields, and config validation that accepts local-artifact pins while warning on `PIN_ME` or unavailable revisions. | `crates/gemma4d-bench/src/manifest.rs`, `crates/gemma4d-bench/src/lib.rs`, `crates/gemma4d-bench/examples/p00_performance_baseline.rs`, `crates/gemma4d-tui/src/config.rs`, `references/configs/tiny16.toml`, `references/templates/benchmark-report.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets --no-run`; `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; `make verify`. |
 | 2026-06-30 | Added XR00 real-context workload corpus generation: copied XR methodology docs/goal into root paths, added `gemma4d-bench workload-corpus`, generated deterministic prompt files and `workloads.jsonl`, and wrote XR00 decision/evidence artifacts. | `docs/xr-*.md`, `codex/goals/XR00-real-workload-corpus.goal.md`, `crates/gemma4d-bench/src/workload_corpus.rs`, `crates/gemma4d-bench/src/lib.rs`, `benchmarks/workloads/real-contexts/` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630`. |
+| 2026-06-30 | Added XR01 real-context A/B harness: reusable `xr_ab` report/evidence module, example runner, explicit baseline/candidate variant config, dry-run mode, failure-closed real-run mode, real helper smoke records, and XR01 decision artifacts. | `codex/goals/XR01-real-context-ab-harness.goal.md`, `crates/gemma4d-bench/src/xr_ab.rs`, `crates/gemma4d-bench/src/lib.rs`, `crates/gemma4d-bench/examples/xr01_real_context_ab.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode dry-run --out-dir benchmarks/out/XR01-real-context-ab-harness-dry-run --max-workloads 1 --max-new-tokens 2`; `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2`. |
 
 ## Verification Gates
 
@@ -446,6 +469,8 @@ only generates prompts and token metadata; it does not run model inference.
 | 2026-06-30 | `cargo test -p gemma4d-tui --all-targets` | Passed | Config validation coverage for local-artifact pins and `PIN_ME` warning behavior. |
 | 2026-06-30 | `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning` | Passed | Wrote manifest and report with target/drafter hashes, safetensor inventories, Rust/MLX/mlx-lm versions, git SHA, and machine summary. |
 | 2026-06-30 | `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630` | Passed | Wrote 13 workload records, prompt files, and XR00 evidence artifacts; local tokenizer measured exact 1K/4K/8K/16K/24K context lengths with no blockers. |
+| 2026-06-30 | `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode dry-run --out-dir benchmarks/out/XR01-real-context-ab-harness-dry-run --max-workloads 1 --max-new-tokens 2` | Passed | CI/offline smoke wrote dry-run records and decision artifacts without requiring the 12B model; decision is `needs_more_data` by design because no real model path is exercised. |
+| 2026-06-30 | `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2` | Passed | Wrote final XR01 records, summary, report, blocker report, and decision; includes dry-run and real helper smoke records with no blockers. |
 
 ## Current Claim Boundaries
 
@@ -513,3 +538,7 @@ only generates prompts and token metadata; it does not run model inference.
 - XR00 is a corpus and token-metadata claim only. It does not execute Gemma 4
   inference, measure latency, compare backends, enable MTP, enable cache
   policies, or optimize runtime code.
+- XR01 accepts the A/B harness shape and evidence schema only. The final smoke
+  run uses one 1K workload and helper-backed baseline/candidate configs, so it
+  does not claim a runtime speedup, native backend superiority, server
+  readiness, cache benefit, MTP benefit, or adapter behavior.

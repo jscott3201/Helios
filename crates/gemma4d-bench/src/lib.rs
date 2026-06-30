@@ -2,6 +2,7 @@
 
 pub mod manifest;
 pub mod workload_corpus;
+pub mod xr_ab;
 
 use std::{
     fs::{self, File},
