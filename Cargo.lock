@@ -641,7 +641,9 @@ dependencies = [
 name = "gemma4d-bench"
 version = "0.1.0"
 dependencies = [
+ "gemma4d-ffi",
  "gemma4d-server",
+ "gemma4d-tokenizer",
  "serde",
  "serde_json",
 ]

@@ -36,8 +36,12 @@ pub struct GenerateOptions {
 pub struct GenerateSummary {
     pub input_tokens: usize,
     pub generated_tokens: Vec<i32>,
+    pub model_load: Duration,
     pub ttft: Duration,
+    pub prefill: Duration,
     pub decode: Duration,
+    pub total: Duration,
+    pub decode_token_latencies: Vec<Duration>,
     pub peak_memory_gb: f32,
     pub peak_rss_mb: f32,
 }
@@ -517,6 +521,7 @@ where
 }
 
 pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
+    let total_started = Instant::now();
     let token_ids = if options.token_ids.is_empty() {
         let prompt = options
             .prompt
@@ -536,36 +541,47 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
         allow_unsupported_config: false,
     };
 
+    let model_load_started = Instant::now();
     let target = Target::load(&load_config)
         .map_err(|error| CliError::Runtime(format!("failed to load target model: {error}")))?;
+    let model_load = model_load_started.elapsed();
 
     let mut cache = KvCache::create(&KvPolicy::default())
         .map_err(|error| CliError::Runtime(format!("failed to create KV cache: {error}")))?;
-    let started = Instant::now();
+    let prefill_started = Instant::now();
     let mut step = ffi::prefill(&target, &mut cache, &token_ids)
         .map_err(|error| CliError::Runtime(format!("prefill failed: {error}")))?;
-    let ttft = started.elapsed();
+    let prefill = prefill_started.elapsed();
+    let ttft = prefill;
     let mut peak_memory_gb = step.peak_memory_gb;
     let mut peak_rss_mb = step.peak_rss_mb;
 
     let mut generated_tokens = Vec::with_capacity(options.max_new_tokens);
+    let mut decode_token_latencies = Vec::with_capacity(options.max_new_tokens.saturating_sub(1));
     let decode_started = Instant::now();
     for index in 0..options.max_new_tokens {
         generated_tokens.push(step.greedy_token);
         if index + 1 < options.max_new_tokens {
+            let token_started = Instant::now();
             step = ffi::decode_one(&target, &mut cache, step.greedy_token)
                 .map_err(|error| CliError::Runtime(format!("decode failed: {error}")))?;
+            decode_token_latencies.push(token_started.elapsed());
             peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
             peak_rss_mb = peak_rss_mb.max(step.peak_rss_mb);
         }
     }
     let decode = decode_started.elapsed();
+    let total = total_started.elapsed();
 
     Ok(GenerateSummary {
         input_tokens: token_ids.len(),
         generated_tokens,
+        model_load,
         ttft,
+        prefill,
         decode,
+        total,
+        decode_token_latencies,
         peak_memory_gb,
         peak_rss_mb,
     })
@@ -761,6 +777,26 @@ fn summary_to_text(label: &str, summary: &AdapterSummary) -> String {
 }
 
 impl GenerateSummary {
+    fn model_load_ms(&self) -> f64 {
+        self.model_load.as_secs_f64() * 1000.0
+    }
+
+    fn prefill_ms(&self) -> f64 {
+        self.prefill.as_secs_f64() * 1000.0
+    }
+
+    fn ttft_ms(&self) -> f64 {
+        self.ttft.as_secs_f64() * 1000.0
+    }
+
+    fn decode_ms(&self) -> f64 {
+        self.decode.as_secs_f64() * 1000.0
+    }
+
+    fn total_ms(&self) -> f64 {
+        self.total.as_secs_f64() * 1000.0
+    }
+
     fn decode_tps(&self) -> f64 {
         let decode_tokens = self.generated_tokens.len().saturating_sub(1);
         if decode_tokens == 0 || self.decode.is_zero() {
@@ -770,13 +806,25 @@ impl GenerateSummary {
         }
     }
 
+    fn decode_latency_ms_json(&self) -> String {
+        let values = self
+            .decode_token_latencies
+            .iter()
+            .map(|latency| format!("{:.3}", latency.as_secs_f64() * 1000.0))
+            .collect::<Vec<_>>();
+        format!("[{}]", values.join(","))
+    }
+
     fn to_text(&self) -> String {
         format!(
-            "generated_tokens={:?} input_tokens={} ttft_ms={:.3} decode_ms={:.3} decode_tps={:.3} peak_memory_gb={:.3} peak_rss_mb={:.1}",
+            "generated_tokens={:?} input_tokens={} model_load_ms={:.3} prefill_ms={:.3} ttft_ms={:.3} decode_ms={:.3} total_ms={:.3} decode_tps={:.3} peak_memory_gb={:.3} peak_rss_mb={:.1}",
             self.generated_tokens,
             self.input_tokens,
-            self.ttft.as_secs_f64() * 1000.0,
-            self.decode.as_secs_f64() * 1000.0,
+            self.model_load_ms(),
+            self.prefill_ms(),
+            self.ttft_ms(),
+            self.decode_ms(),
+            self.total_ms(),
             self.decode_tps(),
             self.peak_memory_gb,
             self.peak_rss_mb,
@@ -785,12 +833,16 @@ impl GenerateSummary {
 
     fn to_json(&self) -> String {
         format!(
-            "{{\"input_tokens\":{},\"generated_tokens\":{:?},\"ttft_ms\":{:.3},\"decode_ms\":{:.3},\"decode_tps\":{:.3},\"peak_memory_gb\":{:.3},\"peak_rss_mb\":{:.1}}}",
+            "{{\"input_tokens\":{},\"generated_tokens\":{:?},\"model_load_ms\":{:.3},\"prefill_ms\":{:.3},\"ttft_ms\":{:.3},\"decode_ms\":{:.3},\"total_ms\":{:.3},\"decode_tps\":{:.3},\"decode_token_latencies_ms\":{},\"mlx_active_memory_gb\":null,\"mlx_cache_memory_gb\":null,\"peak_memory_gb\":{:.3},\"peak_rss_mb\":{:.1}}}",
             self.input_tokens,
             self.generated_tokens,
-            self.ttft.as_secs_f64() * 1000.0,
-            self.decode.as_secs_f64() * 1000.0,
+            self.model_load_ms(),
+            self.prefill_ms(),
+            self.ttft_ms(),
+            self.decode_ms(),
+            self.total_ms(),
             self.decode_tps(),
+            self.decode_latency_ms_json(),
             self.peak_memory_gb,
             self.peak_rss_mb,
         )

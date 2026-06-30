@@ -10,6 +10,8 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
+gemma4d-ffi = { version = "0.1.0", path = "../gemma4d-ffi" }
+gemma4d-tokenizer = { version = "0.1.0", path = "../gemma4d-tokenizer" }
 gemma4d-server = { version = "0.1.0", path = "../gemma4d-server" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
