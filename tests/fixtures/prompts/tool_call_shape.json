@@ -1,0 +1,26 @@
+{
+  "name": "tool_call_shape",
+  "reference_source": "checked-in M02 fixture tokenizer v1 token IDs",
+  "template": {
+    "template_version": "gemma4d-fixture-chat-v1",
+    "add_generation_prompt": false,
+    "thinking_mode": "disabled"
+  },
+  "messages": [
+    {
+      "role": "system",
+      "content": "Return JSON shape."
+    },
+    {
+      "role": "user",
+      "content": "tool_call"
+    },
+    {
+      "role": "assistant",
+      "content": "{\"name\":\"search\",\"arguments\":{\"query\":\"Gemma cache\"}}"
+    }
+  ],
+  "expected_prompt": "<bos><start_of_turn>system\nReturn JSON shape.<end_of_turn>\n<start_of_turn>user\ntool_call<end_of_turn>\n<start_of_turn>assistant\n{\"name\":\"search\",\"arguments\":{\"query\":\"Gemma cache\"}}<end_of_turn>\n",
+  "expected_token_ids": [1, 3, 5, 9, 49, 50, 51, 24, 4, 9, 3, 6, 9, 47, 4, 9, 3, 7, 9, 48, 4, 9],
+  "expected_stop_tokens": ["<eos>", "<end_of_turn>"]
+}

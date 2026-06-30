@@ -1,0 +1,16 @@
+{
+  "architecture": "Gemma4UnifiedForConditionalGeneration",
+  "architectures": [
+    "Gemma4UnifiedForConditionalGeneration"
+  ],
+  "model_type": "gemma4",
+  "num_hidden_layers": 48,
+  "sliding_window": 1024,
+  "max_position_embeddings": 262144,
+  "vocab_size": 262144,
+  "attention_pattern": [
+    "local",
+    "global"
+  ],
+  "global_layers_have_unified_kv": true
+}

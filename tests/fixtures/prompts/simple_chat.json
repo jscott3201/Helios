@@ -1,0 +1,18 @@
+{
+  "name": "simple_chat",
+  "reference_source": "checked-in M02 fixture tokenizer v1 token IDs",
+  "template": {
+    "template_version": "gemma4d-fixture-chat-v1",
+    "add_generation_prompt": true,
+    "thinking_mode": "disabled"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello"
+    }
+  ],
+  "expected_prompt": "<bos><start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>assistant\n",
+  "expected_token_ids": [1, 3, 6, 9, 20, 4, 9, 3, 7, 9],
+  "expected_stop_tokens": ["<eos>", "<end_of_turn>"]
+}

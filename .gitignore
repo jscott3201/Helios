@@ -12,5 +12,7 @@ benchmarks/out/*
 !benchmarks/out/M00/.gitkeep
 !benchmarks/out/M01/
 !benchmarks/out/M01/.gitkeep
+!benchmarks/out/M02/
+!benchmarks/out/M02/.gitkeep
 artifacts/*
 !artifacts/.gitkeep
