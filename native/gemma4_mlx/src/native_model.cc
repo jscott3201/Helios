@@ -1515,6 +1515,11 @@ bool NativeTextModel::verify_draft_block(
             }
             *committed_tokens = std::move(fallback_tokens);
             *out = fallback_step;
+            out->accepted_draft_count = static_cast<uint32_t>(accepted_count);
+            out->committed_count = static_cast<uint32_t>(committed_tokens->size() - context_tokens.size());
+            for (size_t index = 0; index < out->committed_count && index < 4; ++index) {
+                out->committed_tokens[index] = (*committed_tokens)[context_tokens.size() + index];
+            }
             if (last_hidden != nullptr) {
                 *last_hidden = std::move(fallback_hidden);
                 out->native_last_hidden = last_hidden->get();
@@ -1542,6 +1547,11 @@ bool NativeTextModel::verify_draft_block(
         out->sequence_len = committed_tokens->size();
         out->peak_memory_gb = verified.peak_memory_gb;
         out->peak_rss_mb = 0.0f;
+        out->accepted_draft_count = static_cast<uint32_t>(draft_count);
+        out->committed_count = static_cast<uint32_t>(draft_count);
+        for (size_t index = 0; index < draft_count && index < 4; ++index) {
+            out->committed_tokens[index] = draft_tokens[index];
+        }
         out->native_last_hidden = hidden.get();
         if (last_hidden != nullptr) {
             *last_hidden = std::move(hidden);

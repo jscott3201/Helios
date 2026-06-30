@@ -69,6 +69,9 @@ typedef struct Gemma4StepResult {
     float peak_rss_mb;
     uint64_t sequence_len;
     uint64_t active_kv_bytes;
+    uint32_t accepted_draft_count;
+    uint32_t committed_count;
+    int32_t committed_tokens[4];
     /* Opaque view owned by the KV cache; valid until cache reset/free or next cache-advancing call. */
     void* native_last_hidden;
 } Gemma4StepResult;

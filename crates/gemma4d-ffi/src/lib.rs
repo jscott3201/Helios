@@ -77,6 +77,9 @@ mod raw {
         pub peak_rss_mb: f32,
         pub sequence_len: u64,
         pub active_kv_bytes: u64,
+        pub accepted_draft_count: u32,
+        pub committed_count: u32,
+        pub committed_tokens: [i32; 4],
         pub native_last_hidden: *mut std::ffi::c_void,
     }
 
@@ -429,7 +432,17 @@ pub struct StepResult {
     pub peak_rss_mb: f32,
     pub sequence_len: u64,
     pub active_kv_bytes: u64,
+    pub accepted_draft_count: u32,
+    pub committed_count: u32,
+    pub committed_tokens: [i32; 4],
     pub native_last_hidden: Option<NativeLastHiddenView>,
+}
+
+impl StepResult {
+    pub fn committed_tokens(&self) -> &[i32] {
+        &self.committed_tokens
+            [..self.committed_count.min(self.committed_tokens.len() as u32) as usize]
+    }
 }
 
 impl From<raw::Gemma4StepResult> for StepResult {
@@ -441,6 +454,11 @@ impl From<raw::Gemma4StepResult> for StepResult {
             peak_rss_mb: value.peak_rss_mb,
             sequence_len: value.sequence_len,
             active_kv_bytes: value.active_kv_bytes,
+            accepted_draft_count: value.accepted_draft_count,
+            committed_count: value
+                .committed_count
+                .min(value.committed_tokens.len() as u32),
+            committed_tokens: value.committed_tokens,
             native_last_hidden: NonNull::new(value.native_last_hidden)
                 .map(|ptr| NativeLastHiddenView { ptr }),
         }
@@ -722,6 +740,14 @@ mod tests {
         .expect("native verify should accept matching block-size-2 draft");
         assert_eq!(verify_accept.sequence_len, 3);
         assert_eq!(verify_accept.greedy_token, baseline_third.greedy_token);
+        assert_eq!(verify_accept.accepted_draft_count, 2);
+        assert_eq!(
+            verify_accept.committed_tokens(),
+            &[
+                verify_accept_first.greedy_token,
+                baseline_second.greedy_token
+            ]
+        );
         assert!(verify_accept.native_last_hidden.is_some());
 
         let rejected_token = if baseline_first.greedy_token == 0 {
@@ -737,6 +763,11 @@ mod tests {
             .expect("native verify should rollback a rejected draft token");
         assert_eq!(verify_reject.sequence_len, 2);
         assert_eq!(verify_reject.greedy_token, baseline_second.greedy_token);
+        assert_eq!(verify_reject.accepted_draft_count, 0);
+        assert_eq!(
+            verify_reject.committed_tokens(),
+            &[baseline_first.greedy_token]
+        );
         assert!(verify_reject.native_last_hidden.is_some());
         let reject_follow_up = decode_one(
             &target,
