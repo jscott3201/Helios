@@ -34,6 +34,7 @@
 namespace {
 
 constexpr uint64_t kTargetMagic = 0x47454d3444415447ULL;
+constexpr uint64_t kDrafterMagic = 0x47454d3444524146ULL;
 constexpr uint64_t kKvCacheMagic = 0x47454d344b564347ULL;
 thread_local char g_last_error[512] = "";
 
@@ -61,6 +62,12 @@ struct NativeKvCache {
     uint64_t magic;
     Gemma4KvPolicy policy;
     std::vector<int32_t> native_tokens;
+};
+
+struct NativeDrafter {
+    uint64_t magic;
+    bool model_loaded;
+    std::string model_path;
 };
 
 void store_error(const char* message) {
@@ -383,7 +390,7 @@ Gemma4Status helper_command(NativeTarget* target, const std::string& command, Ge
 
 struct Gemma4Target : NativeTarget {};
 struct Gemma4KvCache : NativeKvCache {};
-struct Gemma4Drafter {};
+struct Gemma4Drafter : NativeDrafter {};
 struct Gemma4Adapter {};
 
 Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
@@ -622,4 +629,143 @@ Gemma4Status gemma4_decode_one(
     std::ostringstream command;
     command << "{\"cmd\":\"decode_one\",\"token\":" << token << "}";
     return helper_command(target, command.str(), out);
+}
+
+Gemma4Status gemma4_load_drafter(
+    const Gemma4LoadConfig* config,
+    Gemma4Target* target,
+    Gemma4Drafter** out) {
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_drafter requires a non-null out pointer");
+    }
+    *out = nullptr;
+
+    if (config == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_drafter requires a non-null config");
+    }
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_drafter requires a valid target handle");
+    }
+    if (is_empty(config->model_path)) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_drafter requires a non-empty model_path");
+    }
+
+    Gemma4Drafter* drafter = new (std::nothrow) Gemma4Drafter{};
+    if (drafter == nullptr) {
+        return fail(GEMMA4_ERR_RUNTIME, "gemma4_load_drafter could not allocate drafter handle");
+    }
+
+    drafter->magic = kDrafterMagic;
+    drafter->model_loaded = false;
+    drafter->model_path = config->model_path;
+
+    if (!config->allow_unsupported_config) {
+        delete drafter;
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "Gemma 4 MTP assistant execution is not implemented in the native backend; MTP must auto-disable");
+    }
+
+    *out = drafter;
+    return ok();
+}
+
+Gemma4Status gemma4_free_drafter(Gemma4Drafter* drafter) {
+    if (drafter == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_free_drafter requires a non-null drafter");
+    }
+    if (drafter->magic != kDrafterMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_free_drafter received an invalid drafter handle");
+    }
+
+    drafter->magic = 0;
+    delete drafter;
+    return ok();
+}
+
+Gemma4Status gemma4_mtp_draft_block(
+    Gemma4Drafter* drafter,
+    Gemma4KvCache* cache,
+    uint32_t block_size,
+    int32_t* out_tokens,
+    size_t* inout_count) {
+    if (drafter == nullptr || drafter->magic != kDrafterMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires a valid drafter handle");
+    }
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires a valid cache handle");
+    }
+    if (out_tokens == nullptr || inout_count == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires token output buffers");
+    }
+    if (block_size == 0) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires block_size > 0");
+    }
+    if (*inout_count < block_size) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block output buffer is smaller than block_size");
+    }
+    if (!drafter->model_loaded) {
+        *inout_count = 0;
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_mtp_draft_block requires a loaded Gemma 4 MTP assistant; smoke handles do not draft");
+    }
+
+    (void)cache;
+    (void)out_tokens;
+    *inout_count = 0;
+    return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, "native MTP drafter execution is not implemented");
+}
+
+Gemma4Status gemma4_verify_tokens(
+    Gemma4Target* target,
+    Gemma4KvCache* cache,
+    const int32_t* draft_tokens,
+    size_t draft_count,
+    Gemma4StepResult* out) {
+    clear_step_result(out);
+
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_verify_tokens requires a valid target handle");
+    }
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_verify_tokens requires a valid cache handle");
+    }
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_verify_tokens requires a non-null step result");
+    }
+    if (draft_count > 0 && draft_tokens == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_verify_tokens requires draft tokens when draft_count > 0");
+    }
+    if (draft_count == 0) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_verify_tokens requires at least one draft token");
+    }
+    if (!target->model_loaded) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_verify_tokens requires a loaded Gemma 4 target model; smoke handles do not execute");
+    }
+    if (target->use_native_graph) {
+        if (target->native_model == nullptr) {
+            return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 model state is missing");
+        }
+        cache->native_tokens.insert(cache->native_tokens.end(), draft_tokens, draft_tokens + draft_count);
+        std::string native_error;
+        if (!target->native_model->forward_greedy(cache->native_tokens, out, &native_error)) {
+            return fail(GEMMA4_ERR_RUNTIME, native_error);
+        }
+        target->sequence_len = out->sequence_len;
+        return ok();
+    }
+
+    Gemma4Status status = GEMMA4_OK;
+    for (size_t index = 0; index < draft_count; ++index) {
+        std::ostringstream command;
+        command << "{\"cmd\":\"decode_one\",\"token\":" << draft_tokens[index] << "}";
+        status = helper_command(target, command.str(), out);
+        if (status != GEMMA4_OK) {
+            return status;
+        }
+    }
+    return ok();
 }

@@ -28,6 +28,11 @@ mod raw {
     }
 
     #[repr(C)]
+    pub struct Gemma4Drafter {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
     pub struct Gemma4KvCache {
         _private: [u8; 0],
     }
@@ -99,6 +104,26 @@ mod raw {
             target: *mut Gemma4Target,
             cache: *mut Gemma4KvCache,
             token: i32,
+            out: *mut Gemma4StepResult,
+        ) -> Gemma4Status;
+        pub fn gemma4_load_drafter(
+            config: *const Gemma4LoadConfig,
+            target: *mut Gemma4Target,
+            out: *mut *mut Gemma4Drafter,
+        ) -> Gemma4Status;
+        pub fn gemma4_free_drafter(drafter: *mut Gemma4Drafter) -> Gemma4Status;
+        pub fn gemma4_mtp_draft_block(
+            drafter: *mut Gemma4Drafter,
+            cache: *mut Gemma4KvCache,
+            block_size: u32,
+            out_tokens: *mut i32,
+            inout_count: *mut usize,
+        ) -> Gemma4Status;
+        pub fn gemma4_verify_tokens(
+            target: *mut Gemma4Target,
+            cache: *mut Gemma4KvCache,
+            draft_tokens: *const i32,
+            draft_count: usize,
             out: *mut Gemma4StepResult,
         ) -> Gemma4Status;
     }
@@ -293,6 +318,46 @@ impl Drop for Target {
 }
 
 #[derive(Debug)]
+pub struct Drafter {
+    ptr: NonNull<raw::Gemma4Drafter>,
+}
+
+impl Drafter {
+    pub fn load(config: &LoadConfig, target: &Target) -> Result<Self> {
+        let model_path = CString::new(config.model_path.as_str())?;
+        let model_id = optional_cstring(config.model_id.as_deref())?;
+        let model_revision = optional_cstring(config.model_revision.as_deref())?;
+        let expected_architecture = optional_cstring(config.expected_architecture.as_deref())?;
+
+        let raw_config = raw::Gemma4LoadConfig {
+            model_path: model_path.as_ptr(),
+            model_id: optional_ptr(&model_id),
+            model_revision: optional_ptr(&model_revision),
+            expected_architecture: optional_ptr(&expected_architecture),
+            max_context_tokens: config.max_context_tokens.get(),
+            allow_unsupported_config: config.allow_unsupported_config,
+        };
+
+        let mut out = ptr::null_mut();
+        // SAFETY: `raw_config` C strings live through the call; `target` is a valid handle; `out` is writable.
+        check(unsafe { raw::gemma4_load_drafter(&raw_config, target.ptr.as_ptr(), &mut out) })?;
+        let ptr = NonNull::new(out).ok_or_else(|| Error {
+            status: Status::Runtime,
+            message: "gemma4_load_drafter returned OK with a null drafter".to_owned(),
+        })?;
+        Ok(Self { ptr })
+    }
+}
+
+impl Drop for Drafter {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is an owned drafter handle returned by `gemma4_load_drafter`.
+        let status = unsafe { raw::gemma4_free_drafter(self.ptr.as_ptr()) };
+        debug_assert_eq!(Status::from_raw(status), Status::Ok);
+    }
+}
+
+#[derive(Debug)]
 pub struct KvCache {
     ptr: NonNull<raw::Gemma4KvCache>,
 }
@@ -336,12 +401,24 @@ impl Drop for KvCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NativeLastHiddenView {
+    ptr: NonNull<std::ffi::c_void>,
+}
+
+impl NativeLastHiddenView {
+    pub fn as_ptr(self) -> *mut std::ffi::c_void {
+        self.ptr.as_ptr()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepResult {
     pub greedy_token: i32,
     pub greedy_logit: f32,
     pub peak_memory_gb: f32,
     pub peak_rss_mb: f32,
     pub sequence_len: u64,
+    pub native_last_hidden: Option<NativeLastHiddenView>,
 }
 
 impl From<raw::Gemma4StepResult> for StepResult {
@@ -352,6 +429,8 @@ impl From<raw::Gemma4StepResult> for StepResult {
             peak_memory_gb: value.peak_memory_gb,
             peak_rss_mb: value.peak_rss_mb,
             sequence_len: value.sequence_len,
+            native_last_hidden: NonNull::new(value.native_last_hidden)
+                .map(|ptr| NativeLastHiddenView { ptr }),
         }
     }
 }
@@ -383,6 +462,53 @@ pub fn decode_one(target: &Target, cache: &mut KvCache, token: i32) -> Result<St
     // SAFETY: handles come from safe wrappers and `out` is writable for the duration of the call.
     check(unsafe {
         raw::gemma4_decode_one(target.ptr.as_ptr(), cache.ptr.as_ptr(), token, &mut out)
+    })?;
+
+    Ok(out.into())
+}
+
+pub fn draft_block(
+    drafter: &Drafter,
+    cache: &mut KvCache,
+    block_size: NonZeroU32,
+) -> Result<Vec<i32>> {
+    let mut tokens = vec![0; usize::try_from(block_size.get()).expect("u32 fits usize")];
+    let mut count = tokens.len();
+    // SAFETY: handles come from safe wrappers; `tokens` is writable and `count` starts at capacity.
+    check(unsafe {
+        raw::gemma4_mtp_draft_block(
+            drafter.ptr.as_ptr(),
+            cache.ptr.as_ptr(),
+            block_size.get(),
+            tokens.as_mut_ptr(),
+            &mut count,
+        )
+    })?;
+    tokens.truncate(count);
+    Ok(tokens)
+}
+
+pub fn verify_tokens(
+    target: &Target,
+    cache: &mut KvCache,
+    draft_tokens: &[i32],
+) -> Result<StepResult> {
+    let mut out = raw::Gemma4StepResult::default();
+    let token_ptr = if draft_tokens.is_empty() {
+        ptr::null()
+    } else {
+        draft_tokens.as_ptr()
+    };
+
+    // SAFETY: handles come from safe wrappers; token pointer/count describe `draft_tokens`; `out` is writable.
+    check(unsafe {
+        raw::gemma4_verify_tokens(
+            target.ptr.as_ptr(),
+            cache.ptr.as_ptr(),
+            token_ptr,
+            draft_tokens.len(),
+            &mut out,
+        )
     })?;
 
     Ok(out.into())
@@ -456,6 +582,9 @@ mod tests {
         let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
         let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
         cache.reset().expect("kv reset");
+        let drafter = Drafter::load(&LoadConfig::smoke("/tmp/gemma4d-smoke-drafter"), &target)
+            .expect("drafter handle");
+        drop(drafter);
         drop(cache);
         drop(target);
     }
@@ -571,5 +700,82 @@ mod tests {
         let status = unsafe { raw::gemma4_kv_create(ptr::null(), ptr::null_mut()) };
         assert_eq!(Status::from_raw(status), Status::InvalidArgument);
         assert!(last_error_message().contains("kv_create"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status =
+            unsafe { raw::gemma4_load_drafter(ptr::null(), ptr::null_mut(), ptr::null_mut()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("load_drafter"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe { raw::gemma4_free_drafter(ptr::null_mut()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("free_drafter"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe {
+            raw::gemma4_mtp_draft_block(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("mtp_draft_block"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe {
+            raw::gemma4_verify_tokens(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("verify_tokens"));
+    }
+
+    #[test]
+    fn drafter_strict_load_auto_disable_evidence() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let config = LoadConfig {
+            model_path: "/tmp/gemma4d-missing-drafter".to_owned(),
+            model_id: Some("mlx-community/gemma-4-12B-it-qat-assistant-4bit".to_owned()),
+            model_revision: None,
+            expected_architecture: Some("gemma4".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let err = Drafter::load(&config, &target).expect_err("M06 drafter must fail closed");
+        assert_eq!(err.status(), Status::UnsupportedConfig);
+        assert!(err.message().contains("MTP assistant execution"));
+    }
+
+    #[test]
+    fn smoke_drafter_draft_block_is_unsupported() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let drafter = Drafter::load(&LoadConfig::smoke("/tmp/gemma4d-smoke-drafter"), &target)
+            .expect("drafter handle");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+
+        let err = draft_block(&drafter, &mut cache, NonZeroU32::new(2).expect("non-zero"))
+            .expect_err("smoke drafter does not execute");
+        assert_eq!(err.status(), Status::UnsupportedConfig);
+        assert!(err.message().contains("loaded Gemma 4 MTP assistant"));
+    }
+
+    #[test]
+    fn verify_tokens_rejects_empty_draft() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+
+        let err = verify_tokens(&target, &mut cache, &[]).expect_err("empty verify should fail");
+        assert_eq!(err.status(), Status::InvalidArgument);
+        assert!(err.message().contains("at least one draft token"));
     }
 }

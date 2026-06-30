@@ -145,6 +145,7 @@ pub fn run_interactive(
                     &mut state,
                     Action::DashboardUpdated(provider.dashboard_snapshot()),
                 );
+                reduce(&mut state, Action::MtpUpdated(provider.mtp_snapshot()));
                 for event in provider.backend_events() {
                     reduce(&mut state, Action::BackendEvent(event));
                 }
@@ -181,6 +182,7 @@ pub fn dispatch_action(
                 state,
                 Action::DashboardUpdated(provider.dashboard_snapshot()),
             );
+            reduce(state, Action::MtpUpdated(provider.mtp_snapshot()));
             for event in provider.backend_events() {
                 reduce(state, Action::BackendEvent(event));
             }

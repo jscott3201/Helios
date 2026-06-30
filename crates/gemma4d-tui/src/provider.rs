@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     app::{
-        BackendEvent, BenchmarkRecord, BenchmarkStatus, DashboardSnapshot, LogEntry, ProviderKind,
+        BackendEvent, BenchmarkRecord, BenchmarkStatus, DashboardSnapshot, LogEntry, MtpSnapshot,
+        ProviderKind,
     },
     config::{ConfigValidation, validate_config_path},
 };
@@ -10,6 +11,7 @@ use crate::{
 pub trait RuntimeProvider {
     fn name(&self) -> String;
     fn dashboard_snapshot(&mut self) -> DashboardSnapshot;
+    fn mtp_snapshot(&mut self) -> MtpSnapshot;
     fn backend_events(&mut self) -> Vec<BackendEvent>;
     fn validate_config(&mut self, path: &Path) -> ConfigValidation;
     fn start_benchmark(&mut self, out_dir: &Path) -> BenchmarkRecord;
@@ -55,7 +57,12 @@ impl RuntimeProvider for MockProvider {
             BackendEvent::Log(LogEntry::info(
                 "dashboard metrics are deterministic mock values",
             )),
+            BackendEvent::Mtp(self.mtp_snapshot()),
         ]
+    }
+
+    fn mtp_snapshot(&mut self) -> MtpSnapshot {
+        MtpSnapshot::mock_m06()
     }
 
     fn validate_config(&mut self, path: &Path) -> ConfigValidation {
@@ -123,6 +130,10 @@ impl RuntimeProvider for FileProvider {
                 "runtime daemon absent; Chat/Cache/Adapters/MTP pages remain disabled",
             )),
         ]
+    }
+
+    fn mtp_snapshot(&mut self) -> MtpSnapshot {
+        MtpSnapshot::disabled("file provider has no M06 MTP metrics report loaded")
     }
 
     fn validate_config(&mut self, path: &Path) -> ConfigValidation {

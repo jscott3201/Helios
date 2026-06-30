@@ -66,9 +66,10 @@ fn render_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         PageId::Dashboard => render_dashboard(frame, area, state),
         PageId::Config => render_config(frame, area, state),
         PageId::Benchmarks => render_benchmarks(frame, area, state),
+        PageId::Mtp => render_mtp(frame, area, state),
         PageId::Logs => render_logs(frame, area, state),
         PageId::Help => render_help(frame, area),
-        PageId::Chat | PageId::Cache | PageId::Adapters | PageId::Mtp => {
+        PageId::Chat | PageId::Cache | PageId::Adapters => {
             render_placeholder(frame, area, state.current_page)
         }
     }
@@ -78,7 +79,7 @@ fn render_dashboard(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Length(3),
             Constraint::Min(0),
         ])
@@ -109,6 +110,16 @@ fn render_dashboard(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Line::from(vec![
             Span::styled("Task ", Style::default().fg(Color::Gray)),
             Span::raw(snapshot.active_task.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("MTP ", Style::default().fg(Color::Gray)),
+            Span::raw(format!(
+                "{} | block {} | accept {:.1}% | rollbacks {}",
+                state.mtp.status.label(),
+                state.mtp.draft_block_size,
+                state.mtp.acceptance_rate * 100.0,
+                state.mtp.rollback_count
+            )),
         ]),
     ];
     frame.render_widget(
@@ -239,6 +250,59 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .collect::<Vec<_>>();
     frame.render_widget(
         List::new(items).block(Block::default().borders(Borders::ALL).title("Logs")),
+        area,
+    );
+}
+
+fn render_mtp(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let mtp = &state.mtp;
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Status ", Style::default().fg(Color::Gray)),
+            Span::raw(mtp.status.label()),
+        ]),
+        Line::from(vec![
+            Span::styled("Target ", Style::default().fg(Color::Gray)),
+            Span::raw(mtp.target.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Drafter ", Style::default().fg(Color::Gray)),
+            Span::raw(mtp.drafter.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Compatibility ", Style::default().fg(Color::Gray)),
+            Span::raw(mtp.compatibility.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Exactness ", Style::default().fg(Color::Gray)),
+            Span::raw(mtp.exactness.clone()),
+        ]),
+        Line::from(format!(
+            "Draft block size {} | attempted {} | accepted {}",
+            mtp.draft_block_size, mtp.attempted_draft_tokens, mtp.accepted_draft_tokens
+        )),
+        Line::from(format!(
+            "Acceptance rate {:.1}% | accepted/verify {:.2} | verify passes {}",
+            mtp.acceptance_rate * 100.0,
+            mtp.accepted_tokens_per_verify,
+            mtp.target_verify_passes
+        )),
+        Line::from(format!("Rollbacks {}", mtp.rollback_count)),
+        Line::from(format!(
+            "Auto-disable reason {}",
+            mtp.auto_disable_reason.as_deref().unwrap_or("none")
+        )),
+        Line::from(format!(
+            "Failing fixture {}",
+            mtp.failing_fixture.as_deref().unwrap_or("none")
+        )),
+        Line::from(format!("Adapter state {}", mtp.adapter_state)),
+        Line::from(format!("Active KV {}", mtp.active_kv_mode)),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("MTP"))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }

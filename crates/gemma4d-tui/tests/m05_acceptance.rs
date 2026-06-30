@@ -143,13 +143,29 @@ fn disabled_feature_pages_render_dependency_messages() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
     let base = seed_state(&mut provider, config_path);
 
-    for page in [PageId::Chat, PageId::Cache, PageId::Adapters, PageId::Mtp] {
+    for page in [PageId::Chat, PageId::Cache, PageId::Adapters] {
         let mut state = base.clone();
         reduce(&mut state, Action::Navigate(page));
         let snapshot = render_snapshot(&state, 80, 24).unwrap();
         assert!(snapshot.contains("Disabled until"));
         assert!(snapshot.contains(page.title()));
     }
+}
+
+#[test]
+fn mtp_page_renders_acceptance_rollback_and_auto_disable_status() {
+    let mut provider = MockProvider::default();
+    let config_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
+    let mut state = seed_state(&mut provider, config_path);
+    reduce(&mut state, Action::Navigate(PageId::Mtp));
+
+    let snapshot = render_snapshot(&state, 80, 24).unwrap();
+    assert!(snapshot.contains("MTP"));
+    assert!(snapshot.contains("auto-disabled"));
+    assert!(snapshot.contains("Acceptance rate"));
+    assert!(snapshot.contains("Rollbacks"));
+    assert!(snapshot.contains("Auto-disable reason"));
 }
 
 #[test]

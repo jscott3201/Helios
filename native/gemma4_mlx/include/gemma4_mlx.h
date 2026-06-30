@@ -94,6 +94,24 @@ Gemma4Status gemma4_decode_one(
     int32_t token,
     Gemma4StepResult* out);
 
+Gemma4Status gemma4_load_drafter(
+    const Gemma4LoadConfig* config,
+    Gemma4Target* target,
+    Gemma4Drafter** out);
+Gemma4Status gemma4_free_drafter(Gemma4Drafter* drafter);
+Gemma4Status gemma4_mtp_draft_block(
+    Gemma4Drafter* drafter,
+    Gemma4KvCache* cache,
+    uint32_t block_size,
+    int32_t* out_tokens,
+    size_t* inout_count);
+Gemma4Status gemma4_verify_tokens(
+    Gemma4Target* target,
+    Gemma4KvCache* cache,
+    const int32_t* draft_tokens,
+    size_t draft_count,
+    Gemma4StepResult* out);
+
 #ifdef __cplusplus
 }
 #endif

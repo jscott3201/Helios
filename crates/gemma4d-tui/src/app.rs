@@ -83,7 +83,6 @@ impl PageId {
                 Some("Disabled until M07/M08 expose KV cache and prefix-cache providers.")
             }
             Self::Adapters => Some("Disabled until M10 dynamic adapter loading is implemented."),
-            Self::Mtp => Some("Disabled until M06 speculative decoding exposes runtime telemetry."),
             _ => None,
         }
     }
@@ -123,6 +122,93 @@ impl DashboardSnapshot {
             ttft_p50_ms: None,
             decode_tps_p50: None,
             cache_hit_rate: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MtpStatus {
+    Disabled,
+    Enabled,
+    AutoDisabled,
+}
+
+impl MtpStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+            Self::AutoDisabled => "auto-disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MtpSnapshot {
+    pub status: MtpStatus,
+    pub target: String,
+    pub drafter: String,
+    pub compatibility: String,
+    pub exactness: String,
+    pub draft_block_size: usize,
+    pub attempted_draft_tokens: u64,
+    pub accepted_draft_tokens: u64,
+    pub acceptance_rate: f64,
+    pub accepted_tokens_per_verify: f64,
+    pub target_verify_passes: u64,
+    pub rollback_count: u64,
+    pub auto_disable_reason: Option<String>,
+    pub failing_fixture: Option<String>,
+    pub adapter_state: String,
+    pub active_kv_mode: String,
+}
+
+impl MtpSnapshot {
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: MtpStatus::Disabled,
+            target: "none".to_owned(),
+            drafter: "none".to_owned(),
+            compatibility: "not checked".to_owned(),
+            exactness: "not run".to_owned(),
+            draft_block_size: 0,
+            attempted_draft_tokens: 0,
+            accepted_draft_tokens: 0,
+            acceptance_rate: 0.0,
+            accepted_tokens_per_verify: 0.0,
+            target_verify_passes: 0,
+            rollback_count: 0,
+            auto_disable_reason: Some(reason.into()),
+            failing_fixture: None,
+            adapter_state: "adapters disabled for MTP in M06".to_owned(),
+            active_kv_mode: "bf16 required".to_owned(),
+        }
+    }
+
+    pub fn mock_m06() -> Self {
+        Self {
+            status: MtpStatus::AutoDisabled,
+            target: "mlx-community/gemma-4-12B-it-4bit".to_owned(),
+            drafter: "mlx-community/gemma-4-12B-it-qat-assistant-4bit".to_owned(),
+            compatibility: "target/drafter ABI present; native assistant execution unsupported"
+                .to_owned(),
+            exactness:
+                "block size 1 exact on fixture; block size 2 auto-disabled on failing fixture"
+                    .to_owned(),
+            draft_block_size: 2,
+            attempted_draft_tokens: 2,
+            accepted_draft_tokens: 0,
+            acceptance_rate: 0.0,
+            accepted_tokens_per_verify: 0.0,
+            target_verify_passes: 1,
+            rollback_count: 1,
+            auto_disable_reason: Some(
+                "acceptance rate fell below threshold after rejected draft".to_owned(),
+            ),
+            failing_fixture: Some("mtp_reject_second_token".to_owned()),
+            adapter_state: "disabled; adapter != none is rejected for MTP in M06".to_owned(),
+            active_kv_mode: "bf16 only; compressed active KV disabled".to_owned(),
         }
     }
 }
@@ -219,6 +305,7 @@ pub enum BackendEvent {
     Dashboard(DashboardSnapshot),
     Log(LogEntry),
     Benchmark(BenchmarkRecord),
+    Mtp(MtpSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,6 +320,7 @@ pub enum Action {
     ConfigValidated(ConfigValidation),
     StartBenchmark,
     BenchmarkRecorded(BenchmarkRecord),
+    MtpUpdated(MtpSnapshot),
     BackendEvent(BackendEvent),
     DashboardUpdated(DashboardSnapshot),
     AppendLog(LogEntry),
@@ -250,6 +338,7 @@ pub struct AppState {
     pub config_validation: ConfigValidation,
     pub dashboard: DashboardSnapshot,
     pub benchmark: BenchmarkRecord,
+    pub mtp: MtpSnapshot,
     pub logs: Vec<LogEntry>,
     pub status_line: String,
 }
@@ -268,6 +357,7 @@ impl AppState {
             config_validation: ConfigValidation::pending(config_path),
             dashboard: DashboardSnapshot::offline(&provider_name),
             benchmark,
+            mtp: MtpSnapshot::disabled("MTP provider snapshot pending"),
             logs: vec![LogEntry::info(
                 "TUI initialized with offline provider boundary",
             )],
@@ -334,9 +424,14 @@ pub fn reduce(state: &mut AppState, action: Action) {
             BackendEvent::Dashboard(snapshot) => reduce(state, Action::DashboardUpdated(snapshot)),
             BackendEvent::Log(entry) => reduce(state, Action::AppendLog(entry)),
             BackendEvent::Benchmark(record) => reduce(state, Action::BenchmarkRecorded(record)),
+            BackendEvent::Mtp(snapshot) => reduce(state, Action::MtpUpdated(snapshot)),
         },
         Action::DashboardUpdated(snapshot) => {
             state.dashboard = snapshot;
+        }
+        Action::MtpUpdated(snapshot) => {
+            state.status_line = format!("MTP {}", snapshot.status.label());
+            state.mtp = snapshot;
         }
         Action::AppendLog(entry) => {
             state.logs.push(entry);
