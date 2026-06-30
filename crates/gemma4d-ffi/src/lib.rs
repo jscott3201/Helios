@@ -693,6 +693,56 @@ mod tests {
         assert!(step.peak_memory_gb > 0.0);
         assert!(step.native_last_hidden.is_some());
 
+        let mut baseline_cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let baseline_first =
+            prefill(&target, &mut baseline_cache, &[9259]).expect("baseline prefill should run");
+        let baseline_second = decode_one(&target, &mut baseline_cache, baseline_first.greedy_token)
+            .expect("baseline second token should run");
+        let baseline_third = decode_one(&target, &mut baseline_cache, baseline_second.greedy_token)
+            .expect("baseline third token should run");
+        let baseline_fourth = decode_one(&target, &mut baseline_cache, baseline_third.greedy_token)
+            .expect("baseline fourth token should run");
+
+        let mut verify_accept_cache =
+            KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let verify_accept_first = prefill(&target, &mut verify_accept_cache, &[9259])
+            .expect("verify accept prefill should run");
+        let verify_accept = verify_tokens(
+            &target,
+            &mut verify_accept_cache,
+            &[
+                verify_accept_first.greedy_token,
+                baseline_second.greedy_token,
+            ],
+        )
+        .expect("native verify should accept matching block-size-2 draft");
+        assert_eq!(verify_accept.sequence_len, 3);
+        assert_eq!(verify_accept.greedy_token, baseline_third.greedy_token);
+        assert!(verify_accept.native_last_hidden.is_some());
+
+        let rejected_token = if baseline_first.greedy_token == 0 {
+            1
+        } else {
+            0
+        };
+        let mut verify_reject_cache =
+            KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let _ = prefill(&target, &mut verify_reject_cache, &[9259])
+            .expect("verify reject prefill should run");
+        let verify_reject = verify_tokens(&target, &mut verify_reject_cache, &[rejected_token])
+            .expect("native verify should rollback a rejected draft token");
+        assert_eq!(verify_reject.sequence_len, 2);
+        assert_eq!(verify_reject.greedy_token, baseline_second.greedy_token);
+        assert!(verify_reject.native_last_hidden.is_some());
+        let reject_follow_up = decode_one(
+            &target,
+            &mut verify_reject_cache,
+            verify_reject.greedy_token,
+        )
+        .expect("decode after rejected draft should continue from fallback token");
+        assert_eq!(reject_follow_up.sequence_len, 3);
+        assert_eq!(reject_follow_up.greedy_token, baseline_third.greedy_token);
+
         let assistant_model_path =
             std::env::var("GEMMA4D_ASSISTANT_MODEL_PATH").unwrap_or_else(|_| {
                 workspace_path("artifacts/models/gemma-4-12B-it-qat-assistant-4bit")
@@ -716,32 +766,37 @@ mod tests {
         assert_eq!(draft_after_prefill.len(), 1);
         assert!((0..262144).contains(&draft_after_prefill[0]));
 
-        let decode =
-            decode_one(&target, &mut cache, step.greedy_token).expect("native decode should run");
-        assert_eq!(decode.sequence_len, 2);
-        assert_eq!(decode.greedy_token, 236772);
-        assert!(decode.peak_memory_gb > 0.0);
-        assert!(decode.native_last_hidden.is_some());
+        let verified_draft_after_prefill = verify_tokens(&target, &mut cache, &draft_after_prefill)
+            .expect("native verify should advance after assistant prefill draft");
+        assert_eq!(verified_draft_after_prefill.sequence_len, 2);
+        assert_eq!(
+            verified_draft_after_prefill.greedy_token,
+            baseline_second.greedy_token
+        );
+        assert!(verified_draft_after_prefill.peak_memory_gb > 0.0);
+        assert!(verified_draft_after_prefill.native_last_hidden.is_some());
 
         let draft_one = draft_block(&drafter, &mut cache, NonZeroU32::new(1).expect("non-zero"))
             .expect("assistant block-size-1 draft should run");
         assert_eq!(draft_one.len(), 1);
         assert!((0..262144).contains(&draft_one[0]));
 
-        let mut baseline_cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
-        let baseline_first =
-            prefill(&target, &mut baseline_cache, &[9259]).expect("baseline prefill should run");
-        let baseline_second = decode_one(&target, &mut baseline_cache, baseline_first.greedy_token)
-            .expect("baseline second token should run");
-        let baseline_third = decode_one(&target, &mut baseline_cache, baseline_second.greedy_token)
-            .expect("baseline third token should run");
-
         let draft_two = draft_block(&drafter, &mut cache, NonZeroU32::new(2).expect("non-zero"))
             .expect("assistant block-size-2 draft should run");
         assert_eq!(draft_two.len(), 2);
         assert!(draft_two.iter().all(|token| (0..262144).contains(token)));
 
-        assert_eq!(baseline_second.greedy_token, decode.greedy_token);
+        let verified_draft_two = verify_tokens(&target, &mut cache, &draft_two)
+            .expect("native verify should advance after assistant block-size-2 draft");
+        assert!((3..=4).contains(&verified_draft_two.sequence_len));
+        let expected_next = if verified_draft_two.sequence_len == 3 {
+            baseline_third.greedy_token
+        } else {
+            baseline_fourth.greedy_token
+        };
+        assert_eq!(verified_draft_two.greedy_token, expected_next);
+        assert!(verified_draft_two.native_last_hidden.is_some());
+
         assert_eq!(baseline_third.sequence_len, 3);
     }
 
