@@ -12,4 +12,8 @@ name = "gemma4d"
 path = "src/main.rs"
 
 [dependencies]
+gemma4d-adapters = { version = "0.1.0", path = "../gemma4d-adapters" }
 gemma4d-ffi = { version = "0.1.0", path = "../gemma4d-ffi" }
+
+[dev-dependencies]
+serde_json = "1.0.150"

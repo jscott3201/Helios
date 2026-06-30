@@ -629,6 +629,13 @@ dependencies = [
 [[package]]
 name = "gemma4d-adapters"
 version = "0.1.0"
+dependencies = [
+ "gemma4d-kv",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "gemma4d-bench"
@@ -691,7 +698,9 @@ version = "0.1.0"
 name = "gemma4d-server"
 version = "0.1.0"
 dependencies = [
+ "gemma4d-adapters",
  "gemma4d-ffi",
+ "serde_json",
 ]
 
 [[package]]

@@ -67,10 +67,11 @@ fn render_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         PageId::Config => render_config(frame, area, state),
         PageId::Benchmarks => render_benchmarks(frame, area, state),
         PageId::Cache => render_cache(frame, area, state),
+        PageId::Adapters => render_adapters(frame, area, state),
         PageId::Mtp => render_mtp(frame, area, state),
         PageId::Logs => render_logs(frame, area, state),
         PageId::Help => render_help(frame, area),
-        PageId::Chat | PageId::Adapters => render_placeholder(frame, area, state.current_page),
+        PageId::Chat => render_placeholder(frame, area, state.current_page),
     }
 }
 
@@ -323,6 +324,86 @@ fn render_cache(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
+fn render_adapters(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let adapters = &state.adapters;
+    let trusted = if adapters.trusted_roots.is_empty() {
+        "none".to_owned()
+    } else {
+        adapters
+            .trusted_roots
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Status ", Style::default().fg(Color::Gray)),
+            Span::raw(adapters.status.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Registry ", Style::default().fg(Color::Gray)),
+            Span::raw(adapters.registry_root.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Trusted roots ", Style::default().fg(Color::Gray)),
+            Span::raw(trusted),
+        ]),
+        Line::from(format!(
+            "Loaded {} | pinned {} | active {}",
+            adapters.loaded,
+            adapters.pinned,
+            adapters.active_adapter_id.as_deref().unwrap_or("none")
+        )),
+        Line::from(format!(
+            "Resident {} | last load {}",
+            bytes(adapters.total_resident_bytes),
+            adapters
+                .last_load_latency_us
+                .map(|value| format!("{value} us"))
+                .unwrap_or_else(|| "n/a".to_owned())
+        )),
+        Line::from(format!(
+            "MTP disabled with active adapter {}",
+            if adapters.mtp_disabled_active {
+                "yes"
+            } else {
+                "no"
+            }
+        )),
+        Line::from(""),
+        Line::from("Adapter registry entries"),
+    ];
+    for entry in adapters.entries.iter().take(8) {
+        lines.push(Line::from(format!(
+            "{} | {} | loaded {} | pinned {} | active {} | {} | mtp {}",
+            entry.adapter_id,
+            entry.adapter_type,
+            yes_no(entry.loaded),
+            yes_no(entry.pinned),
+            yes_no(entry.active),
+            bytes(entry.resident_bytes),
+            entry.supports_mtp
+        )));
+        lines.push(Line::from(format!(
+            "  targets {} | source {}",
+            entry.target_modules.join(","),
+            entry.source_path.display()
+        )));
+    }
+    if adapters.entries.is_empty() {
+        lines.push(Line::from("no adapters registered"));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(adapters.note.clone()));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Adapters"))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn render_logs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let items = state
         .logs
@@ -481,6 +562,10 @@ fn bytes(value: u64) -> String {
     } else {
         format!("{value} B")
     }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn status_color(status: crate::config::ValidationStatus) -> Color {

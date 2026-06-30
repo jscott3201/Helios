@@ -1578,6 +1578,89 @@ mod tests {
     }
 
     #[test]
+    fn adapter_identity_and_weight_hash_partition_namespace_and_blocks() {
+        let block_size = NonZeroU64::new(1024).expect("non-zero");
+        let mut first = KvNamespace::fixture(1024);
+        first.adapter_id = Some("rust-coding-r16-v1".to_owned());
+        first.adapter_weight_hash = Some("adapter-weight-hash-a".to_owned());
+        let mut second = first.clone();
+        second.adapter_id = Some("sql-r16-v1".to_owned());
+        second.adapter_weight_hash = Some("adapter-weight-hash-b".to_owned());
+
+        assert_ne!(
+            first.namespace_hash().expect("first hash"),
+            second.namespace_hash().expect("second hash")
+        );
+
+        let first_key = KvBlockKey::new(&first, 0, block_size, 0, 1024).expect("first key");
+        let second_key = KvBlockKey::new(&second, 0, block_size, 0, 1024).expect("second key");
+        assert_ne!(first_key.namespace_hash, second_key.namespace_hash);
+        assert_ne!(first_key.block_id, second_key.block_id);
+    }
+
+    #[test]
+    fn adapter_namespace_mismatch_rejects_ram_restore() {
+        let block_size = NonZeroU64::new(1024).expect("non-zero");
+        let mut namespace = KvNamespace::fixture(1024);
+        namespace.adapter_id = Some("rust-coding-r16-v1".to_owned());
+        namespace.adapter_weight_hash = Some("adapter-weight-hash-a".to_owned());
+        let observation = fresh_prefill_fixture(1024);
+        let block = RamPrefixBlock::from_observation(
+            namespace.clone(),
+            0,
+            block_size,
+            0,
+            observation,
+            estimated_bf16_kv_bytes(1024),
+        )
+        .expect("adapter block");
+        let key = block.key.clone();
+        let mut wrong_namespace = namespace;
+        wrong_namespace.adapter_weight_hash = Some("adapter-weight-hash-b".to_owned());
+        let mut cache = RamPrefixCache::new(NonZeroU64::new(block.byte_len * 2).expect("non-zero"));
+        cache.insert(block).expect("insert");
+
+        let err = cache
+            .restore(&key, &wrong_namespace)
+            .expect_err("wrong adapter namespace should reject");
+        assert!(matches!(err, Error::NamespaceMismatch { .. }));
+    }
+
+    #[test]
+    fn adapter_namespace_mismatch_rejects_ssd_restore() {
+        let root = temp_cache_dir("adapter_namespace");
+        let block_size = NonZeroU64::new(1024).expect("non-zero");
+        let mut namespace = KvNamespace::fixture(1024);
+        namespace.adapter_id = Some("rust-coding-r16-v1".to_owned());
+        namespace.adapter_weight_hash = Some("adapter-weight-hash-a".to_owned());
+        let observation = fresh_prefill_fixture(1024);
+        let block = RamPrefixBlock::from_observation(
+            namespace.clone(),
+            0,
+            block_size,
+            0,
+            observation,
+            estimated_bf16_kv_bytes(1024),
+        )
+        .expect("adapter block");
+        let key = block.key.clone();
+        let mut wrong_namespace = namespace;
+        wrong_namespace.adapter_id = Some("sql-r16-v1".to_owned());
+        wrong_namespace.adapter_weight_hash = Some("adapter-weight-hash-b".to_owned());
+        let mut cache =
+            SsdPrefixCache::open(&root, NonZeroU64::new(8 * 1024 * 1024).expect("non-zero"))
+                .expect("cache");
+        cache.write_block(&block).expect("write");
+
+        let err = cache
+            .restore_before_prefill(&key, &wrong_namespace)
+            .expect_err("wrong adapter namespace should reject");
+        assert!(matches!(err, Error::NamespaceMismatch { .. }));
+        assert_eq!(cache.accounting().namespace_rejections, 1);
+        cleanup_temp_dir(root);
+    }
+
+    #[test]
     fn restore_matches_fresh_prefill_for_m07_context_lengths() {
         for sequence_len in [1024, 4096, 8192, 16384] {
             let block = fixture_block(sequence_len, NonZeroU64::new(16384).expect("non-zero"))

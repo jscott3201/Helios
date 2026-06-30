@@ -193,6 +193,10 @@ pub fn seed_state(provider: &mut dyn RuntimeProvider, config_path: PathBuf) -> A
         Action::DashboardUpdated(provider.dashboard_snapshot()),
     );
     reduce(&mut state, Action::CacheUpdated(provider.cache_snapshot()));
+    reduce(
+        &mut state,
+        Action::AdaptersUpdated(provider.adapter_snapshot()),
+    );
     reduce(&mut state, Action::MtpUpdated(provider.mtp_snapshot()));
     for event in provider.backend_events() {
         reduce(&mut state, Action::BackendEvent(event));

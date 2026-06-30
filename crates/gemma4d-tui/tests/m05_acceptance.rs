@@ -120,6 +120,7 @@ fn snapshots_render_required_pages_at_required_sizes() {
         PageId::Dashboard,
         PageId::Config,
         PageId::Benchmarks,
+        PageId::Adapters,
         PageId::Logs,
         PageId::Help,
     ] {
@@ -137,19 +138,17 @@ fn snapshots_render_required_pages_at_required_sizes() {
 }
 
 #[test]
-fn disabled_feature_pages_render_dependency_messages() {
+fn chat_page_renders_dependency_message() {
     let mut provider = MockProvider::default();
     let config_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
     let base = seed_state(&mut provider, config_path);
 
-    for page in [PageId::Chat, PageId::Adapters] {
-        let mut state = base.clone();
-        reduce(&mut state, Action::Navigate(page));
-        let snapshot = render_snapshot(&state, 80, 24).unwrap();
-        assert!(snapshot.contains("Disabled until"));
-        assert!(snapshot.contains(page.title()));
-    }
+    let mut state = base.clone();
+    reduce(&mut state, Action::Navigate(PageId::Chat));
+    let snapshot = render_snapshot(&state, 80, 24).unwrap();
+    assert!(snapshot.contains("Disabled until"));
+    assert!(snapshot.contains("Chat"));
 }
 
 #[test]
@@ -187,6 +186,23 @@ fn mtp_page_renders_acceptance_rollback_and_auto_disable_status() {
     assert!(snapshot.contains("Acceptance rate"));
     assert!(snapshot.contains("Rollbacks"));
     assert!(snapshot.contains("Auto-disable reason"));
+}
+
+#[test]
+fn adapter_page_renders_registry_summary_and_mtp_gate() {
+    let mut provider = MockProvider::default();
+    let config_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../references/configs/tui.toml");
+    let mut state = seed_state(&mut provider, config_path);
+    reduce(&mut state, Action::Navigate(PageId::Adapters));
+
+    let snapshot = render_snapshot(&state, 80, 24).unwrap();
+    assert!(snapshot.contains("Adapters"));
+    assert!(snapshot.contains("Registry benchmarks/out/M10/registry"));
+    assert!(snapshot.contains("rust-coding-r16-v1"));
+    assert!(snapshot.contains("loaded yes"));
+    assert!(snapshot.contains("pinned yes"));
+    assert!(snapshot.contains("MTP disabled with active adapter yes"));
 }
 
 #[test]

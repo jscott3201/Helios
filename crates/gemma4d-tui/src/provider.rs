@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     app::{
-        BackendEvent, BenchmarkRecord, BenchmarkStatus, CacheSnapshot, DashboardSnapshot, LogEntry,
-        MtpSnapshot, ProviderKind,
+        AdapterSnapshot, BackendEvent, BenchmarkRecord, BenchmarkStatus, CacheSnapshot,
+        DashboardSnapshot, LogEntry, MtpSnapshot, ProviderKind,
     },
     config::{ConfigValidation, validate_config_path},
 };
@@ -12,6 +12,7 @@ pub trait RuntimeProvider {
     fn name(&self) -> String;
     fn dashboard_snapshot(&mut self) -> DashboardSnapshot;
     fn cache_snapshot(&mut self) -> CacheSnapshot;
+    fn adapter_snapshot(&mut self) -> AdapterSnapshot;
     fn mtp_snapshot(&mut self) -> MtpSnapshot;
     fn backend_events(&mut self) -> Vec<BackendEvent>;
     fn validate_config(&mut self, path: &Path) -> ConfigValidation;
@@ -59,12 +60,17 @@ impl RuntimeProvider for MockProvider {
                 "dashboard metrics are deterministic mock values",
             )),
             BackendEvent::Cache(self.cache_snapshot()),
+            BackendEvent::Adapters(self.adapter_snapshot()),
             BackendEvent::Mtp(self.mtp_snapshot()),
         ]
     }
 
     fn cache_snapshot(&mut self) -> CacheSnapshot {
         CacheSnapshot::mock_m09()
+    }
+
+    fn adapter_snapshot(&mut self) -> AdapterSnapshot {
+        AdapterSnapshot::mock_m10()
     }
 
     fn mtp_snapshot(&mut self) -> MtpSnapshot {
@@ -127,6 +133,10 @@ impl RuntimeProvider for FileProvider {
         CacheSnapshot::disabled("file provider has no M07 cache accounting report loaded")
     }
 
+    fn adapter_snapshot(&mut self) -> AdapterSnapshot {
+        AdapterSnapshot::disabled("file provider has no M10 adapter registry report loaded")
+    }
+
     fn backend_events(&mut self) -> Vec<BackendEvent> {
         if self.emitted_bootstrap_logs {
             return Vec::new();
@@ -137,7 +147,7 @@ impl RuntimeProvider for FileProvider {
                 "file provider attached; reading repository files only",
             )),
             BackendEvent::Log(LogEntry::warn(
-                "runtime daemon absent; Chat/Cache/Adapters/MTP pages remain disabled",
+                "runtime daemon absent; live Chat and mutation controls remain disabled",
             )),
         ]
     }

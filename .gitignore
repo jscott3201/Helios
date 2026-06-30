@@ -35,5 +35,8 @@ benchmarks/out/M08/*
 !benchmarks/out/M09/
 benchmarks/out/M09/*
 !benchmarks/out/M09/.gitkeep
+!benchmarks/out/M10/
+benchmarks/out/M10/*
+!benchmarks/out/M10/.gitkeep
 artifacts/*
 !artifacts/.gitkeep

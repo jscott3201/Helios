@@ -80,7 +80,6 @@ impl PageId {
     pub fn dependency_message(self) -> Option<&'static str> {
         match self {
             Self::Chat => Some("Disabled until M11 provides the local server/control provider."),
-            Self::Adapters => Some("Disabled until M10 dynamic adapter loading is implemented."),
             _ => None,
         }
     }
@@ -264,6 +263,102 @@ impl CacheSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdapterSnapshot {
+    pub status: String,
+    pub registry_root: PathBuf,
+    pub trusted_roots: Vec<PathBuf>,
+    pub loaded: usize,
+    pub pinned: usize,
+    pub active_adapter_id: Option<String>,
+    pub total_resident_bytes: u64,
+    pub last_load_latency_us: Option<u128>,
+    pub mtp_disabled_active: bool,
+    pub entries: Vec<AdapterEntrySnapshot>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterEntrySnapshot {
+    pub adapter_id: String,
+    pub display_name: Option<String>,
+    pub adapter_type: String,
+    pub source_path: PathBuf,
+    pub loaded: bool,
+    pub pinned: bool,
+    pub active: bool,
+    pub resident_bytes: u64,
+    pub load_latency_us: u128,
+    pub target_modules: Vec<String>,
+    pub supports_mtp: String,
+    pub adapter_weight_hash: String,
+}
+
+impl AdapterSnapshot {
+    pub fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: "disabled".to_owned(),
+            registry_root: PathBuf::from("none"),
+            trusted_roots: Vec::new(),
+            loaded: 0,
+            pinned: 0,
+            active_adapter_id: None,
+            total_resident_bytes: 0,
+            last_load_latency_us: None,
+            mtp_disabled_active: false,
+            entries: Vec::new(),
+            note: reason.into(),
+        }
+    }
+
+    pub fn mock_m10() -> Self {
+        Self {
+            status: "ready".to_owned(),
+            registry_root: PathBuf::from("benchmarks/out/M10/registry"),
+            trusted_roots: vec![PathBuf::from("benchmarks/out/M10/fixtures/trusted")],
+            loaded: 1,
+            pinned: 1,
+            active_adapter_id: Some("rust-coding-r16-v1".to_owned()),
+            total_resident_bytes: 4096,
+            last_load_latency_us: Some(1200),
+            mtp_disabled_active: true,
+            entries: vec![
+                AdapterEntrySnapshot {
+                    adapter_id: "rust-coding-r16-v1".to_owned(),
+                    display_name: Some("Rust coding fixture".to_owned()),
+                    adapter_type: "lora".to_owned(),
+                    source_path: PathBuf::from(
+                        "benchmarks/out/M10/fixtures/trusted/rust-coding-r16-v1",
+                    ),
+                    loaded: true,
+                    pinned: true,
+                    active: true,
+                    resident_bytes: 4096,
+                    load_latency_us: 1200,
+                    target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
+                    supports_mtp: "unknown".to_owned(),
+                    adapter_weight_hash: "m10-fixture-adapter-weight-hash".to_owned(),
+                },
+                AdapterEntrySnapshot {
+                    adapter_id: "sql-r16-v1".to_owned(),
+                    display_name: Some("SQL fixture".to_owned()),
+                    adapter_type: "lora".to_owned(),
+                    source_path: PathBuf::from("benchmarks/out/M10/fixtures/trusted/sql-r16-v1"),
+                    loaded: false,
+                    pinned: false,
+                    active: false,
+                    resident_bytes: 0,
+                    load_latency_us: 0,
+                    target_modules: vec!["q_proj".to_owned(), "v_proj".to_owned()],
+                    supports_mtp: "unknown".to_owned(),
+                    adapter_weight_hash: "m10-fixture-sql-weight-hash".to_owned(),
+                },
+            ],
+            note: "M10 standard LoRA registry is provider-backed; MTP stays disabled while an adapter is active".to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MtpStatus {
@@ -442,6 +537,7 @@ impl LogEntry {
 pub enum BackendEvent {
     Dashboard(DashboardSnapshot),
     Cache(CacheSnapshot),
+    Adapters(AdapterSnapshot),
     Log(LogEntry),
     Benchmark(BenchmarkRecord),
     Mtp(MtpSnapshot),
@@ -460,6 +556,7 @@ pub enum Action {
     StartBenchmark,
     BenchmarkRecorded(BenchmarkRecord),
     CacheUpdated(CacheSnapshot),
+    AdaptersUpdated(AdapterSnapshot),
     MtpUpdated(MtpSnapshot),
     BackendEvent(BackendEvent),
     DashboardUpdated(DashboardSnapshot),
@@ -478,6 +575,7 @@ pub struct AppState {
     pub config_validation: ConfigValidation,
     pub dashboard: DashboardSnapshot,
     pub cache: CacheSnapshot,
+    pub adapters: AdapterSnapshot,
     pub benchmark: BenchmarkRecord,
     pub mtp: MtpSnapshot,
     pub logs: Vec<LogEntry>,
@@ -498,6 +596,7 @@ impl AppState {
             config_validation: ConfigValidation::pending(config_path),
             dashboard: DashboardSnapshot::offline(&provider_name),
             cache: CacheSnapshot::disabled("cache provider snapshot pending"),
+            adapters: AdapterSnapshot::disabled("adapter registry snapshot pending"),
             benchmark,
             mtp: MtpSnapshot::disabled("MTP provider snapshot pending"),
             logs: vec![LogEntry::info(
@@ -565,6 +664,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::BackendEvent(event) => match event {
             BackendEvent::Dashboard(snapshot) => reduce(state, Action::DashboardUpdated(snapshot)),
             BackendEvent::Cache(snapshot) => reduce(state, Action::CacheUpdated(snapshot)),
+            BackendEvent::Adapters(snapshot) => reduce(state, Action::AdaptersUpdated(snapshot)),
             BackendEvent::Log(entry) => reduce(state, Action::AppendLog(entry)),
             BackendEvent::Benchmark(record) => reduce(state, Action::BenchmarkRecorded(record)),
             BackendEvent::Mtp(snapshot) => reduce(state, Action::MtpUpdated(snapshot)),
@@ -575,6 +675,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::CacheUpdated(snapshot) => {
             state.status_line = format!("cache {}", snapshot.status);
             state.cache = snapshot;
+        }
+        Action::AdaptersUpdated(snapshot) => {
+            state.status_line = format!("adapters {}", snapshot.status);
+            state.adapters = snapshot;
         }
         Action::MtpUpdated(snapshot) => {
             state.status_line = format!("MTP {}", snapshot.status.label());
