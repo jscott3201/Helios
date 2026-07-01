@@ -9,7 +9,7 @@ use std::{
 };
 
 use gemma4d_bench::{CliError, manifest, workload_corpus::WorkloadRecord};
-use gemma4d_ffi::{KvCache, KvPolicy, LoadConfig, Target, prefill};
+use gemma4d_ffi::{KvCache, KvPolicy, LoadConfig, PrefillChunkPolicy, Target, prefill};
 use gemma4d_tokenizer::sha256_hex;
 use serde::Serialize;
 
@@ -375,6 +375,8 @@ struct Variant {
     backend: Backend,
     config: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
+    #[serde(skip_serializing)]
+    prefill_chunk_policy: Option<PrefillChunkPolicy>,
     baseline_variant: Option<String>,
 }
 
@@ -508,6 +510,12 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             "per_layer",
             [("GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY", "long_context_256")],
         ),
+        native_variant_with_setter_policy(
+            "native_chunked_prefill_setter_long_context_256",
+            "per_layer",
+            PrefillChunkPolicy::LongContext256,
+            "long_context_256",
+        ),
         native_variant_with_extra_env(
             "native_chunked_prefill_384",
             "per_layer",
@@ -580,6 +588,7 @@ fn helper_variant_with_clear_cache(chunk_tokens: usize, prefill_clear_cache: boo
         backend: Backend::Helper,
         config,
         env,
+        prefill_chunk_policy: None,
         baseline_variant: if chunk_tokens == 2048 && prefill_clear_cache {
             None
         } else {
@@ -615,12 +624,28 @@ fn native_variant_with_extra_env<const N: usize>(
         backend: Backend::Native,
         config,
         env,
+        prefill_chunk_policy: None,
         baseline_variant: if name == "native_eval_per_layer" {
             None
         } else {
             Some("native_eval_per_layer".to_owned())
         },
     }
+}
+
+fn native_variant_with_setter_policy(
+    name: &str,
+    eval_mode: &str,
+    policy: PrefillChunkPolicy,
+    policy_name: &str,
+) -> Variant {
+    let mut variant = native_variant_with_extra_env(name, eval_mode, []);
+    variant.config.insert(
+        "prefill_chunk_policy_setter".to_owned(),
+        policy_name.to_owned(),
+    );
+    variant.prefill_chunk_policy = Some(policy);
+    variant
 }
 
 fn prepare_workload_inputs(
@@ -687,7 +712,7 @@ fn run_variant_trial(
     let target = Target::load(&load_config);
     let model_load = load_started.elapsed();
 
-    let target = match target {
+    let mut target = match target {
         Ok(target) => target,
         Err(error) => {
             for workload in workload_inputs {
@@ -707,6 +732,25 @@ fn run_variant_trial(
             return Ok(());
         }
     };
+    if let Some(policy) = variant.prefill_chunk_policy {
+        if let Err(error) = target.set_prefill_chunk_policy(policy) {
+            for workload in workload_inputs {
+                records.push(failed_record(
+                    run_id,
+                    git_sha,
+                    git_status_short,
+                    command,
+                    model_identity,
+                    variant,
+                    trial_index,
+                    workload,
+                    model_load,
+                    format!("prefill chunk policy setter failed: {error}"),
+                ));
+            }
+            return Ok(());
+        }
+    }
 
     for workload in workload_inputs {
         records.push(run_prefill_record(

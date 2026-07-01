@@ -56,6 +56,8 @@ struct NativeTarget {
     bool model_loaded;
     bool use_native_graph;
     uint64_t sequence_len;
+    bool has_prefill_chunk_policy_override;
+    Gemma4PrefillChunkPolicy prefill_chunk_policy;
     gemma4d::Gemma4ModelManifest manifest;
     std::unique_ptr<gemma4d::NativeTextModel> native_model;
     pid_t helper_pid;
@@ -721,6 +723,11 @@ Gemma4Status gemma4_load_target(const Gemma4LoadConfig* config, Gemma4Target** o
     target->model_loaded = false;
     target->use_native_graph = false;
     target->sequence_len = 0;
+    target->has_prefill_chunk_policy_override = false;
+    target->prefill_chunk_policy = Gemma4PrefillChunkPolicy{
+        GEMMA4_PREFILL_CHUNK_DISABLED,
+        0,
+    };
     target->manifest = gemma4d::Gemma4ModelManifest{};
     target->native_model.reset();
     target->helper_pid = -1;
@@ -777,6 +784,56 @@ Gemma4Status gemma4_free_target(Gemma4Target* target) {
     target->magic = 0;
     stop_helper(target);
     delete target;
+    return ok();
+}
+
+Gemma4Status gemma4_target_set_prefill_chunk_policy(
+    Gemma4Target* target,
+    const Gemma4PrefillChunkPolicy* policy) {
+    if (target == nullptr) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_target_set_prefill_chunk_policy requires a non-null target");
+    }
+    if (target->magic != kTargetMagic) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_target_set_prefill_chunk_policy received an invalid target handle");
+    }
+    if (policy == nullptr) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_target_set_prefill_chunk_policy requires a non-null policy");
+    }
+
+    switch (policy->mode) {
+        case GEMMA4_PREFILL_CHUNK_DISABLED:
+        case GEMMA4_PREFILL_CHUNK_LONG_CONTEXT_256:
+            break;
+        case GEMMA4_PREFILL_CHUNK_FIXED_TOKENS:
+            if (policy->fixed_chunk_tokens == 0) {
+                return fail(
+                    GEMMA4_ERR_INVALID_ARGUMENT,
+                    "fixed prefill chunk policy requires fixed_chunk_tokens > 0");
+            }
+            break;
+        default:
+            return fail(
+                GEMMA4_ERR_INVALID_ARGUMENT,
+                "unknown prefill chunk policy mode");
+    }
+
+    if (target->model_loaded && !target->use_native_graph) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "prefill chunk policy can only be applied to native graph targets");
+    }
+
+    target->has_prefill_chunk_policy_override = true;
+    target->prefill_chunk_policy = *policy;
+    if (target->use_native_graph && target->native_model != nullptr) {
+        target->native_model->set_prefill_chunk_policy(*policy);
+    }
     return ok();
 }
 

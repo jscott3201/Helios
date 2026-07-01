@@ -41,6 +41,17 @@ typedef struct Gemma4LoadConfig {
     bool allow_unsupported_config;
 } Gemma4LoadConfig;
 
+typedef enum Gemma4PrefillChunkMode {
+    GEMMA4_PREFILL_CHUNK_DISABLED = 0,
+    GEMMA4_PREFILL_CHUNK_FIXED_TOKENS = 1,
+    GEMMA4_PREFILL_CHUNK_LONG_CONTEXT_256 = 2
+} Gemma4PrefillChunkMode;
+
+typedef struct Gemma4PrefillChunkPolicy {
+    Gemma4PrefillChunkMode mode;
+    uint32_t fixed_chunk_tokens;
+} Gemma4PrefillChunkPolicy;
+
 typedef enum Gemma4KvMode {
     GEMMA4_KV_BF16 = 0,
     GEMMA4_KV_MLX_AFFINE_Q8 = 1,
@@ -139,6 +150,9 @@ Gemma4Status gemma4_get_last_error(char* buffer, size_t buffer_len);
 
 Gemma4Status gemma4_load_target(const Gemma4LoadConfig* config, Gemma4Target** out);
 Gemma4Status gemma4_free_target(Gemma4Target* target);
+Gemma4Status gemma4_target_set_prefill_chunk_policy(
+    Gemma4Target* target,
+    const Gemma4PrefillChunkPolicy* policy);
 
 Gemma4Status gemma4_load_adapter(
     Gemma4Target* target,

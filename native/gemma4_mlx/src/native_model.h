@@ -137,6 +137,7 @@ public:
 
     size_t tensor_count() const;
     std::string summary() const;
+    void set_prefill_chunk_policy(const Gemma4PrefillChunkPolicy& policy);
     bool set_adapter(std::shared_ptr<const NativeLoraAdapter> adapter, std::string* error);
     void clear_adapter();
     bool has_adapter() const;

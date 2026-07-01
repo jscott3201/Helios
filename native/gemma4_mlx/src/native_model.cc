@@ -2969,6 +2969,31 @@ std::string NativeTextModel::summary() const {
     return out.str();
 }
 
+void NativeTextModel::set_prefill_chunk_policy(const Gemma4PrefillChunkPolicy& policy) {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    if (impl_ == nullptr) {
+        return;
+    }
+    switch (policy.mode) {
+        case GEMMA4_PREFILL_CHUNK_FIXED_TOKENS:
+            impl_->native_prefill_chunk_tokens = policy.fixed_chunk_tokens;
+            impl_->native_prefill_policy_long_context_256 = false;
+            break;
+        case GEMMA4_PREFILL_CHUNK_LONG_CONTEXT_256:
+            impl_->native_prefill_chunk_tokens = 0;
+            impl_->native_prefill_policy_long_context_256 = true;
+            break;
+        case GEMMA4_PREFILL_CHUNK_DISABLED:
+        default:
+            impl_->native_prefill_chunk_tokens = 0;
+            impl_->native_prefill_policy_long_context_256 = false;
+            break;
+    }
+#else
+    (void)policy;
+#endif
+}
+
 bool NativeTextModel::set_adapter(std::shared_ptr<const NativeLoraAdapter> adapter, std::string* error) {
     if (error == nullptr) {
         return false;

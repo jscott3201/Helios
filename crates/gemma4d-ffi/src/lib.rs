@@ -68,6 +68,16 @@ mod raw {
         pub allow_unsupported_config: bool,
     }
 
+    pub const GEMMA4_PREFILL_CHUNK_DISABLED: i32 = 0;
+    pub const GEMMA4_PREFILL_CHUNK_FIXED_TOKENS: i32 = 1;
+    pub const GEMMA4_PREFILL_CHUNK_LONG_CONTEXT_256: i32 = 2;
+
+    #[repr(C)]
+    pub struct Gemma4PrefillChunkPolicy {
+        pub mode: i32,
+        pub fixed_chunk_tokens: u32,
+    }
+
     #[repr(C)]
     pub struct Gemma4KvPolicy {
         pub active_mode: i32,
@@ -164,6 +174,10 @@ mod raw {
             out: *mut *mut Gemma4Target,
         ) -> Gemma4Status;
         pub fn gemma4_free_target(target: *mut Gemma4Target) -> Gemma4Status;
+        pub fn gemma4_target_set_prefill_chunk_policy(
+            target: *mut Gemma4Target,
+            policy: *const Gemma4PrefillChunkPolicy,
+        ) -> Gemma4Status;
         pub fn gemma4_load_adapter(
             target: *mut Gemma4Target,
             config: *const Gemma4AdapterLoadConfig,
@@ -384,6 +398,32 @@ impl LoadConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefillChunkPolicy {
+    Disabled,
+    FixedTokens(NonZeroU32),
+    LongContext256,
+}
+
+impl PrefillChunkPolicy {
+    fn raw(self) -> raw::Gemma4PrefillChunkPolicy {
+        match self {
+            Self::Disabled => raw::Gemma4PrefillChunkPolicy {
+                mode: raw::GEMMA4_PREFILL_CHUNK_DISABLED,
+                fixed_chunk_tokens: 0,
+            },
+            Self::FixedTokens(tokens) => raw::Gemma4PrefillChunkPolicy {
+                mode: raw::GEMMA4_PREFILL_CHUNK_FIXED_TOKENS,
+                fixed_chunk_tokens: tokens.get(),
+            },
+            Self::LongContext256 => raw::Gemma4PrefillChunkPolicy {
+                mode: raw::GEMMA4_PREFILL_CHUNK_LONG_CONTEXT_256,
+                fixed_chunk_tokens: 0,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum KvMode {
     Bf16 = 0,
@@ -465,6 +505,15 @@ impl Target {
         // SAFETY: `self.ptr` is an owned target handle returned by `gemma4_load_target`.
         check(unsafe { raw::gemma4_clear_adapter(self.ptr.as_ptr(), &mut info) })?;
         Ok(info.into())
+    }
+
+    pub fn set_prefill_chunk_policy(&mut self, policy: PrefillChunkPolicy) -> Result<()> {
+        let raw_policy = policy.raw();
+        // SAFETY: `self.ptr` is an owned target handle, and `raw_policy` is a valid stack policy
+        // pointer for the duration of the call.
+        check(unsafe {
+            raw::gemma4_target_set_prefill_chunk_policy(self.ptr.as_ptr(), &raw_policy)
+        })
     }
 }
 
@@ -1116,6 +1165,58 @@ mod tests {
     }
 
     #[test]
+    fn target_prefill_chunk_policy_setter_accepts_valid_modes_without_model_loading() {
+        let mut target =
+            Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+
+        target
+            .set_prefill_chunk_policy(PrefillChunkPolicy::Disabled)
+            .expect("disabled policy should be accepted");
+        target
+            .set_prefill_chunk_policy(PrefillChunkPolicy::FixedTokens(
+                NonZeroU32::new(256).expect("non-zero"),
+            ))
+            .expect("fixed policy should be accepted");
+        target
+            .set_prefill_chunk_policy(PrefillChunkPolicy::LongContext256)
+            .expect("long-context policy should be accepted");
+    }
+
+    #[test]
+    fn target_prefill_chunk_policy_rejects_invalid_fixed_size() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let raw_policy = raw::Gemma4PrefillChunkPolicy {
+            mode: raw::GEMMA4_PREFILL_CHUNK_FIXED_TOKENS,
+            fixed_chunk_tokens: 0,
+        };
+
+        // SAFETY: `target` is a valid smoke target; the intentionally invalid policy validates
+        // native argument checks without requiring model execution.
+        let status = unsafe {
+            raw::gemma4_target_set_prefill_chunk_policy(target.ptr.as_ptr(), &raw_policy)
+        };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("fixed prefill chunk"));
+    }
+
+    #[test]
+    fn target_prefill_chunk_policy_rejects_unknown_mode() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let raw_policy = raw::Gemma4PrefillChunkPolicy {
+            mode: 99,
+            fixed_chunk_tokens: 0,
+        };
+
+        // SAFETY: `target` is a valid smoke target; the intentionally unknown mode validates
+        // native argument checks without requiring model execution.
+        let status = unsafe {
+            raw::gemma4_target_set_prefill_chunk_policy(target.ptr.as_ptr(), &raw_policy)
+        };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("unknown prefill chunk policy"));
+    }
+
+    #[test]
     fn empty_kv_cache_rejects_snapshot_export_and_last_step() {
         let cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
 
@@ -1351,6 +1452,12 @@ mod tests {
         let status = unsafe { raw::gemma4_free_target(ptr::null_mut()) };
         assert_eq!(Status::from_raw(status), Status::InvalidArgument);
         assert!(last_error_message().contains("free_target"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status =
+            unsafe { raw::gemma4_target_set_prefill_chunk_policy(ptr::null_mut(), ptr::null()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("prefill_chunk_policy"));
 
         // SAFETY: This deliberately passes null pointers to validate native argument checks.
         let status = unsafe { raw::gemma4_kv_create(ptr::null(), ptr::null_mut()) };
