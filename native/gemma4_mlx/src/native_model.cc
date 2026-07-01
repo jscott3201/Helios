@@ -1664,13 +1664,21 @@ struct NativeMtpDraftStep {
     array projected_hidden;
 };
 
+bool experimental_mtp_skip_final_projection_enabled() {
+    const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_MTP_SKIP_FINAL_PROJECTION");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+        std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
 NativeMtpDraftStep assistant_draft_one(
     const NativeMtpAssistantModel::Impl& assistant,
     const NativeTextModel::Impl& target,
     const NativeHiddenState::Impl& shared,
     const array& current_hidden,
     int32_t token_id,
-    int position_offset) {
+    int position_offset,
+    bool need_projected_hidden) {
     array token_embedding = target_token_embedding(target, token_id);
     array input = mlx::core::concatenate({token_embedding, current_hidden}, 2);
     array h = quantized_linear(assistant, input, "pre_projection");
@@ -1685,6 +1693,10 @@ NativeMtpDraftStep assistant_draft_one(
 
     array logits = assistant_logits(assistant, h);
     array greedy = mlx::core::argmax(logits);
+    if (!need_projected_hidden) {
+        mlx::core::eval(greedy);
+        return NativeMtpDraftStep{greedy.item<int>(), std::move(h)};
+    }
     array projected = quantized_linear(assistant, h, "post_projection");
     mlx::core::eval({greedy, projected});
 
@@ -3412,17 +3424,22 @@ bool NativeMtpAssistantModel::draft_block(
         array current_hidden = last_hidden.impl_->hidden;
         int32_t token_id = context_tokens.back();
         size_t produced = 0;
+        const bool skip_final_projection = experimental_mtp_skip_final_projection_enabled();
         for (uint32_t step = 0; step < block_size; ++step) {
+            const bool need_projected_hidden = !skip_final_projection || step + 1 < block_size;
             NativeMtpDraftStep draft = assistant_draft_one(
                 *impl_,
                 *target_model.impl_,
                 *last_hidden.impl_,
                 current_hidden,
                 token_id,
-                static_cast<int>(first_position + step));
+                static_cast<int>(first_position + step),
+                need_projected_hidden);
             out_tokens[produced++] = draft.token;
             token_id = draft.token;
-            current_hidden = std::move(draft.projected_hidden);
+            if (step + 1 < block_size) {
+                current_hidden = std::move(draft.projected_hidden);
+            }
         }
 
         *inout_count = produced;
