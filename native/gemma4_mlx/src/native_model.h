@@ -164,6 +164,12 @@ public:
         std::string* error,
         std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
 
+    bool decode_incremental_state_only(
+        int32_t token,
+        NativeKvState* kv_state,
+        Gemma4StepResult* out,
+        std::string* error) const;
+
     bool decode_incremental_block(
         const int32_t* tokens,
         size_t token_count,

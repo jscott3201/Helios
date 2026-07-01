@@ -1443,6 +1443,42 @@ NativeForwardArrays decode_last_logits(
     return NativeForwardArrays{std::move(logits), std::move(h), std::move(shared_kv)};
 }
 
+NativeHiddenArrays decode_last_hidden(
+    const NativeTextModel::Impl& impl,
+    int32_t token,
+    NativeKvState::Impl* target_kv) {
+    if (target_kv == nullptr || target_kv->sequence_len == 0 || target_kv->layers.size() != kTargetLayerCount) {
+        throw std::runtime_error("native incremental state advance requires a populated target KV cache");
+    }
+    if (target_kv->sequence_len > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native incremental state advance position exceeds MLX shape limits");
+    }
+
+    const uint64_t previous_sequence_len = target_kv->sequence_len;
+    std::vector<int32_t> ids = {token};
+    array token_ids(ids.begin(), {1, 1}, mlx::core::int32);
+    array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
+    SharedKvArrays shared_kv;
+
+    for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
+        h = target_layer_decode_forward(
+            impl,
+            h,
+            layer,
+            previous_sequence_len,
+            &target_kv->layers[layer],
+            &shared_kv);
+    }
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
+        1e-6f));
+    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    target_kv->sequence_len = previous_sequence_len + 1;
+    target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
+    return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
+}
+
 NativeForwardArrays decode_block_logits(
     const NativeTextModel::Impl& impl,
     const int32_t* tokens,
@@ -3067,6 +3103,51 @@ bool NativeTextModel::decode_incremental(
         return false;
     } catch (...) {
         *error = "native Gemma 4 incremental decode failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+bool NativeTextModel::decode_incremental_state_only(
+    int32_t token,
+    NativeKvState* kv_state,
+    Gemma4StepResult* out,
+    std::string* error) const {
+    if (out == nullptr || error == nullptr || kv_state == nullptr) {
+        return false;
+    }
+    *out = Gemma4StepResult{};
+    error->clear();
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)token;
+    *error = "native Gemma 4 graph was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->language_tensor_count == 0) {
+            *error = "native Gemma 4 model state is not loaded";
+            return false;
+        }
+        if (kv_state->impl_ == nullptr || kv_state->sequence_len() == 0) {
+            *error = "native incremental state advance requires a prior native prefill";
+            return false;
+        }
+
+        mlx::core::reset_peak_memory();
+        NativeHiddenArrays forward = decode_last_hidden(*impl_, token, kv_state->impl_.get());
+        mlx::core::eval(forward.hidden);
+
+        out->sequence_len = kv_state->sequence_len();
+        out->active_kv_bytes = kv_state->active_bytes();
+        out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
+        out->peak_rss_mb = 0.0f;
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native Gemma 4 incremental state advance failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native Gemma 4 incremental state advance failed with an unknown exception";
         return false;
     }
 #endif

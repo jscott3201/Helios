@@ -1572,6 +1572,9 @@ Gemma4Status verify_tokens_impl(
             draft_tokens[0] == cache->last_step.greedy_token) {
             const bool serial_state_repair =
                 env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_SERIAL_STATE_REPAIR");
+            const bool state_only_serial_repair =
+                serial_state_repair &&
+                env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_STATE_ONLY_REPAIR");
             std::unique_ptr<gemma4d::NativeKvState> block_kv = cache->native_kv_state->clone();
             if (block_kv == nullptr) {
                 return fail(GEMMA4_ERR_RUNTIME, "native MTP block-prefix verify failed to clone target KV state");
@@ -1628,6 +1631,19 @@ Gemma4Status verify_tokens_impl(
                 uint64_t active_kv_bytes =
                     std::max(block_step.active_kv_bytes, cache->native_kv_state->active_bytes());
                 for (size_t index = 0; index < committed_count; ++index) {
+                    if (state_only_serial_repair && index + 1 < committed_count) {
+                        Gemma4StepResult state_step{};
+                        if (!target->native_model->decode_incremental_state_only(
+                                committed_tokens[index],
+                                serial_kv.get(),
+                                &state_step,
+                                &native_error)) {
+                            return fail(GEMMA4_ERR_RUNTIME, native_error);
+                        }
+                        peak_memory_gb = std::max(peak_memory_gb, state_step.peak_memory_gb);
+                        active_kv_bytes = std::max(active_kv_bytes, state_step.active_kv_bytes);
+                        continue;
+                    }
                     if (!target->native_model->decode_incremental(
                             committed_tokens[index],
                             serial_kv.get(),
