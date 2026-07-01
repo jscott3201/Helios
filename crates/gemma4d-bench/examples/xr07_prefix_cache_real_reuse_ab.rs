@@ -133,12 +133,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     blockers.extend(blockers_for_records(&records, &selected_cases, &options));
     blockers.sort();
     blockers.dedup();
-    let cap_recommendation = cap_recommendation(
+    let mut cap_recommendation = cap_recommendation(
         &records,
         environment.hw_memsize_bytes,
         TINY16_CAP_MEMORY_FRACTION,
     );
     let decision = decision_for(&blockers, &records, &aggregates, &cap_recommendation);
+    apply_decision_to_cap_recommendation(&decision, &mut cap_recommendation);
     let status = if decision == "blocked_with_evidence" {
         "blocked"
     } else {
@@ -1616,6 +1617,24 @@ fn cap_recommendation(
         default_policy,
         rationale,
     }
+}
+
+fn apply_decision_to_cap_recommendation(
+    decision: &str,
+    cap_recommendation: &mut CapRecommendation,
+) {
+    if decision == "accept_candidate" {
+        return;
+    }
+    let candidate_cap = cap_recommendation
+        .recommended_tiny16_cap_mib
+        .map(|cap| format!("{cap} MiB"))
+        .unwrap_or_else(|| "unavailable".to_owned());
+    cap_recommendation.default_policy =
+        "do_not_enable_ram_prefix_cache_by_default_for_tiny16".to_owned();
+    cap_recommendation.rationale = format!(
+        "decision {decision} prevents default enablement; candidate cap would be {candidate_cap} if correctness, namespace, speed, and memory blockers are resolved"
+    );
 }
 
 fn failed_hypotheses(records: &[Record], aggregates: &[Aggregate]) -> Vec<String> {
