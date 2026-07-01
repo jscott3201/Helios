@@ -1569,6 +1569,56 @@ Gemma4Status verify_tokens_impl(
         }
 
         std::string native_error;
+        // Experimental XR30 prototype: when the first draft token already
+        // disagrees with the cached target greedy token, no speculative token
+        // can be accepted. Commit the known fallback directly and avoid the
+        // staged KV clone used by rollback-capable verifier paths. This is a
+        // success-path measurement only; a late decode failure can invalidate
+        // the live cache, so keep it default-off.
+        if (terminal_commit_count == 0 &&
+            env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_DIRECT_FIRST_REJECT") &&
+            draft_tokens[0] != cache->last_step.greedy_token) {
+            const uint64_t context_sequence_len = cache->native_tokens.size();
+            Gemma4MtpTraceInfo trace{};
+            initialize_mtp_trace(&trace, context_sequence_len);
+            record_mtp_target_step(&trace, 0, context_sequence_len, cache->last_step);
+            record_mtp_draft_score(&trace, 0, draft_tokens[0], cache->last_step);
+
+            const int32_t fallback_token = cache->last_step.greedy_token;
+            Gemma4StepResult fallback_step{};
+            std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
+            if (!target->native_model->decode_incremental(
+                    fallback_token,
+                    cache->native_kv_state.get(),
+                    &fallback_step,
+                    &native_error,
+                    &fallback_hidden)) {
+                return fail(GEMMA4_ERR_RUNTIME, native_error);
+            }
+
+            const size_t lookahead_index = draft_count;
+            fallback_step.peak_memory_gb =
+                std::max(fallback_step.peak_memory_gb, cache->last_step.peak_memory_gb);
+            fallback_step.active_kv_bytes =
+                std::max(fallback_step.active_kv_bytes, cache->native_kv_state->active_bytes());
+            record_mtp_target_step(&trace, lookahead_index, context_sequence_len, fallback_step);
+            record_mtp_hidden_shape(&trace, fallback_hidden.get());
+
+            fallback_step.accepted_draft_count = 0;
+            fallback_step.committed_count = 1;
+            fallback_step.committed_tokens[0] = fallback_token;
+            fallback_step.mtp_trace = trace;
+
+            cache->native_tokens.push_back(fallback_token);
+            cache->last_hidden = std::move(fallback_hidden);
+            fallback_step.native_last_hidden = cache->last_hidden.get();
+            *out = fallback_step;
+            out->native_last_hidden = cache->last_hidden.get();
+            remember_last_step(cache, out);
+            target->sequence_len = out->sequence_len;
+            return ok();
+        }
+
         // Experimental XR22 prototype: use one block target decode when the
         // first draft is already known accepted, and keep an exact prefix KV for
         // fallback if the second draft is rejected.
