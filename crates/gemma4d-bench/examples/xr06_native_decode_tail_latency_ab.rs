@@ -40,6 +40,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_REQUIRE_MLX",
     "GEMMA4D_USE_NATIVE_GRAPH",
     "GEMMA4D_NATIVE_DECODE_KV_EVAL",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -556,6 +557,14 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             0,
             0,
         ),
+        native_variant_with_extra_env(
+            "native_decode_gather_greedy_logit",
+            "per_layer",
+            Some("native_decode_eval_per_layer"),
+            48,
+            0,
+            [("GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT", "1")],
+        ),
     ];
     if !options.variant_names.is_empty() {
         let requested = options
@@ -586,6 +595,24 @@ fn native_variant(
     immediate_layer_kv_eval_count: usize,
     grouped_end_kv_eval_count: usize,
 ) -> Variant {
+    native_variant_with_extra_env(
+        name,
+        eval_policy,
+        baseline_variant,
+        immediate_layer_kv_eval_count,
+        grouped_end_kv_eval_count,
+        [],
+    )
+}
+
+fn native_variant_with_extra_env<const N: usize>(
+    name: &str,
+    eval_policy: &str,
+    baseline_variant: Option<&str>,
+    immediate_layer_kv_eval_count: usize,
+    grouped_end_kv_eval_count: usize,
+    extra_env: [(&str, &str); N],
+) -> Variant {
     let mut config = BTreeMap::new();
     config.insert("decode_kv_eval".to_owned(), eval_policy.to_owned());
     config.insert(
@@ -604,6 +631,10 @@ fn native_variant(
         "GEMMA4D_NATIVE_DECODE_KV_EVAL".to_owned(),
         eval_policy.to_owned(),
     );
+    for (key, value) in extra_env {
+        config.insert(key.to_owned(), value.to_owned());
+        env.insert(key.to_owned(), value.to_owned());
+    }
     Variant {
         name: name.to_owned(),
         config,

@@ -84,6 +84,7 @@ struct NativeTextModel::Impl {
     size_t language_tensor_count = 0;
     size_t total_tensor_count_seen = 0;
     std::string manifest_summary;
+    bool experimental_gather_greedy_logit = false;
 };
 
 struct NativeMtpAssistantModel::Impl {
@@ -1794,6 +1795,18 @@ bool trace_parity_logits_enabled() {
     return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
+bool experimental_native_gather_greedy_logit_env_enabled() {
+    const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+array greedy_logit_for_vector_logits(const array& logits, const array& greedy, bool use_gather) {
+    if (use_gather) {
+        return to_float32(mlx::core::take(logits, greedy, 0));
+    }
+    return to_float32(mlx::core::max(logits));
+}
+
 void trace_parity_logits(const std::vector<int32_t>& tokens, const array& logits) {
     if (!trace_parity_logits_enabled()) {
         return;
@@ -2752,6 +2765,8 @@ bool NativeTextModel::load(
         model->impl_->manifest_summary = manifest.summary();
         model->impl_->default_quantization = manifest.default_quantization();
         model->impl_->quantization_overrides = manifest.quantization_overrides;
+        model->impl_->experimental_gather_greedy_logit =
+            experimental_native_gather_greedy_logit_env_enabled();
 
         const std::vector<std::filesystem::path> files = safetensor_files(model_path);
         if (files.empty()) {
@@ -2918,7 +2933,8 @@ bool NativeTextModel::forward_greedy(
         NativeForwardArrays forward = forward_last_logits(*impl_, tokens);
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits);
-        array max_logit = to_float32(mlx::core::max(logits));
+        array max_logit =
+            greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
         mlx::core::eval({greedy, max_logit});
         trace_parity_logits(tokens, logits);
 
@@ -2996,7 +3012,8 @@ bool NativeTextModel::prefill_incremental(
         NativeForwardArrays forward = prefill_last_logits(*impl_, tokens, state->impl_.get());
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits);
-        array max_logit = to_float32(mlx::core::max(logits));
+        array max_logit =
+            greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
         mlx::core::eval({greedy, max_logit});
         trace_parity_logits(tokens, logits);
 
@@ -3070,7 +3087,8 @@ bool NativeTextModel::decode_incremental(
         NativeForwardArrays forward = decode_last_logits(*impl_, token, kv_state->impl_.get());
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits);
-        array max_logit = to_float32(mlx::core::max(logits));
+        array max_logit =
+            greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
         mlx::core::eval({greedy, max_logit});
 
         std::unique_ptr<NativeHiddenState> hidden;
