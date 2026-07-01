@@ -376,6 +376,13 @@ enum class PrefillKvEvalMode {
     SelectiveFullAttention,
 };
 
+enum class DecodeKvEvalMode {
+    PerLayer,
+    EndOfDecode,
+    SelectiveFullAttention,
+    DeferToLogits,
+};
+
 constexpr int kTargetLayerCount = 48;
 constexpr int kHiddenSize = 3840;
 constexpr int kSlidingWindowSize = 1024;
@@ -412,6 +419,37 @@ bool eval_prefill_kv_when_stored(PrefillKvEvalMode mode, bool full_attention) {
 bool eval_prefill_kv_at_end(PrefillKvEvalMode mode, bool full_attention) {
     return mode == PrefillKvEvalMode::EndOfPrefill ||
         (mode == PrefillKvEvalMode::SelectiveFullAttention && !full_attention);
+}
+
+DecodeKvEvalMode decode_kv_eval_mode() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_DECODE_KV_EVAL");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "current") == 0 ||
+        std::strcmp(value, "per_layer") == 0) {
+        return DecodeKvEvalMode::PerLayer;
+    }
+    if (std::strcmp(value, "end") == 0 || std::strcmp(value, "end_of_decode") == 0 ||
+        std::strcmp(value, "grouped") == 0) {
+        return DecodeKvEvalMode::EndOfDecode;
+    }
+    if (std::strcmp(value, "selective") == 0 ||
+        std::strcmp(value, "selective_full_attention") == 0) {
+        return DecodeKvEvalMode::SelectiveFullAttention;
+    }
+    if (std::strcmp(value, "defer") == 0 || std::strcmp(value, "defer_to_logits") == 0 ||
+        std::strcmp(value, "logits") == 0) {
+        return DecodeKvEvalMode::DeferToLogits;
+    }
+    return DecodeKvEvalMode::PerLayer;
+}
+
+bool eval_decode_kv_when_stored(DecodeKvEvalMode mode, bool full_attention) {
+    return mode == DecodeKvEvalMode::PerLayer ||
+        (mode == DecodeKvEvalMode::SelectiveFullAttention && full_attention);
+}
+
+bool eval_decode_kv_at_end(DecodeKvEvalMode mode, bool full_attention) {
+    return mode == DecodeKvEvalMode::EndOfDecode ||
+        (mode == DecodeKvEvalMode::SelectiveFullAttention && !full_attention);
 }
 
 uint64_t estimate_target_kv_bytes(uint64_t sequence_len) {
@@ -740,7 +778,9 @@ array target_attention_decode_forward(
     target_kv->full_attention = full_attention;
     target_kv->key = cached_keys;
     target_kv->value = cached_values;
-    mlx::core::eval({*target_kv->key, *target_kv->value});
+    if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
+        mlx::core::eval({*target_kv->key, *target_kv->value});
+    }
     capture_shared_kv(shared_kv, layer_idx, full_attention, *target_kv->key, *target_kv->value);
 
     array output = mlx::core::fast::scaled_dot_product_attention(
@@ -791,6 +831,29 @@ array target_layer_decode_forward(
         1e-6f));
     h = model_dtype(mlp_residual + h);
     return model_dtype(h * tensor_or_throw(impl, base + ".layer_scalar"));
+}
+
+void eval_deferred_decode_kv(NativeKvState::Impl* target_kv, DecodeKvEvalMode mode) {
+    if (target_kv == nullptr || mode == DecodeKvEvalMode::PerLayer ||
+        mode == DecodeKvEvalMode::DeferToLogits) {
+        return;
+    }
+    std::vector<array> eval_arrays;
+    eval_arrays.reserve(target_kv->layers.size() * 2);
+    for (const NativeKvState::Impl::Layer& layer : target_kv->layers) {
+        if (!eval_decode_kv_at_end(mode, layer.full_attention)) {
+            continue;
+        }
+        if (layer.key.has_value()) {
+            eval_arrays.push_back(*layer.key);
+        }
+        if (layer.value.has_value()) {
+            eval_arrays.push_back(*layer.value);
+        }
+    }
+    if (!eval_arrays.empty()) {
+        mlx::core::eval(eval_arrays);
+    }
 }
 
 bool trace_layer_stats_enabled() {
@@ -1182,6 +1245,7 @@ NativeForwardArrays decode_last_logits(
         1e-6f));
     array logits = target_logits_for_hidden(impl, h);
     logits = mlx::core::reshape(logits, {262144});
+    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
     target_kv->sequence_len = previous_sequence_len + 1;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
     return NativeForwardArrays{std::move(logits), std::move(h), std::move(shared_kv)};
