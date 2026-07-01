@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+xr13-prototypes = []
+
 [dependencies]
 gemma4d-tokenizer = { version = "0.1.0", path = "../gemma4d-tokenizer" }
 serde = { version = "1.0.228", features = ["derive"] }
