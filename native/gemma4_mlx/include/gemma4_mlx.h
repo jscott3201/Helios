@@ -178,6 +178,15 @@ Gemma4Status gemma4_decode_one(
     Gemma4KvCache* cache,
     int32_t token,
     Gemma4StepResult* out);
+Gemma4Status gemma4_decode_block(
+    Gemma4Target* target,
+    Gemma4KvCache* cache,
+    const int32_t* tokens,
+    size_t token_count,
+    int32_t* out_greedy_tokens,
+    float* out_greedy_logits,
+    size_t* inout_count,
+    Gemma4StepResult* out);
 
 Gemma4Status gemma4_load_drafter(
     const Gemma4LoadConfig* config,

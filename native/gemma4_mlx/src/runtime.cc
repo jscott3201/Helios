@@ -1275,6 +1275,87 @@ Gemma4Status gemma4_decode_one(
     return helper_command(target, command.str(), out);
 }
 
+Gemma4Status gemma4_decode_block(
+    Gemma4Target* target,
+    Gemma4KvCache* cache,
+    const int32_t* tokens,
+    size_t token_count,
+    int32_t* out_greedy_tokens,
+    float* out_greedy_logits,
+    size_t* inout_count,
+    Gemma4StepResult* out) {
+    clear_step_result(out);
+
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_decode_block requires a valid target handle");
+    }
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_decode_block requires a valid cache handle");
+    }
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_decode_block requires a non-null step result");
+    }
+    if (tokens == nullptr || token_count == 0) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_decode_block requires at least one token");
+    }
+    if (token_count > 2) {
+        return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, "gemma4_decode_block currently supports token_count <= 2");
+    }
+    if (out_greedy_tokens == nullptr || out_greedy_logits == nullptr || inout_count == nullptr) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_decode_block requires greedy token/logit output buffers and count");
+    }
+    if (*inout_count < token_count) {
+        *inout_count = token_count;
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_decode_block output buffers are too small");
+    }
+    *inout_count = 0;
+    if (!target->model_loaded) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_decode_block requires a loaded Gemma 4 target model; smoke handles do not execute");
+    }
+    if (!target->use_native_graph) {
+        return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, "gemma4_decode_block requires the native target graph");
+    }
+    if (target->native_model == nullptr) {
+        return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 model state is missing");
+    }
+    if (cache->native_kv_state == nullptr) {
+        return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 block decode requires a prior prefill");
+    }
+
+    std::string native_error;
+    std::vector<int32_t> greedy_tokens;
+    std::vector<float> greedy_logits;
+    if (!target->native_model->decode_incremental_block(
+            tokens,
+            token_count,
+            cache->native_kv_state.get(),
+            out,
+            &greedy_tokens,
+            &greedy_logits,
+            &native_error,
+            &cache->last_hidden)) {
+        return fail(GEMMA4_ERR_RUNTIME, native_error);
+    }
+    if (greedy_tokens.size() < token_count || greedy_logits.size() < token_count) {
+        return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 block decode returned incomplete logits");
+    }
+
+    for (size_t index = 0; index < token_count; ++index) {
+        cache->native_tokens.push_back(tokens[index]);
+        out_greedy_tokens[index] = greedy_tokens[index];
+        out_greedy_logits[index] = greedy_logits[index];
+    }
+    *inout_count = token_count;
+    out->native_last_hidden = cache->last_hidden.get();
+    remember_last_step(cache, out);
+    target->sequence_len = out->sequence_len;
+    return ok();
+}
+
 Gemma4Status gemma4_load_drafter(
     const Gemma4LoadConfig* config,
     Gemma4Target* target,

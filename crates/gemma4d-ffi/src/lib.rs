@@ -231,6 +231,16 @@ mod raw {
             token: i32,
             out: *mut Gemma4StepResult,
         ) -> Gemma4Status;
+        pub fn gemma4_decode_block(
+            target: *mut Gemma4Target,
+            cache: *mut Gemma4KvCache,
+            tokens: *const i32,
+            token_count: usize,
+            out_greedy_tokens: *mut i32,
+            out_greedy_logits: *mut f32,
+            inout_count: *mut usize,
+            out: *mut Gemma4StepResult,
+        ) -> Gemma4Status;
         pub fn gemma4_load_drafter(
             config: *const Gemma4LoadConfig,
             target: *mut Gemma4Target,
@@ -906,6 +916,40 @@ pub fn decode_one(target: &Target, cache: &mut KvCache, token: i32) -> Result<St
     })?;
 
     Ok(out.into())
+}
+
+pub fn decode_block(
+    target: &Target,
+    cache: &mut KvCache,
+    tokens: &[i32],
+) -> Result<(StepResult, Vec<i32>, Vec<f32>)> {
+    let mut out = raw::Gemma4StepResult::default();
+    let mut greedy_tokens = vec![0; tokens.len()];
+    let mut greedy_logits = vec![0.0; tokens.len()];
+    let mut count = tokens.len();
+    let token_ptr = if tokens.is_empty() {
+        ptr::null()
+    } else {
+        tokens.as_ptr()
+    };
+
+    // SAFETY: handles come from safe wrappers; token and output buffers are
+    // sized by `count`, and `out` is writable for the duration of the call.
+    check(unsafe {
+        raw::gemma4_decode_block(
+            target.ptr.as_ptr(),
+            cache.ptr.as_ptr(),
+            token_ptr,
+            tokens.len(),
+            greedy_tokens.as_mut_ptr(),
+            greedy_logits.as_mut_ptr(),
+            &mut count,
+            &mut out,
+        )
+    })?;
+    greedy_tokens.truncate(count);
+    greedy_logits.truncate(count);
+    Ok((out.into(), greedy_tokens, greedy_logits))
 }
 
 pub fn draft_block(
