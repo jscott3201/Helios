@@ -1570,6 +1570,8 @@ Gemma4Status verify_tokens_impl(
         if (terminal_commit_count == 0 &&
             env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_ROLLBACK") && draft_count == 2 &&
             draft_tokens[0] == cache->last_step.greedy_token) {
+            const bool serial_state_repair =
+                env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_SERIAL_STATE_REPAIR");
             std::unique_ptr<gemma4d::NativeKvState> block_kv = cache->native_kv_state->clone();
             if (block_kv == nullptr) {
                 return fail(GEMMA4_ERR_RUNTIME, "native MTP block-prefix verify failed to clone target KV state");
@@ -1612,7 +1614,62 @@ Gemma4Status verify_tokens_impl(
             record_mtp_target_step(&trace, 1, context_sequence_len, second_target_step);
             record_mtp_draft_score(&trace, 1, draft_tokens[1], second_target_step);
 
+            auto commit_serial_repaired_state =
+                [&](const int32_t* committed_tokens, size_t committed_count, uint32_t accepted_count) -> Gemma4Status {
+                std::unique_ptr<gemma4d::NativeKvState> serial_kv = cache->native_kv_state->clone();
+                if (serial_kv == nullptr) {
+                    return fail(
+                        GEMMA4_ERR_RUNTIME,
+                        "native MTP block-prefix serial-state repair failed to clone target KV state");
+                }
+                Gemma4StepResult serial_step{};
+                std::unique_ptr<gemma4d::NativeHiddenState> serial_hidden;
+                float peak_memory_gb = std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
+                uint64_t active_kv_bytes =
+                    std::max(block_step.active_kv_bytes, cache->native_kv_state->active_bytes());
+                for (size_t index = 0; index < committed_count; ++index) {
+                    if (!target->native_model->decode_incremental(
+                            committed_tokens[index],
+                            serial_kv.get(),
+                            &serial_step,
+                            &native_error,
+                            &serial_hidden)) {
+                        return fail(GEMMA4_ERR_RUNTIME, native_error);
+                    }
+                    peak_memory_gb = std::max(peak_memory_gb, serial_step.peak_memory_gb);
+                    active_kv_bytes = std::max(active_kv_bytes, serial_step.active_kv_bytes);
+                }
+                record_mtp_target_step(&trace, committed_count, context_sequence_len, serial_step);
+                record_mtp_hidden_shape(&trace, serial_hidden.get());
+
+                serial_step.peak_memory_gb = peak_memory_gb;
+                serial_step.active_kv_bytes = active_kv_bytes;
+                serial_step.accepted_draft_count = accepted_count;
+                serial_step.committed_count = static_cast<uint32_t>(committed_count);
+                for (size_t index = 0; index < committed_count && index < 4; ++index) {
+                    serial_step.committed_tokens[index] = committed_tokens[index];
+                }
+                serial_step.mtp_trace = trace;
+
+                for (size_t index = 0; index < committed_count; ++index) {
+                    cache->native_tokens.push_back(committed_tokens[index]);
+                }
+                cache->native_kv_state = std::move(serial_kv);
+                cache->last_hidden = std::move(serial_hidden);
+                serial_step.native_last_hidden = cache->last_hidden.get();
+                *out = serial_step;
+                out->native_last_hidden = cache->last_hidden.get();
+                remember_last_step(cache, out);
+                target->sequence_len = out->sequence_len;
+                return ok();
+            };
+
             if (draft_tokens[1] == block_greedy_tokens[0]) {
+                const int32_t committed_tokens[2] = {draft_tokens[0], draft_tokens[1]};
+                if (serial_state_repair) {
+                    return commit_serial_repaired_state(committed_tokens, 2, 2);
+                }
+
                 Gemma4StepResult lookahead_step = block_step;
                 lookahead_step.greedy_token = block_greedy_tokens[1];
                 lookahead_step.greedy_logit = block_greedy_logits[1];
@@ -1641,6 +1698,11 @@ Gemma4Status verify_tokens_impl(
             }
 
             const int32_t fallback_token = block_greedy_tokens[0];
+            const int32_t committed_tokens[2] = {draft_tokens[0], fallback_token};
+            if (serial_state_repair) {
+                return commit_serial_repaired_state(committed_tokens, 2, 1);
+            }
+
             Gemma4StepResult fallback_step{};
             std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
             if (!target->native_model->decode_incremental(
