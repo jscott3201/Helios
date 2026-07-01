@@ -41,6 +41,7 @@ which code produced it, and what claims are allowed.
 | 2026-07-01 | XR04 MTP repair and A/B evidence | Accept candidate | `50fe4e2` plus local XR04 verifier repair | `native_mtp_incremental_verify_trace` | `benchmarks/out/XR04-mtp-repair-and-autotune/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` plus `xr03-repro/` and `exactness-smoke/` subruns | Reproduced the XR03 blocker first, then repaired live MTP verify to stage against cloned incremental KV. The 32-token root run stayed byte-identical for 10/10 records with acceptance `162/370 = 0.438`; MTP remains opt-in because generation speedups are workload/block dependent. |
 | 2026-07-01 | XR05 prefill and MLX eval scheduling A/B | Reject candidate | `5b145fc` plus local candidate-wide decision-gate fix | `prefill_eval_scheduling_real_context_ab` | `benchmarks/out/XR05-prefill-and-eval-scheduling-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr05-1782873617-153379000`; command `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr05_prefill_eval_scheduling_ab -- --out-dir benchmarks/out/XR05-prefill-and-eval-scheduling-ab`; 72/72 records passed runtime with no blockers, but no candidate satisfied the candidate-wide no-correctness-regression gate. |
 | 2026-07-01 | XR06 native decode tail-latency A/B | Accept candidate | `92b0757` | `native_decode_tail_latency_real_context_ab` | `benchmarks/out/XR06-native-decode-tail-latency-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr06-1782877235-943162000`; command `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab`; 60/60 records passed with no blockers. Native decode eval scheduling remains opt-in; accepted comparisons were workload-local and several tail hypotheses failed. |
+| 2026-07-01 | XR07 prefix cache real reuse A/B | Blocked with evidence | `6e4280b` | `native_ram_prefix_cache_real_reuse_ab` | `benchmarks/out/XR07-prefix-cache-real-reuse-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr07-1782880867-63480000`; command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab --trials 2 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 4`; namespace isolation passed, but restored continuation/continued decode parity failed and tiny16 memory gates failed at 8K/16K. Default policy is `do_not_enable_ram_prefix_cache_by_default_for_tiny16`. |
 
 ## P00 Baseline Snapshot
 
@@ -641,6 +642,68 @@ XR06 interpretation:
   keeping decode eval scheduling opt-in while pursuing a stricter per-family or
   per-position policy and adding progress logging to the long runner.
 
+## XR07 Prefix Cache Real Reuse A/B Snapshot
+
+XR07 measures realistic RAM prefix reuse where a long real-context prefix is
+cached and a small edited suffix is replayed before continuing generation. The
+candidate warm path includes namespace lookup, native snapshot import, and
+edited suffix replay overhead. Runtime code was not optimized.
+
+| Field | Value |
+|---|---|
+| Command | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab --trials 2 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 4` |
+| Evidence | `benchmarks/out/XR07-prefix-cache-real-reuse-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Smoke evidence | `benchmarks/out/XR07-prefix-cache-real-reuse-ab-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Run ID | `xr07-1782880867-63480000` |
+| Git SHA | `6e4280bcb31787847e1b9696018e51b9a6baa1ed` |
+| Mode | `native_ram_prefix_cache_real_reuse_ab` |
+| Records | `6`: 3 contexts x 2 trials |
+| Suffix shape | 4-token suffix with 2-token deterministic edit; 4 continued decode tokens |
+| Namespace safety | Passed for every trial: base/adapter namespaces and block IDs differed, base-to-adapter and adapter-to-base restores rejected, wrong cache mode rejected, same-namespace miss recorded |
+| Decision | `blocked_with_evidence` |
+| Default policy | `do_not_enable_ram_prefix_cache_by_default_for_tiny16`; candidate cap would be `634 MiB` only if correctness, speed, and memory blockers are resolved |
+
+Workload cases:
+
+| Case | Context | Source workload | Prefix tokens | Suffix tokens | Edit distance | Derived seed | Suffix source |
+|---|---:|---|---:|---:|---:|---:|---|
+| `xr07_4k_code_review_rust_4k_001` | 4096 | `code_review_rust_4k_001` | 4092 | 4 | 2 | 1231492896 | `deterministic_token_suffix_edit` |
+| `xr07_8k_prefix_reuse_edit_8k_a_001` | 8192 | `prefix_reuse_edit_8k_a_001` | 8188 | 4 | 2 | 2036799275 | `deterministic_token_suffix_edit` |
+| `xr07_16k_long_repo_pack_16k_001` | 16384 | `long_repo_pack_16k_001` | 16380 | 4 | 2 | 426186536 | `deterministic_token_suffix_edit` |
+
+Aggregate results:
+
+| Case | Trials | Fresh full ms | Warm TTFT ms | Speedup | Lookup ms | Import ms | Suffix replay ms | Active KV MiB | Resident MiB | Peak MLX GB | Correct | Namespace | Meaningful |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| `xr07_4k_code_review_rust_4k_001` | 2/2 | 10601.746 | 1434.190 | 2.746x | 0.080 | 0.007 | 1434.103 | 384.000 | 767.875 | 10.718 | `false` | `true` | `true` |
+| `xr07_8k_prefix_reuse_edit_8k_a_001` | 2/2 | 39631.771 | 21908.417 | 0.812x | 0.333 | 0.016 | 21908.067 | 448.000 | 895.875 | 15.710 | `false` | `true` | `false` |
+| `xr07_16k_long_repo_pack_16k_001` | 2/2 | 100412.709 | 45707.847 | 2.197x | 1.011 | 0.562 | 45706.274 | 576.000 | 1151.875 | 27.353 | `false` | `true` | `true` |
+
+XR07 blockers:
+
+- Restored full-context continuation did not match fresh full prefill for both
+  4K trials and both 16K trials.
+- Continued greedy decode after restored suffix replay did not match fresh
+  continuation for all 6 records.
+- 8K and 16K crossed the 14 GB tiny16 peak MLX memory gate: `15.710 GB` and
+  `27.353 GB`.
+- 8K did not meet the warm TTFT gate after suffix replay; median speedup was
+  `0.812x`.
+- Every aggregate is low-N evidence (`2/2` trials).
+
+XR07 interpretation:
+
+- Real edited-suffix prefix reuse is not safe to enable by default. P06 exact
+  snapshot restore remains valid for exact restored prefixes, but XR07 shows the
+  current restore-plus-suffix-replay path is not fresh-prefill exact on real
+  edited contexts.
+- Namespace isolation behaved correctly, including adapter-qualified and
+  cache-mode rejection, but safety admission is insufficient without restored
+  continuation parity.
+- The candidate cap estimate (`634 MiB`) is only a sizing note for a future
+  corrected implementation. It is not a default policy recommendation while the
+  decision remains `blocked_with_evidence`.
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -673,6 +736,7 @@ XR06 interpretation:
 | 2026-07-01 | Repaired native MTP verification to stage against cloned incremental target KV instead of full-prefix verifier recompute. The live verifier now compares drafts against the cache's last-step prediction, advances accepted/fallback tokens through `decode_incremental`, swaps staged KV/hidden/tokens only after success, and records top-1 incremental trace evidence. | `native/gemma4_mlx/src/runtime.cc`, `BENCHMARKS.md` | `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --example xr03_mtp_real_context_diagnosis`; `cargo test -p gemma4d-ffi --lib`; `cargo test -p gemma4d-bench --lib`; `cargo check -p gemma4d-bench --example p05_native_mtp --example xr03_mtp_real_context_diagnosis`; XR04 pre-fix repro, exactness smoke, and root 32-token A/B runs. |
 | 2026-07-01 | Added XR05 prefill/eval scheduling A/B harness and opt-in knobs: helper `GEMMA4D_MLX_LM_PREFILL_CHUNK_TOKENS`, helper `GEMMA4D_MLX_LM_PREFILL_CLEAR_CACHE`, and native `GEMMA4D_NATIVE_PREFILL_KV_EVAL`. The runner records command, seeds, token lengths, MLX peak memory, RSS, prefill tok/s, TTFT, correctness gates, low-N status, blockers, and decision artifacts. It also enforces candidate-wide no-correctness-regression before accepting any workload-local win. | `.codex/agents/tui-ux-engineer.toml`, `codex/goals/XR05-prefill-and-eval-scheduling-ab.goal.md`, `native/gemma4_mlx/scripts/gemma4d_mlx_lm_helper.py`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-bench/examples/xr05_prefill_eval_scheduling_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr05_prefill_eval_scheduling_ab`; `cargo check -p gemma4d-ffi`; TOML parse for `.codex/agents/tui-ux-engineer.toml`; smoke and full XR05 runs with escalated Metal access. |
 | 2026-07-01 | Added XR06 native decode tail-latency A/B harness and opt-in native decode KV eval scheduling modes. The runner records deterministic workload seeds/token lengths, per-token latency traces, position before/after decode, active KV bytes, peak MLX memory, eval-policy markers, correctness gates, blockers, failed hypotheses, and decision artifacts. | `codex/goals/XR06-native-decode-tail-latency-ab.goal.md`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --example xr06_native_decode_tail_latency_ab`; smoke and full XR06 runs with escalated Metal access. |
+| 2026-07-01 | Added XR07 real-prefix RAM cache A/B harness and goal contract. The runner derives 4K/8K/16K real-context repeated-prefix cases from the XR00 corpus, applies deterministic small suffix edits, compares fresh full prefill against RAM restore plus native import and suffix replay, records hit rate, warm TTFT, restore/import/replay latency, continued decode parity, active KV bytes, cache residency, adapter namespace isolation, failed hypotheses, blockers, and default-policy decision artifacts. It does not optimize runtime code. | `codex/goals/XR07-prefix-cache-real-reuse-ab.goal.md`, `crates/gemma4d-bench/examples/xr07_prefix_cache_real_reuse_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab`; `cargo check -p gemma4d-ffi`; `cargo test -p gemma4d-kv --lib`; XR07 smoke and full runs with escalated Metal access. |
 
 ## Verification Gates
 
@@ -752,6 +816,12 @@ XR06 interpretation:
 | 2026-07-01 | `cargo check -p gemma4d-bench --example xr06_native_decode_tail_latency_ab` | Passed | Focused compile gate for the XR06 benchmark runner. |
 | 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --trials 1 --max-new-tokens 8 --clear-workload-ids --workload-id chat_short_1k_001 --variants native_decode_eval_per_layer,native_decode_eval_defer_to_logits --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab-smoke` | Passed | Required escalated Metal access; wrote smoke artifacts with 2/2 records passed and no blockers. Decision was `reject_candidate` because the smoke intentionally had fewer than three trials. |
 | 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab` | Passed | Required escalated Metal access; wrote 60 real-context records, 3 trials, 64 generated tokens, no blockers, and decision `accept_candidate`. |
+| 2026-07-01 | `cargo fmt --all --check` | Passed | Formatting gate after the XR07 runner and benchmark-ledger changes. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab` | Passed | Focused compile gate for the XR07 prefix-cache real-reuse runner. |
+| 2026-07-01 | `cargo check -p gemma4d-ffi` | Passed | Focused native/FFI compile gate before XR07 native MLX execution. |
+| 2026-07-01 | `cargo test -p gemma4d-kv --lib` | Passed | 18 passed; covers namespace mismatch, adapter partitioning, RAM/SSD restore, cache accounting, and compression metadata tests. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab-smoke --clear-contexts --context 4096 --trials 1 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 1` | Blocked with evidence | Required escalated Metal access; wrote smoke artifacts and exposed restored-continuation plus continued-decode parity blockers at 4K. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab --trials 2 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 4` | Blocked with evidence | Required escalated Metal access; wrote 6 real-context records and final XR07 artifacts. Decision is `blocked_with_evidence`; default policy is `do_not_enable_ram_prefix_cache_by_default_for_tiny16`. |
 
 ## Current Claim Boundaries
 
@@ -868,3 +938,12 @@ XR06 interpretation:
   stayed below 14 GB peak MLX, but system memory pressure reached yellow with
   roughly 5 GB swap during the run. Treat tiny16 adoption as unresolved until a
   smaller policy matrix and sentinel run pass.
+- XR07 does not justify enabling RAM prefix cache by default. The real edited
+  suffix restore path failed restored-continuation or continued-decode parity on
+  every selected context, even though namespace safety checks passed.
+- XR07 warm TTFT claims include namespace lookup, native snapshot import, and
+  edited suffix replay. The 8K case was slower than fresh full prefill after
+  suffix replay, and 8K/16K crossed the 14 GB tiny16 memory gate.
+- XR07's `634 MiB` cap is only a candidate sizing note after blockers are
+  resolved. It is not an adoption recommendation while the decision remains
+  `blocked_with_evidence`.
