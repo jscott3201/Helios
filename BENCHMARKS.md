@@ -36,6 +36,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | P11 model revision and manifest pinning | Passed | final SHA recorded in generated manifest | `manifest_capture_local_artifact_identity` | `benchmarks/out/P11-manifest-pinning/{manifest.json,report.md}` | Command `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; target and drafter revisions are explicitly pinned in `tiny16.toml` to local artifact SHA-256s because local revision metadata is unavailable. |
 | 2026-06-30 | XR00 real-context workload corpus | Passed | final SHA recorded in generated summary | `real_context_corpus_tokenizer_count_only` | `benchmarks/workloads/real-contexts/{workloads.jsonl,prompts/*.txt}` and `benchmarks/out/XR00-real-workload-corpus/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630`; no model execution or runtime optimization. |
 | 2026-06-30 | XR01 real-context A/B harness | Passed | final SHA recorded in generated summary | `real_context_ab_harness_dry_run_plus_helper_smoke` | `benchmarks/out/XR01-real-context-ab-harness/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2`; writes dry-run and real helper smoke records for the XR00 corpus schema, no runtime optimization. |
+| 2026-06-30 | XR02 native vs helper real-context A/B | Blocked with evidence | `d60664b` plus local XR02 harness changes | `native_incremental_vs_helper_real_contexts` | `benchmarks/out/XR02-native-helper-real-context-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench --example xr02_native_helper_real_context_ab -- --trials 2 --max-new-tokens 8`; 5 real XR00 workloads, 2 variants, 2 trials, 20 records. Native is blocked by chat/tool token mismatches and a 16K tiny16 memory cliff; code-review is opt-in only. |
 
 ## P00 Baseline Snapshot
 
@@ -393,6 +394,44 @@ smoke command paths only; it is not a performance win claim.
 | Decision | `accept_candidate` |
 | Blockers | none recorded |
 
+## XR02 Native vs Helper Real-Context A/B Snapshot
+
+XR02 reuses the XR01 harness shape against real XR00 prompt files and compares
+the helper/default baseline with the opt-in native incremental path
+(`GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1`). It does not optimize
+runtime code or switch defaults.
+
+| Field | Value |
+|---|---|
+| Command | `cargo run -p gemma4d-bench --example xr02_native_helper_real_context_ab -- --trials 2 --max-new-tokens 8` |
+| Workload manifest | `benchmarks/workloads/real-contexts/workloads.jsonl` |
+| Evidence | `benchmarks/out/XR02-native-helper-real-context-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Variants | `baseline=helper`, `candidate=native` with `GEMMA4D_REQUIRE_MLX=1,GEMMA4D_USE_NATIVE_GRAPH=1`; cache/MTP/adapter disabled |
+| Records | `20` real records: 5 workloads x 2 variants x 2 trials |
+| Requested max new tokens | `8` |
+| Correctness | Native token IDs mismatched helper on `chat_short_1k_001` and `tool_json_1k_001`; token IDs matched on `code_review_rust_4k_001`, `code_review_rust_8k_001`, and `benchmark_qa_16k_001` |
+| Decision | `blocked_with_evidence` |
+| Blockers | 4 failed candidate records: both trials of `chat_short_1k_001` and `tool_json_1k_001` |
+
+Workload selection:
+
+| Workload | Family | Target tokens | Actual tokens | Workload max new tokens | Seed |
+|---|---|---:|---:|---:|---:|
+| `chat_short_1k_001` | `chat_short` | 1024 | 1024 | 128 | 20260630 |
+| `code_review_rust_4k_001` | `code_review_rust` | 4096 | 4096 | 192 | 20260631 |
+| `code_review_rust_8k_001` | `code_review_rust` | 8192 | 8192 | 256 | 20260632 |
+| `benchmark_qa_16k_001` | `benchmark_qa` | 16384 | 16384 | 256 | 20260634 |
+| `tool_json_1k_001` | `tool_json` | 1024 | 1024 | 160 | 20260635 |
+
+Family recommendations:
+
+| Family | Recommendation | Token match | Max logit delta | Helper p95 ms | Native p95 ms | Native p95 delta | Native peak GB | Active KV bytes | Reason |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| `benchmark_qa` | `blocked` | `true` | 0.500 | 1498.076 | 25246.230 | 1585.244% | 21.868 | 604094464 | Native peak MLX memory exceeded the 14 GB tiny16 cliff. |
+| `chat_short` | `blocked` | `false` | 1.375 | 346.156 | 340.265 | -1.702% | 7.321 | 352436224 | Candidate generated token IDs did not match helper baseline. |
+| `code_review_rust` | `native_opt_in` | `true` | 1.750 | 379.987 | 4468.121 | 1075.861% | 12.763 | 469876736 | Token parity held and active KV bytes were observed, but p95 missed the default gate. |
+| `tool_json` | `blocked` | `false` | 2.375 | 110.312 | 227.390 | 106.133% | 7.321 | 352436224 | Candidate generated token IDs did not match helper baseline. |
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -420,6 +459,7 @@ smoke command paths only; it is not a performance win claim.
 | 2026-06-30 | Added `gemma4d-bench manifest`, reusable manifest capture structs, SHA-256 model identity in generic benchmark reports, P00 local artifact identity fields, and config validation that accepts local-artifact pins while warning on `PIN_ME` or unavailable revisions. | `crates/gemma4d-bench/src/manifest.rs`, `crates/gemma4d-bench/src/lib.rs`, `crates/gemma4d-bench/examples/p00_performance_baseline.rs`, `crates/gemma4d-tui/src/config.rs`, `references/configs/tiny16.toml`, `references/templates/benchmark-report.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets --no-run`; `cargo test -p gemma4d-tui --all-targets`; `cargo run -p gemma4d-bench -- manifest --out-dir benchmarks/out/P11-manifest-pinning`; `make verify`. |
 | 2026-06-30 | Added XR00 real-context workload corpus generation: copied XR methodology docs/goal into root paths, added `gemma4d-bench workload-corpus`, generated deterministic prompt files and `workloads.jsonl`, and wrote XR00 decision/evidence artifacts. | `docs/xr-*.md`, `codex/goals/XR00-real-workload-corpus.goal.md`, `crates/gemma4d-bench/src/workload_corpus.rs`, `crates/gemma4d-bench/src/lib.rs`, `benchmarks/workloads/real-contexts/` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630`. |
 | 2026-06-30 | Added XR01 real-context A/B harness: reusable `xr_ab` report/evidence module, example runner, explicit baseline/candidate variant config, dry-run mode, failure-closed real-run mode, real helper smoke records, and XR01 decision artifacts. | `codex/goals/XR01-real-context-ab-harness.goal.md`, `crates/gemma4d-bench/src/xr_ab.rs`, `crates/gemma4d-bench/src/lib.rs`, `crates/gemma4d-bench/examples/xr01_real_context_ab.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode dry-run --out-dir benchmarks/out/XR01-real-context-ab-harness-dry-run --max-workloads 1 --max-new-tokens 2`; `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2`. |
+| 2026-06-30 | Added XR02 native/helper real-context A/B profile on the reusable XR harness: XR02 defaults, native candidate env, generated-logit comparison, first-token and steady-state decode fields, per-family recommendations, deterministic seed/token metadata in records and reports, and failure-closed decision artifacts. | `codex/goals/XR02-native-helper-real-context-ab.goal.md`, `crates/gemma4d-bench/src/xr_ab.rs`, `crates/gemma4d-bench/examples/xr02_native_helper_real_context_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench --example xr02_native_helper_real_context_ab -- --trials 2 --max-new-tokens 8`. |
 
 ## Verification Gates
 
@@ -471,6 +511,9 @@ smoke command paths only; it is not a performance win claim.
 | 2026-06-30 | `cargo run -p gemma4d-bench -- workload-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --workload-dir benchmarks/workloads/real-contexts --out-dir benchmarks/out/XR00-real-workload-corpus --python /opt/homebrew/opt/mlx-lm/libexec/bin/python --seed 20260630` | Passed | Wrote 13 workload records, prompt files, and XR00 evidence artifacts; local tokenizer measured exact 1K/4K/8K/16K/24K context lengths with no blockers. |
 | 2026-06-30 | `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode dry-run --out-dir benchmarks/out/XR01-real-context-ab-harness-dry-run --max-workloads 1 --max-new-tokens 2` | Passed | CI/offline smoke wrote dry-run records and decision artifacts without requiring the 12B model; decision is `needs_more_data` by design because no real model path is exercised. |
 | 2026-06-30 | `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2` | Passed | Wrote final XR01 records, summary, report, blocker report, and decision; includes dry-run and real helper smoke records with no blockers. |
+| 2026-06-30 | `cargo fmt --all --check` | Passed | Formatting gate after XR02 harness/report metadata changes. |
+| 2026-06-30 | `cargo test -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for XR02 harness defaults, report schema, and example runner. |
+| 2026-06-30 | `cargo run -p gemma4d-bench --example xr02_native_helper_real_context_ab -- --trials 2 --max-new-tokens 8` | Blocked with evidence | Wrote 20 real records and XR02 decision artifacts; example exits nonzero by design when decision is `blocked_with_evidence`. |
 
 ## Current Claim Boundaries
 
@@ -542,3 +585,10 @@ smoke command paths only; it is not a performance win claim.
   run uses one 1K workload and helper-backed baseline/candidate configs, so it
   does not claim a runtime speedup, native backend superiority, server
   readiness, cache benefit, MTP benefit, or adapter behavior.
+- XR02 does not justify making native incremental the default on measured
+  real-context workloads. `chat_short` and `tool_json` failed token parity, and
+  `benchmark_qa` hit a 21.868 GB native peak MLX memory cliff against the
+  14 GB tiny16 gate.
+- XR02's `code_review_rust` family is `native_opt_in` only: generated token
+  parity held and native active KV bytes were observed, but native p95 decode
+  missed the default gate by 1075.861%.

@@ -14,8 +14,50 @@ use crate::{CliError, manifest, workload_corpus::WorkloadRecord};
 
 pub const DEFAULT_WORKLOADS_PATH: &str = "benchmarks/workloads/real-contexts/workloads.jsonl";
 pub const DEFAULT_OUT_DIR: &str = "benchmarks/out/XR01-real-context-ab-harness";
+pub const XR02_OUT_DIR: &str = "benchmarks/out/XR02-native-helper-real-context-ab";
 pub const DEFAULT_MODEL_PATH: &str = "artifacts/models/gemma-4-12B-it-4bit";
-pub const GOAL: &str = "XR01-real-context-ab-harness";
+pub const XR01_GOAL: &str = "XR01-real-context-ab-harness";
+pub const XR02_GOAL: &str = "XR02-native-helper-real-context-ab";
+pub const XR02_DEFAULT_MAX_NEW_TOKENS: usize = 16;
+pub const TINY16_MEMORY_CLIFF_GB: f64 = 14.0;
+pub const LOGIT_TOLERANCE: f64 = 0.5;
+pub const XR02_WORKLOAD_IDS: &[&str] = &[
+    "chat_short_1k_001",
+    "tool_json_1k_001",
+    "code_review_rust_4k_001",
+    "code_review_rust_8k_001",
+    "benchmark_qa_16k_001",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalProfile {
+    Xr01Harness,
+    Xr02NativeHelper,
+}
+
+impl GoalProfile {
+    fn goal_id(self) -> &'static str {
+        match self {
+            Self::Xr01Harness => XR01_GOAL,
+            Self::Xr02NativeHelper => XR02_GOAL,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Xr01Harness => "XR01 Real-Context A/B Harness",
+            Self::Xr02NativeHelper => "XR02 Native vs Helper Real-Context A/B",
+        }
+    }
+
+    fn run_id_prefix(self) -> &'static str {
+        match self {
+            Self::Xr01Harness => "xr01",
+            Self::Xr02NativeHelper => "xr02",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -168,6 +210,7 @@ impl VariantConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrAbOptions {
+    pub goal: GoalProfile,
     pub out_dir: PathBuf,
     pub workloads_path: PathBuf,
     pub model_path: PathBuf,
@@ -183,6 +226,7 @@ pub struct XrAbOptions {
 impl Default for XrAbOptions {
     fn default() -> Self {
         Self {
+            goal: GoalProfile::Xr01Harness,
             out_dir: PathBuf::from(DEFAULT_OUT_DIR),
             workloads_path: PathBuf::from(DEFAULT_WORKLOADS_PATH),
             model_path: PathBuf::from(DEFAULT_MODEL_PATH),
@@ -197,10 +241,30 @@ impl Default for XrAbOptions {
     }
 }
 
+impl XrAbOptions {
+    pub fn xr02_defaults() -> Self {
+        let mut candidate = VariantConfig::candidate();
+        candidate.backend = BackendMode::Native;
+        Self {
+            goal: GoalProfile::Xr02NativeHelper,
+            out_dir: PathBuf::from(XR02_OUT_DIR),
+            mode: RunMode::Real,
+            workload_ids: XR02_WORKLOAD_IDS
+                .iter()
+                .map(|workload_id| (*workload_id).to_owned())
+                .collect(),
+            max_new_tokens: Some(XR02_DEFAULT_MAX_NEW_TOKENS),
+            candidate,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct XrAbSummary {
     pub schema_version: u32,
     pub goal: String,
+    pub generated_at_unix_seconds: u64,
     pub decision: String,
     pub status: String,
     pub run_id: String,
@@ -217,7 +281,9 @@ pub struct XrAbSummary {
     pub decision_path: String,
     pub variants: Vec<VariantConfig>,
     pub requested_trials: usize,
+    pub requested_max_new_tokens: Option<usize>,
     pub selected_workloads: Vec<String>,
+    pub selected_workload_details: Vec<SelectedWorkload>,
     pub record_count: usize,
     pub dry_run_records: usize,
     pub real_records: usize,
@@ -225,9 +291,23 @@ pub struct XrAbSummary {
     pub blocked_records: usize,
     pub failed_records: usize,
     pub schema_checks: SchemaChecks,
+    pub family_recommendations: Vec<FamilyRecommendation>,
+    pub failed_hypotheses: Vec<String>,
     pub command_paths: Vec<String>,
     pub generated_files: Vec<String>,
     pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectedWorkload {
+    pub workload_id: String,
+    pub family: String,
+    pub prompt_path: String,
+    pub prompt_sha256: String,
+    pub target_context_tokens: usize,
+    pub actual_context_tokens: usize,
+    pub workload_max_new_tokens: usize,
+    pub deterministic_seed: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,7 +320,27 @@ pub struct SchemaChecks {
     pub has_peak_memory: bool,
     pub has_active_kv_bytes: bool,
     pub has_output_token_ids: bool,
+    pub has_output_logits: bool,
+    pub has_steady_state_decode: bool,
     pub has_correctness_gate: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FamilyRecommendation {
+    pub family: String,
+    pub workloads: Vec<String>,
+    pub recommendation: String,
+    pub token_match: bool,
+    pub max_logit_abs_delta: f64,
+    pub helper_decode_p95_ms: f64,
+    pub native_decode_p95_ms: f64,
+    pub native_decode_p95_delta_percent: f64,
+    pub helper_peak_mlx_gb: f64,
+    pub native_peak_mlx_gb: f64,
+    pub native_active_kv_bytes: u64,
+    pub memory_cliff: bool,
+    pub low_n: bool,
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,6 +357,9 @@ pub struct XrAbRecord {
     pub prompt_path: String,
     pub prompt_sha256: String,
     pub expected_output_style: String,
+    pub target_context_tokens: usize,
+    pub workload_max_new_tokens: usize,
+    pub deterministic_seed: u64,
     pub variant: String,
     pub backend: String,
     pub config: VariantConfig,
@@ -264,14 +367,20 @@ pub struct XrAbRecord {
     pub input_tokens: usize,
     pub generated_tokens: usize,
     pub output_token_ids: Vec<i32>,
+    pub output_logits: Vec<f64>,
     pub model_load_ms: f64,
     pub prefill_ms: f64,
     pub decode_ms: f64,
     pub total_ms: f64,
     pub decode_token_latencies_ms: Vec<f64>,
+    pub first_decode_ms: f64,
+    pub steady_decode_token_latencies_ms: Vec<f64>,
     pub decode_p50_ms: f64,
     pub decode_p95_ms: f64,
     pub decode_p99_ms: f64,
+    pub steady_decode_p50_ms: f64,
+    pub steady_decode_p95_ms: f64,
+    pub steady_decode_p99_ms: f64,
     pub prefill_tps: f64,
     pub decode_tps: f64,
     pub peak_mlx_gb: f64,
@@ -291,6 +400,9 @@ pub struct CorrectnessGate {
     pub gate: String,
     pub reference_variant: Option<String>,
     pub token_match: Option<bool>,
+    pub logit_match: Option<bool>,
+    pub max_logit_abs_delta: Option<f64>,
+    pub logit_tolerance: Option<f64>,
     pub first_mismatch_index: Option<usize>,
     pub notes: Vec<String>,
 }
@@ -299,6 +411,7 @@ pub struct CorrectnessGate {
 struct GenerateJson {
     input_tokens: Option<usize>,
     generated_tokens: Option<Vec<i32>>,
+    generated_logits: Option<Vec<f64>>,
     model_load_ms: Option<f64>,
     prefill_ms: Option<f64>,
     ttft_ms: Option<f64>,
@@ -317,7 +430,25 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    let mut options = XrAbOptions::default();
+    parse_cli_args_with_defaults(XrAbOptions::default(), args)
+}
+
+pub fn parse_xr02_cli_args<I, S>(args: I) -> Result<XrAbOptions, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    parse_cli_args_with_defaults(XrAbOptions::xr02_defaults(), args)
+}
+
+fn parse_cli_args_with_defaults<I, S>(
+    mut options: XrAbOptions,
+    args: I,
+) -> Result<XrAbOptions, CliError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut args = args.into_iter().map(Into::into).peekable();
 
     while let Some(arg) = args.next() {
@@ -329,6 +460,7 @@ where
             "--model-path" => {
                 options.model_path = PathBuf::from(required_value(&mut args, "--model-path")?)
             }
+            "--goal" => options.goal = parse_goal_profile(&required_value(&mut args, "--goal")?)?,
             "--mode" => options.mode = parse_run_mode(&required_value(&mut args, "--mode")?)?,
             "--trials" => {
                 options.trials =
@@ -344,6 +476,9 @@ where
                 options
                     .workload_ids
                     .push(required_value(&mut args, "--workload-id")?);
+            }
+            "--clear-workload-ids" => {
+                options.workload_ids.clear();
             }
             "--max-new-tokens" => {
                 options.max_new_tokens = Some(parse_positive_usize(
@@ -435,6 +570,10 @@ where
 }
 
 pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliError> {
+    write_xr_ab_artifacts(options)
+}
+
+pub fn write_xr_ab_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliError> {
     fs::create_dir_all(&options.out_dir)
         .map_err(|error| CliError::Runtime(format!("failed to create out dir: {error}")))?;
 
@@ -444,7 +583,7 @@ pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliErr
     let blockers_path = options.out_dir.join("blockers.md");
     let decision_path = options.out_dir.join("decision.md");
 
-    let run_id = run_id();
+    let run_id = run_id(options.goal);
     let git_sha =
         command_stdout("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
     let git_status_short =
@@ -468,6 +607,7 @@ pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliErr
             let prompt_sha256 = sha256_hex(prompt.as_bytes());
             for trial_index in 0..options.trials {
                 let mut baseline_tokens = None;
+                let mut baseline_logits = None;
                 for variant in &variants {
                     let mut record = run_variant(
                         options,
@@ -488,6 +628,9 @@ pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliErr
                             gate: "baseline_self_check".to_owned(),
                             reference_variant: None,
                             token_match: Some(true),
+                            logit_match: Some(true),
+                            max_logit_abs_delta: Some(0.0),
+                            logit_tolerance: Some(LOGIT_TOLERANCE),
                             first_mismatch_index: None,
                             notes: vec![
                                 "baseline record is the reference for this workload/trial/run_kind"
@@ -495,11 +638,16 @@ pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliErr
                             ],
                         };
                         baseline_tokens = Some(record.output_token_ids.clone());
-                    } else if let Some(reference_tokens) = &baseline_tokens {
+                        baseline_logits = Some(record.output_logits.clone());
+                    } else if let (Some(reference_tokens), Some(reference_logits)) =
+                        (&baseline_tokens, &baseline_logits)
+                    {
                         record.correctness = compare_against_baseline(
                             &variant.name,
                             reference_tokens,
                             &record.output_token_ids,
+                            reference_logits,
+                            &record.output_logits,
                         );
                         if record.correctness.status != "passed" && record.status == "passed" {
                             record.status = "failed".to_owned();
@@ -513,6 +661,9 @@ pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliErr
                             gate: "baseline_missing".to_owned(),
                             reference_variant: Some(options.baseline.name.clone()),
                             token_match: None,
+                            logit_match: None,
+                            max_logit_abs_delta: None,
+                            logit_tolerance: Some(LOGIT_TOLERANCE),
                             first_mismatch_index: None,
                             notes: vec![
                                 "baseline record was unavailable for comparison".to_owned(),
@@ -531,6 +682,7 @@ pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliErr
     command_paths.sort();
     command_paths.dedup();
     write_jsonl(&records_path, &records)?;
+    let selected_workload_details = workloads.iter().map(selected_workload).collect::<Vec<_>>();
     let summary = build_summary(
         options,
         &model_identity,
@@ -538,6 +690,7 @@ pub fn write_xr01_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliErr
             .iter()
             .map(|workload| workload.workload_id.clone())
             .collect(),
+        selected_workload_details,
         records.len(),
         &records,
         command_paths,
@@ -622,12 +775,14 @@ fn dry_run_record(
 ) -> XrAbRecord {
     let max_new_tokens = effective_max_new_tokens(options, workload);
     let output_token_ids = synthetic_tokens(workload, trial_index, max_new_tokens);
+    let output_logits = synthetic_logits(workload, max_new_tokens);
     let decode_token_latencies_ms = synthetic_latencies(workload, max_new_tokens);
     let decode_ms = decode_token_latencies_ms.iter().sum::<f64>();
     let prefill_ms = workload.actual_context_tokens as f64 * 0.011;
     let total_ms = prefill_ms + decode_ms;
     let command = format!(
-        "cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode dry-run --workloads {} --out-dir {} --max-workloads {} --trials {} --max-new-tokens {}",
+        "cargo run -p gemma4d-bench --example {} -- --mode dry-run --workloads {} --out-dir {} --max-workloads {} --trials {} --max-new-tokens {}",
+        example_name(options.goal),
         shell_quote(&options.workloads_path.display().to_string()),
         shell_quote(&options.out_dir.display().to_string()),
         options.max_workloads.unwrap_or(usize::MAX),
@@ -647,6 +802,7 @@ fn dry_run_record(
         trial_index,
         input_tokens,
         output_token_ids,
+        output_logits,
         0.0,
         prefill_ms,
         decode_ms,
@@ -778,6 +934,7 @@ fn real_run_record(
                 );
             };
             let output_token_ids = parsed.generated_tokens.clone().unwrap_or_default();
+            let output_logits = parsed.generated_logits.clone().unwrap_or_default();
             let decode_token_latencies_ms =
                 parsed.decode_token_latencies_ms.clone().unwrap_or_default();
             let decode_ms = parsed
@@ -800,6 +957,7 @@ fn real_run_record(
                 trial_index,
                 input_tokens,
                 output_token_ids,
+                output_logits,
                 parsed.model_load_ms.unwrap_or(0.0),
                 prefill_ms,
                 decode_ms,
@@ -864,6 +1022,7 @@ fn base_record(
     trial_index: usize,
     input_tokens: usize,
     output_token_ids: Vec<i32>,
+    output_logits: Vec<f64>,
     model_load_ms: f64,
     prefill_ms: f64,
     decode_ms: f64,
@@ -879,6 +1038,11 @@ fn base_record(
     let decode_p50_ms = percentile(&decode_token_latencies_ms, 50.0);
     let decode_p95_ms = percentile(&decode_token_latencies_ms, 95.0);
     let decode_p99_ms = percentile(&decode_token_latencies_ms, 99.0);
+    let first_decode_ms = decode_token_latencies_ms.first().copied().unwrap_or(0.0);
+    let steady_decode_token_latencies_ms = steady_decode_latencies(&decode_token_latencies_ms);
+    let steady_decode_p50_ms = percentile(&steady_decode_token_latencies_ms, 50.0);
+    let steady_decode_p95_ms = percentile(&steady_decode_token_latencies_ms, 95.0);
+    let steady_decode_p99_ms = percentile(&steady_decode_token_latencies_ms, 99.0);
     let generated_tokens = output_token_ids.len();
     let decode_tps = if decode_ms > 0.0 {
         generated_tokens as f64 / (decode_ms / 1000.0)
@@ -888,7 +1052,7 @@ fn base_record(
 
     XrAbRecord {
         schema_version: 1,
-        goal: GOAL.to_owned(),
+        goal: record_goal_id(run_id).to_owned(),
         run_id: run_id.to_owned(),
         git_sha: git_sha.to_owned(),
         git_status_short: git_status_short.to_owned(),
@@ -899,6 +1063,9 @@ fn base_record(
         prompt_path: workload.prompt_path.clone(),
         prompt_sha256: prompt_sha256.to_owned(),
         expected_output_style: workload.expected_output_style.clone(),
+        target_context_tokens: workload.target_context_tokens,
+        workload_max_new_tokens: workload.max_new_tokens,
+        deterministic_seed: workload.deterministic_seed,
         variant: variant.name.clone(),
         backend: variant.backend.as_str().to_owned(),
         config: variant.clone(),
@@ -906,14 +1073,20 @@ fn base_record(
         input_tokens,
         generated_tokens,
         output_token_ids,
+        output_logits,
         model_load_ms,
         prefill_ms,
         decode_ms,
         total_ms,
         decode_token_latencies_ms,
+        first_decode_ms,
+        steady_decode_token_latencies_ms,
         decode_p50_ms,
         decode_p95_ms,
         decode_p99_ms,
+        steady_decode_p50_ms,
+        steady_decode_p95_ms,
+        steady_decode_p99_ms,
         prefill_tps,
         decode_tps,
         peak_mlx_gb: 0.0,
@@ -924,6 +1097,9 @@ fn base_record(
             gate: "pending_pairwise_comparison".to_owned(),
             reference_variant: None,
             token_match: None,
+            logit_match: None,
+            max_logit_abs_delta: None,
+            logit_tolerance: Some(LOGIT_TOLERANCE),
             first_mismatch_index: None,
             notes: Vec::new(),
         },
@@ -992,6 +1168,7 @@ fn blocked_record_with_stdio(
         trial_index,
         workload.actual_context_tokens,
         Vec::new(),
+        Vec::new(),
         0.0,
         0.0,
         0.0,
@@ -1009,6 +1186,9 @@ fn blocked_record_with_stdio(
         gate: "command_completed_with_metrics".to_owned(),
         reference_variant: None,
         token_match: None,
+        logit_match: None,
+        max_logit_abs_delta: None,
+        logit_tolerance: Some(LOGIT_TOLERANCE),
         first_mismatch_index: None,
         notes: vec![blocker],
     };
@@ -1019,15 +1199,29 @@ fn compare_against_baseline(
     variant_name: &str,
     reference_tokens: &[i32],
     candidate_tokens: &[i32],
+    reference_logits: &[f64],
+    candidate_logits: &[f64],
 ) -> CorrectnessGate {
+    let max_logit_abs_delta = max_abs_delta(reference_logits, candidate_logits);
+    let logit_match = max_logit_abs_delta <= LOGIT_TOLERANCE;
     if reference_tokens == candidate_tokens {
+        let mut notes = vec![format!("{variant_name} matched baseline output token ids")];
+        if !logit_match {
+            notes.push(format!(
+                "greedy logits drifted by max abs delta {:.3}; token parity is authoritative for XR02",
+                max_logit_abs_delta
+            ));
+        }
         return CorrectnessGate {
             status: "passed".to_owned(),
-            gate: "candidate_output_token_ids_equal_baseline".to_owned(),
+            gate: "candidate_output_token_ids_equal_baseline_with_logit_delta".to_owned(),
             reference_variant: Some("baseline".to_owned()),
             token_match: Some(true),
+            logit_match: Some(logit_match),
+            max_logit_abs_delta: Some(max_logit_abs_delta),
+            logit_tolerance: Some(LOGIT_TOLERANCE),
             first_mismatch_index: None,
-            notes: vec![format!("{variant_name} matched baseline output token ids")],
+            notes,
         };
     }
 
@@ -1038,9 +1232,12 @@ fn compare_against_baseline(
         .or_else(|| Some(reference_tokens.len().min(candidate_tokens.len())));
     CorrectnessGate {
         status: "failed".to_owned(),
-        gate: "candidate_output_token_ids_equal_baseline".to_owned(),
+        gate: "candidate_output_token_ids_equal_baseline_with_logit_delta".to_owned(),
         reference_variant: Some("baseline".to_owned()),
         token_match: Some(false),
+        logit_match: Some(logit_match),
+        max_logit_abs_delta: Some(max_logit_abs_delta),
+        logit_tolerance: Some(LOGIT_TOLERANCE),
         first_mismatch_index,
         notes: vec![format!(
             "{variant_name} differed from baseline output token ids"
@@ -1052,6 +1249,7 @@ fn build_summary(
     options: &XrAbOptions,
     model_identity: &manifest::ArtifactIdentity,
     selected_workloads: Vec<String>,
+    selected_workload_details: Vec<SelectedWorkload>,
     record_count: usize,
     records: &[XrAbRecord],
     command_paths: Vec<String>,
@@ -1081,6 +1279,7 @@ fn build_summary(
         .filter(|record| record.status == "failed" || record.correctness.status == "failed")
         .count();
     let schema_checks = schema_checks(records);
+    let family_recommendations = family_recommendations(options.goal, records);
     let mut blockers = records
         .iter()
         .filter_map(|record| {
@@ -1097,6 +1296,7 @@ fn build_summary(
         })
         .collect::<Vec<_>>();
     blockers.extend(decision_blockers(
+        options.goal,
         options.mode,
         dry_run_records,
         real_records,
@@ -1105,15 +1305,20 @@ fn build_summary(
     blockers.sort();
     blockers.dedup();
 
-    let decision = if blockers.is_empty() {
-        "accept_candidate"
-    } else if blocked_records > 0 {
-        "blocked_with_evidence"
-    } else {
-        "needs_more_data"
-    };
+    let failed_hypotheses = failed_hypotheses(options.goal, &family_recommendations, &records);
+    let decision = decision_for(
+        options.goal,
+        &blockers,
+        blocked_records,
+        failed_records,
+        &family_recommendations,
+    );
     let status = if blockers.is_empty() {
-        "passed"
+        if failed_records == 0 {
+            "passed"
+        } else {
+            "failed"
+        }
     } else if blocked_records > 0 {
         "blocked"
     } else {
@@ -1122,7 +1327,8 @@ fn build_summary(
 
     XrAbSummary {
         schema_version: 1,
-        goal: GOAL.to_owned(),
+        goal: options.goal.goal_id().to_owned(),
+        generated_at_unix_seconds: unix_seconds_now(),
         decision: decision.to_owned(),
         status: status.to_owned(),
         run_id: run_id.to_owned(),
@@ -1139,7 +1345,9 @@ fn build_summary(
         decision_path: options.out_dir.join("decision.md").display().to_string(),
         variants: vec![options.baseline.clone(), options.candidate.clone()],
         requested_trials: options.trials,
+        requested_max_new_tokens: options.max_new_tokens,
         selected_workloads,
+        selected_workload_details,
         record_count,
         dry_run_records,
         real_records,
@@ -1147,6 +1355,8 @@ fn build_summary(
         blocked_records,
         failed_records,
         schema_checks,
+        family_recommendations,
+        failed_hypotheses,
         command_paths,
         generated_files,
         blockers,
@@ -1154,6 +1364,7 @@ fn build_summary(
 }
 
 fn decision_blockers(
+    goal: GoalProfile,
     mode: RunMode,
     dry_run_records: usize,
     real_records: usize,
@@ -1179,11 +1390,234 @@ fn decision_blockers(
         || !schema.has_peak_memory
         || !schema.has_active_kv_bytes
         || !schema.has_output_token_ids
+        || !schema.has_output_logits
+        || !schema.has_steady_state_decode
         || !schema.has_correctness_gate
     {
-        blockers.push("evidence schema is missing one or more XR01 required fields".to_owned());
+        blockers.push(format!(
+            "evidence schema is missing one or more {} required fields",
+            goal.goal_id()
+        ));
     }
     blockers
+}
+
+fn family_recommendations(goal: GoalProfile, records: &[XrAbRecord]) -> Vec<FamilyRecommendation> {
+    if goal != GoalProfile::Xr02NativeHelper {
+        return Vec::new();
+    }
+
+    let mut families = records
+        .iter()
+        .filter(|record| record.run_kind == "real")
+        .map(|record| record.family.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    families.sort();
+
+    let mut out = Vec::new();
+    for family in families {
+        let family_records = records
+            .iter()
+            .filter(|record| record.run_kind == "real" && record.family == family)
+            .collect::<Vec<_>>();
+        let helper_records = family_records
+            .iter()
+            .copied()
+            .filter(|record| record.variant == "baseline")
+            .collect::<Vec<_>>();
+        let native_records = family_records
+            .iter()
+            .copied()
+            .filter(|record| record.variant == "candidate")
+            .collect::<Vec<_>>();
+        let workloads = family_records
+            .iter()
+            .map(|record| record.workload_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let helper_decode_p95_ms = mean(helper_records.iter().map(|record| record.decode_p95_ms));
+        let native_decode_p95_ms = mean(native_records.iter().map(|record| record.decode_p95_ms));
+        let helper_peak_mlx_gb = max_f64(helper_records.iter().map(|record| record.peak_mlx_gb));
+        let native_peak_mlx_gb = max_f64(native_records.iter().map(|record| record.peak_mlx_gb));
+        let native_active_kv_bytes = native_records
+            .iter()
+            .map(|record| record.active_kv_bytes)
+            .max()
+            .unwrap_or(0);
+        let token_match = native_records
+            .iter()
+            .all(|record| record.correctness.token_match.unwrap_or(false));
+        let max_logit_abs_delta = native_records
+            .iter()
+            .filter_map(|record| record.correctness.max_logit_abs_delta)
+            .fold(0.0_f64, f64::max);
+        let any_blocked = family_records
+            .iter()
+            .any(|record| record.status == "blocked");
+        let memory_cliff = native_peak_mlx_gb > TINY16_MEMORY_CLIFF_GB;
+        let low_n = native_records.len() < 3 || helper_records.len() < 3;
+        let p95_delta_percent = if helper_decode_p95_ms > 0.0 {
+            ((native_decode_p95_ms - helper_decode_p95_ms) / helper_decode_p95_ms) * 100.0
+        } else {
+            0.0
+        };
+        let p95_within_gate =
+            helper_decode_p95_ms > 0.0 && native_decode_p95_ms <= helper_decode_p95_ms * 1.05;
+        let memory_reduced = native_peak_mlx_gb > 0.0
+            && helper_peak_mlx_gb > 0.0
+            && native_peak_mlx_gb <= helper_peak_mlx_gb;
+        let cache_unlocked = native_active_kv_bytes > 0;
+        let mut reasons = Vec::new();
+
+        let recommendation = if any_blocked {
+            reasons.push("one or more real-run records were blocked".to_owned());
+            "blocked"
+        } else if !token_match {
+            reasons.push("candidate generated token IDs did not match helper baseline".to_owned());
+            "blocked"
+        } else if memory_cliff {
+            reasons.push(format!(
+                "native peak MLX memory {:.3} GB exceeded tiny16 cliff {:.3} GB",
+                native_peak_mlx_gb, TINY16_MEMORY_CLIFF_GB
+            ));
+            "blocked"
+        } else if p95_within_gate && (memory_reduced || cache_unlocked) {
+            if p95_delta_percent <= 0.0 {
+                reasons.push(format!(
+                    "native p95 improved by {:.3}%",
+                    p95_delta_percent.abs()
+                ));
+            } else {
+                reasons.push(format!(
+                    "native p95 stayed within 5% regression gate at {:.3}%",
+                    p95_delta_percent
+                ));
+            }
+            if cache_unlocked {
+                reasons.push(format!(
+                    "native active KV bytes observed at {}",
+                    native_active_kv_bytes
+                ));
+            }
+            if memory_reduced {
+                reasons.push("native peak MLX memory did not exceed helper peak".to_owned());
+            }
+            "native_default_candidate"
+        } else if token_match && cache_unlocked {
+            reasons.push(format!(
+                "native token parity held and active KV bytes observed, but p95 delta {:.3}% missed the default gate",
+                p95_delta_percent
+            ));
+            "native_opt_in"
+        } else {
+            reasons.push(format!(
+                "native did not meet default gate; p95 delta {:.3}%, memory_reduced={}, cache_unlocked={}",
+                p95_delta_percent, memory_reduced, cache_unlocked
+            ));
+            "helper_default"
+        };
+
+        if low_n {
+            reasons.push("low_n: fewer than three measured trials per variant".to_owned());
+        }
+
+        out.push(FamilyRecommendation {
+            family,
+            workloads,
+            recommendation: recommendation.to_owned(),
+            token_match,
+            max_logit_abs_delta,
+            helper_decode_p95_ms,
+            native_decode_p95_ms,
+            native_decode_p95_delta_percent: p95_delta_percent,
+            helper_peak_mlx_gb,
+            native_peak_mlx_gb,
+            native_active_kv_bytes,
+            memory_cliff,
+            low_n,
+            reasons,
+        });
+    }
+    out
+}
+
+fn decision_for(
+    goal: GoalProfile,
+    blockers: &[String],
+    blocked_records: usize,
+    failed_records: usize,
+    recommendations: &[FamilyRecommendation],
+) -> &'static str {
+    if blocked_records > 0 {
+        return "blocked_with_evidence";
+    }
+    match goal {
+        GoalProfile::Xr01Harness => {
+            if !blockers.is_empty() {
+                "needs_more_data"
+            } else if failed_records == 0 {
+                "accept_candidate"
+            } else {
+                "needs_more_data"
+            }
+        }
+        GoalProfile::Xr02NativeHelper => {
+            if !blockers.is_empty() {
+                return "blocked_with_evidence";
+            }
+            if failed_records > 0
+                || recommendations
+                    .iter()
+                    .any(|item| item.recommendation == "blocked")
+            {
+                "reject_candidate"
+            } else if !recommendations.is_empty()
+                && recommendations
+                    .iter()
+                    .all(|item| item.recommendation == "native_default_candidate")
+            {
+                "accept_candidate"
+            } else {
+                "keep_experimental"
+            }
+        }
+    }
+}
+
+fn failed_hypotheses(
+    goal: GoalProfile,
+    recommendations: &[FamilyRecommendation],
+    records: &[XrAbRecord],
+) -> Vec<String> {
+    if goal != GoalProfile::Xr02NativeHelper {
+        return Vec::new();
+    }
+    let mut hypotheses = records
+        .iter()
+        .filter(|record| record.status == "failed" || record.correctness.status == "failed")
+        .map(|record| {
+            format!(
+                "{} {} failed correctness gate {}",
+                record.workload_id, record.variant, record.correctness.gate
+            )
+        })
+        .collect::<Vec<_>>();
+    for recommendation in recommendations {
+        if recommendation.recommendation != "native_default_candidate" {
+            hypotheses.push(format!(
+                "family {} recommendation {}: {}",
+                recommendation.family,
+                recommendation.recommendation,
+                recommendation.reasons.join("; ")
+            ));
+        }
+    }
+    hypotheses.sort();
+    hypotheses.dedup();
+    hypotheses
 }
 
 fn schema_checks(records: &[XrAbRecord]) -> SchemaChecks {
@@ -1200,6 +1634,12 @@ fn schema_checks(records: &[XrAbRecord]) -> SchemaChecks {
         has_output_token_ids: records.iter().all(|record| {
             record.status == "blocked" || record.generated_tokens == record.output_token_ids.len()
         }),
+        has_output_logits: records.iter().all(|record| {
+            record.status == "blocked" || record.generated_tokens == record.output_logits.len()
+        }),
+        has_steady_state_decode: records
+            .iter()
+            .all(|record| record.status == "blocked" || record.first_decode_ms >= 0.0),
         has_correctness_gate: records.iter().all(|record| {
             !record.correctness.status.is_empty() && !record.correctness.gate.is_empty()
         }),
@@ -1208,12 +1648,16 @@ fn schema_checks(records: &[XrAbRecord]) -> SchemaChecks {
 
 pub fn render_report(summary: &XrAbSummary, records: &[XrAbRecord]) -> String {
     let mut out = String::new();
-    out.push_str("# XR01 Real-Context A/B Harness Report\n\n");
+    out.push_str(&format!("# {} Report\n\n", summary_title(summary)));
     out.push_str("## Summary\n\n");
     out.push_str("| Field | Value |\n|---|---|\n");
     out.push_str(&format!("| Decision | `{}` |\n", summary.decision));
     out.push_str(&format!("| Status | `{}` |\n", summary.status));
     out.push_str(&format!("| Run ID | `{}` |\n", summary.run_id));
+    out.push_str(&format!(
+        "| Generated at unix seconds | `{}` |\n",
+        summary.generated_at_unix_seconds
+    ));
     out.push_str(&format!("| Git SHA | `{}` |\n", summary.git_sha));
     out.push_str(&format!(
         "| Git status | `{}` |\n",
@@ -1223,6 +1667,17 @@ pub fn render_report(summary: &XrAbSummary, records: &[XrAbRecord]) -> String {
     out.push_str(&format!(
         "| Workloads | `{}` |\n",
         summary.selected_workloads.len()
+    ));
+    out.push_str(&format!(
+        "| Requested trials | `{}` |\n",
+        summary.requested_trials
+    ));
+    out.push_str(&format!(
+        "| Requested max new tokens | `{}` |\n",
+        summary
+            .requested_max_new_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "workload_default".to_owned())
     ));
     out.push_str(&format!("| Records | `{}` |\n", summary.record_count));
     out.push_str(&format!(
@@ -1234,6 +1689,48 @@ pub fn render_report(summary: &XrAbSummary, records: &[XrAbRecord]) -> String {
         "| Model exists | `{}` |\n\n",
         summary.model_identity.exists
     ));
+
+    if !summary.family_recommendations.is_empty() {
+        out.push_str("## Family Recommendations\n\n");
+        out.push_str("| Family | Workloads | Recommendation | Token match | Max logit delta | Helper p95 ms | Native p95 ms | Delta | Native peak GB | Active KV bytes | Notes |\n");
+        out.push_str("|---|---|---|---|---:|---:|---:|---:|---:|---:|---|\n");
+        for item in &summary.family_recommendations {
+            out.push_str(&format!(
+                "| `{}` | `{}` | `{}` | `{}` | {:.3} | {:.3} | {:.3} | {:.3}% | {:.3} | {} | {} |\n",
+                markdown_escape(&item.family),
+                markdown_escape(&item.workloads.join(",")),
+                markdown_escape(&item.recommendation),
+                item.token_match,
+                item.max_logit_abs_delta,
+                item.helper_decode_p95_ms,
+                item.native_decode_p95_ms,
+                item.native_decode_p95_delta_percent,
+                item.native_peak_mlx_gb,
+                item.native_active_kv_bytes,
+                markdown_escape(&item.reasons.join("; "))
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !summary.selected_workload_details.is_empty() {
+        out.push_str("## Workload Metadata\n\n");
+        out.push_str("| Workload | Family | Target tokens | Actual tokens | Max new tokens | Deterministic seed | Prompt SHA-256 |\n");
+        out.push_str("|---|---|---:|---:|---:|---:|---|\n");
+        for workload in &summary.selected_workload_details {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} | {} | {} | {} | `{}` |\n",
+                markdown_escape(&workload.workload_id),
+                markdown_escape(&workload.family),
+                workload.target_context_tokens,
+                workload.actual_context_tokens,
+                workload.workload_max_new_tokens,
+                workload.deterministic_seed,
+                markdown_escape(&workload.prompt_sha256)
+            ));
+        }
+        out.push('\n');
+    }
 
     out.push_str("## Variants\n\n");
     out.push_str(
@@ -1256,11 +1753,13 @@ pub fn render_report(summary: &XrAbSummary, records: &[XrAbRecord]) -> String {
     }
 
     out.push_str("\n## Records\n\n");
-    out.push_str("| Kind | Workload | Variant | Backend | Trial | Status | Input | Output | Prefill ms | Decode p50/p95/p99 ms | Total ms | Peak GB | Active KV bytes | Correctness |\n");
-    out.push_str("|---|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Kind | Workload | Variant | Backend | Trial | Status | Input | Output | Prefill ms | First decode ms | Decode p50/p95/p99 ms | Steady p50/p95/p99 ms | Total ms | Peak GB | Active KV bytes | Correctness | Logit delta |\n");
+    out.push_str(
+        "|---|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|\n",
+    );
     for record in records {
         out.push_str(&format!(
-            "| `{}` | `{}` | `{}` | `{}` | {} | `{}` | {} | {} | {:.3} | {:.3}/{:.3}/{:.3} | {:.3} | {:.3} | {} | `{}` |\n",
+            "| `{}` | `{}` | `{}` | `{}` | {} | `{}` | {} | {} | {:.3} | {:.3} | {:.3}/{:.3}/{:.3} | {:.3}/{:.3}/{:.3} | {:.3} | {:.3} | {} | `{}` | {:.3} |\n",
             record.run_kind,
             markdown_escape(&record.workload_id),
             markdown_escape(&record.variant),
@@ -1270,13 +1769,18 @@ pub fn render_report(summary: &XrAbSummary, records: &[XrAbRecord]) -> String {
             record.input_tokens,
             record.generated_tokens,
             record.prefill_ms,
+            record.first_decode_ms,
             record.decode_p50_ms,
             record.decode_p95_ms,
             record.decode_p99_ms,
+            record.steady_decode_p50_ms,
+            record.steady_decode_p95_ms,
+            record.steady_decode_p99_ms,
             record.total_ms,
             record.peak_mlx_gb,
             record.active_kv_bytes,
-            markdown_escape(&record.correctness.status)
+            markdown_escape(&record.correctness.status),
+            record.correctness.max_logit_abs_delta.unwrap_or(0.0)
         ));
     }
 
@@ -1296,12 +1800,19 @@ pub fn render_report(summary: &XrAbSummary, records: &[XrAbRecord]) -> String {
 
 pub fn render_blockers(summary: &XrAbSummary) -> String {
     let mut out = String::new();
-    out.push_str("# XR01 Blockers\n\n");
+    out.push_str(&format!("# {} Blockers\n\n", summary_title(summary)));
     if summary.blockers.is_empty() {
         out.push_str("No blockers recorded.\n\n");
     } else {
         for blocker in &summary.blockers {
             out.push_str(&format!("- {blocker}\n"));
+        }
+        out.push('\n');
+    }
+    if !summary.failed_hypotheses.is_empty() {
+        out.push_str("## Failed Hypotheses / Rejected Gates\n\n");
+        for hypothesis in &summary.failed_hypotheses {
+            out.push_str(&format!("- {hypothesis}\n"));
         }
         out.push('\n');
     }
@@ -1316,14 +1827,48 @@ pub fn render_blockers(summary: &XrAbSummary) -> String {
 
 pub fn render_decision(summary: &XrAbSummary) -> String {
     let mut out = String::new();
-    out.push_str("# XR01 Decision\n\n");
+    out.push_str(&format!("# {} Decision\n\n", summary_title(summary)));
     out.push_str(&format!("Decision: `{}`\n\n", summary.decision));
-    if summary.blockers.is_empty() {
-        out.push_str(
-            "The XR01 harness produced dry-run evidence and real model smoke evidence with stable A/B records, decode percentile fields, prefill/total timing fields, memory fields, active KV bytes, output token IDs, and correctness gates. This accepts the harness shape only; it does not claim a production serving or runtime optimization win.\n\n",
-        );
-    } else {
-        out.push_str("The XR01 harness wrote evidence but cannot be accepted until the blockers are resolved.\n\n");
+    match summary.goal.as_str() {
+        XR02_GOAL => {
+            out.push_str(
+                "XR02 compares helper/default generation against the opt-in native incremental path on real XR00 workloads. The decision applies only to the measured workload families and does not claim production serving readiness.\n\n",
+            );
+            if !summary.family_recommendations.is_empty() {
+                out.push_str("## Recommendations\n\n");
+                for item in &summary.family_recommendations {
+                    out.push_str(&format!(
+                        "- `{}`: `{}` ({})\n",
+                        markdown_escape(&item.family),
+                        markdown_escape(&item.recommendation),
+                        markdown_escape(&item.reasons.join("; "))
+                    ));
+                }
+                out.push('\n');
+            }
+        }
+        _ if summary.blockers.is_empty() => {
+            out.push_str(
+                "The XR01 harness produced dry-run evidence and real model smoke evidence with stable A/B records, decode percentile fields, prefill/total timing fields, memory fields, active KV bytes, output token IDs, and correctness gates. This accepts the harness shape only; it does not claim a production serving or runtime optimization win.\n\n",
+            );
+        }
+        _ => {
+            out.push_str("The XR01 harness wrote evidence but cannot be accepted until the blockers are resolved.\n\n");
+        }
+    }
+    if !summary.blockers.is_empty() {
+        out.push_str("## Blockers\n\n");
+        for blocker in &summary.blockers {
+            out.push_str(&format!("- {blocker}\n"));
+        }
+        out.push('\n');
+    }
+    if !summary.failed_hypotheses.is_empty() {
+        out.push_str("## Failed Hypotheses / Rejected Gates\n\n");
+        for hypothesis in &summary.failed_hypotheses {
+            out.push_str(&format!("- {hypothesis}\n"));
+        }
+        out.push('\n');
     }
     out.push_str("## Evidence\n\n");
     out.push_str(&format!("- Records: `{}`\n", summary.records_path));
@@ -1392,6 +1937,19 @@ fn select_workloads(
     Ok(workloads)
 }
 
+fn selected_workload(workload: &WorkloadRecord) -> SelectedWorkload {
+    SelectedWorkload {
+        workload_id: workload.workload_id.clone(),
+        family: workload.family.clone(),
+        prompt_path: workload.prompt_path.clone(),
+        prompt_sha256: workload.prompt_sha256.clone(),
+        target_context_tokens: workload.target_context_tokens,
+        actual_context_tokens: workload.actual_context_tokens,
+        workload_max_new_tokens: workload.max_new_tokens,
+        deterministic_seed: workload.deterministic_seed,
+    }
+}
+
 fn write_jsonl(path: &Path, records: &[XrAbRecord]) -> Result<(), CliError> {
     let mut file = File::create(path)
         .map_err(|error| CliError::Runtime(format!("failed to create records.jsonl: {error}")))?;
@@ -1426,11 +1984,28 @@ fn synthetic_tokens(workload: &WorkloadRecord, trial_index: usize, count: usize)
         .collect()
 }
 
+fn synthetic_logits(workload: &WorkloadRecord, count: usize) -> Vec<f64> {
+    let seed = workload.deterministic_seed as f64 / 1_000_000.0;
+    (0..count)
+        .map(|index| seed + (index as f64 * 0.125))
+        .collect()
+}
+
 fn synthetic_latencies(workload: &WorkloadRecord, count: usize) -> Vec<f64> {
     let base = 1.0 + (workload.actual_context_tokens as f64 / 8192.0);
     (0..count)
         .map(|index| base + (index % 7) as f64 * 0.037)
         .collect()
+}
+
+fn steady_decode_latencies(values: &[f64]) -> Vec<f64> {
+    if values.len() > 4 {
+        values[4..].to_vec()
+    } else if values.len() > 1 {
+        values[1..].to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 fn effective_max_new_tokens(options: &XrAbOptions, workload: &WorkloadRecord) -> usize {
@@ -1475,6 +2050,13 @@ fn generate_command_display(
     parts.join(" ")
 }
 
+fn example_name(goal: GoalProfile) -> &'static str {
+    match goal {
+        GoalProfile::Xr01Harness => "xr01_real_context_ab",
+        GoalProfile::Xr02NativeHelper => "xr02_native_helper_real_context_ab",
+    }
+}
+
 fn env_display(env: &BTreeMap<String, String>) -> String {
     if env.is_empty() {
         return "none".to_owned();
@@ -1493,6 +2075,57 @@ fn percentile(values: &[f64], percentile: f64) -> f64 {
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let rank = ((percentile / 100.0) * (values.len().saturating_sub(1) as f64)).ceil() as usize;
     values[rank.min(values.len() - 1)]
+}
+
+fn mean<I>(values: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let values = values.into_iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn max_f64<I>(values: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    values.into_iter().fold(0.0_f64, f64::max)
+}
+
+fn max_abs_delta(left: &[f64], right: &[f64]) -> f64 {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0_f64, f64::max)
+}
+
+fn summary_title(summary: &XrAbSummary) -> &'static str {
+    match summary.goal.as_str() {
+        XR02_GOAL => GoalProfile::Xr02NativeHelper.title(),
+        _ => GoalProfile::Xr01Harness.title(),
+    }
+}
+
+fn record_goal_id(run_id: &str) -> &'static str {
+    if run_id.starts_with("xr02-") {
+        XR02_GOAL
+    } else {
+        XR01_GOAL
+    }
+}
+
+fn parse_goal_profile(value: &str) -> Result<GoalProfile, CliError> {
+    match value {
+        "xr01" | "XR01" | XR01_GOAL => Ok(GoalProfile::Xr01Harness),
+        "xr02" | "XR02" | XR02_GOAL => Ok(GoalProfile::Xr02NativeHelper),
+        other => Err(CliError::Usage(format!(
+            "unsupported --goal '{other}', expected xr01 or xr02"
+        ))),
+    }
 }
 
 fn parse_run_mode(value: &str) -> Result<RunMode, CliError> {
@@ -1593,11 +2226,23 @@ fn duration_ms(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-fn run_id() -> String {
+fn run_id(goal: GoalProfile) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("xr01-{}-{}", now.as_secs(), now.subsec_nanos())
+    format!(
+        "{}-{}-{}",
+        goal.run_id_prefix(),
+        now.as_secs(),
+        now.subsec_nanos()
+    )
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn first_nonempty_line(left: &str, right: &str) -> String {
@@ -1708,6 +2353,7 @@ mod tests {
         )
         .expect("workloads");
         let options = XrAbOptions {
+            goal: GoalProfile::Xr01Harness,
             out_dir: root.join("out"),
             workloads_path,
             model_path: root.join("missing-model"),
@@ -1759,6 +2405,7 @@ mod tests {
         )
         .expect("workloads");
         let options = XrAbOptions {
+            goal: GoalProfile::Xr01Harness,
             out_dir: root.join("out"),
             workloads_path,
             model_path: root.join("missing-model"),
