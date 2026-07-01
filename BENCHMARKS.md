@@ -43,6 +43,7 @@ which code produced it, and what claims are allowed.
 | 2026-07-01 | XR06 native decode tail-latency A/B | Accept candidate | `92b0757` | `native_decode_tail_latency_real_context_ab` | `benchmarks/out/XR06-native-decode-tail-latency-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr06-1782877235-943162000`; command `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab`; 60/60 records passed with no blockers. Native decode eval scheduling remains opt-in; accepted comparisons were workload-local and several tail hypotheses failed. |
 | 2026-07-01 | XR07 prefix cache real reuse A/B | Blocked with evidence | `6e4280b` | `native_ram_prefix_cache_real_reuse_ab` | `benchmarks/out/XR07-prefix-cache-real-reuse-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr07-1782880867-63480000`; command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab --trials 2 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 4`; namespace isolation passed, but restored continuation/continued decode parity failed and tiny16 memory gates failed at 8K/16K. Default policy is `do_not_enable_ram_prefix_cache_by_default_for_tiny16`. |
 | 2026-07-01 | XR08 SSD cache policy and variance A/B | Keep experimental | `0e4b0cd` | `native_ssd_cache_policy_variance` | `benchmarks/out/XR08-ssd-cache-policy-variance/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr08-1782883921-278286000`; command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr08_ssd_cache_policy_variance -- --out-dir benchmarks/out/XR08-ssd-cache-policy-variance`; 12/12 restore records passed correctness and rejection gates. 8K BF16/q8 profiles passed TTFT, variance, and memory gates; 16K BF16/q8 profiles were rejected for the 14 GB tiny16 memory gate. Policy remains opt-in, profile-gated, and experimental. |
+| 2026-07-01 | XR09 KV compression real-quality A/B | Reject candidate | `1dabccc` | `native_kv_compression_real_quality_ab` | `benchmarks/out/XR09-kv-compression-real-quality-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr09-1782886055`; command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr09_kv_compression_real_quality_ab -- --out-dir benchmarks/out/XR09-kv-compression-real-quality-ab`; no hard blockers and BF16 exact restore passed on 6 real workloads, but q8 failed `benchmark_qa_4k_001` quality gate and q4 failed 3 families. Recommendation is `no_go_for_compression_candidate`; active compressed decode remains disabled. |
 
 ## P00 Baseline Snapshot
 
@@ -766,6 +767,60 @@ XR08 interpretation:
 - Mid-decode SSD fetch remains disallowed; all measured restores happen before
   prefill and payload import.
 
+## XR09 KV Compression Real-Quality A/B Snapshot
+
+XR09 re-runs BF16, q8, and q4 prefix payload compression on XR00 real-context
+workloads. The warm path loads the payload, transparently reconstructs BF16
+active KV, imports the snapshot, retrieves the cached last step, and runs one
+continued `decode_one` against the BF16 cold continuation. Runtime code was not
+optimized and active compressed decode stayed disabled.
+
+| Field | Value |
+|---|---|
+| Command | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr09_kv_compression_real_quality_ab -- --out-dir benchmarks/out/XR09-kv-compression-real-quality-ab` |
+| Evidence | `benchmarks/out/XR09-kv-compression-real-quality-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Smoke evidence | `benchmarks/out/XR09-kv-compression-real-quality-ab-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Run ID | `xr09-1782886055` |
+| Git SHA | `1dabccc5f9ac6b056e27a10ea59a7a5d12bce8b4` |
+| Mode | `native_kv_compression_real_quality_ab` |
+| Records | `6`: 6 workloads x 1 trial, each with BF16/q8/q4 mode records |
+| Generated files | `records.jsonl`, `summary.json`, `report.md`, `blockers.md`, `decision.md`; per-workload payload paths and SHA-256s are recorded under each record's `modes` array |
+| Decision | `reject_candidate` |
+| Recommendation | `no_go_for_compression_candidate`; q8 rejected until quality gate passes, q4 rejected until greedy failures are resolved, Planar/Iso deferred |
+
+Workload cases:
+
+| Workload | Family | Tokens | Seed |
+|---|---|---:|---:|
+| `benchmark_qa_4k_001` | `benchmark_qa` | 4095 | 20260633 |
+| `chat_short_1k_001` | `chat_short` | 1024 | 20260630 |
+| `code_review_rust_4k_001` | `code_review_rust` | 4096 | 20260631 |
+| `long_repo_pack_16k_001` | `long_repo_pack` | 16384 | 20260639 |
+| `prefix_reuse_edit_8k_a_001` | `prefix_reuse_edit` | 8192 | 20260636 |
+| `tool_json_1k_001` | `tool_json` | 1024 | 20260635 |
+
+Compression quality highlights:
+
+| Workload | q8 gate | q8 logit delta | q8 payload reduction | q4 gate | q4 failure |
+|---|---|---:|---:|---|---|
+| `benchmark_qa_4k_001` | `false` | 1.000 | 7.540% | `false` | greedy token mismatch: baseline `107`, q4 `45518` |
+| `chat_short_1k_001` | `true` | 0.438 | 2.306% | `false` | greedy token mismatch: baseline `45518`, q4 `236779` |
+| `code_review_rust_4k_001` | `true` | 0.188 | 7.541% | `true` | none |
+| `long_repo_pack_16k_001` | `true` | 0.000 | 17.385% | `true` | none |
+| `prefix_reuse_edit_8k_a_001` | `true` | 0.125 | 12.115% | `true` | none |
+| `tool_json_1k_001` | `true` | 0.063 | 2.306% | `false` | logit delta `5.375` exceeded q4 threshold |
+
+XR09 interpretation:
+
+- BF16 exact restore passed on every selected real-context workload.
+- q8 cannot be promoted from XR09 because it failed the deterministic quality
+  threshold on `benchmark_qa_4k_001`, even though the greedy token still matched.
+- q4 cannot be promoted because it failed greedy-token agreement on
+  `benchmark_qa_4k_001` and `chat_short_1k_001`, and exceeded the q4 logit
+  threshold on `tool_json_1k_001`.
+- Payload reductions are storage-only: active KV memory reduction was `0.000%`
+  for BF16, q8, and q4 because active compressed decode remains disabled.
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -800,6 +855,7 @@ XR08 interpretation:
 | 2026-07-01 | Added XR06 native decode tail-latency A/B harness and opt-in native decode KV eval scheduling modes. The runner records deterministic workload seeds/token lengths, per-token latency traces, position before/after decode, active KV bytes, peak MLX memory, eval-policy markers, correctness gates, blockers, failed hypotheses, and decision artifacts. | `codex/goals/XR06-native-decode-tail-latency-ab.goal.md`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --example xr06_native_decode_tail_latency_ab`; smoke and full XR06 runs with escalated Metal access. |
 | 2026-07-01 | Added XR07 real-prefix RAM cache A/B harness and goal contract. The runner derives 4K/8K/16K real-context repeated-prefix cases from the XR00 corpus, applies deterministic small suffix edits, compares fresh full prefill against RAM restore plus native import and suffix replay, records hit rate, warm TTFT, restore/import/replay latency, continued decode parity, active KV bytes, cache residency, adapter namespace isolation, failed hypotheses, blockers, and default-policy decision artifacts. It does not optimize runtime code. | `codex/goals/XR07-prefix-cache-real-reuse-ab.goal.md`, `crates/gemma4d-bench/examples/xr07_prefix_cache_real_reuse_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab`; `cargo check -p gemma4d-ffi`; `cargo test -p gemma4d-kv --lib`; XR07 smoke and full runs with escalated Metal access. |
 | 2026-07-01 | Added XR08 SSD cache policy and variance harness and goal contract. The runner measures real-context SSD prefix restore variance for BF16 and q8 payloads, records exact generated artifacts, deterministic seeds, token lengths, metadata/payload IO, warm TTFT, fresh prefill, payload checksum time, native import time, cache accounting, corruption/namespace/cache-mode rejection, mid-decode rejection, admission probes, failed hypotheses, blockers, and profile-gated decision artifacts. It does not optimize runtime code. | `codex/goals/XR08-ssd-cache-policy-variance.goal.md`, `crates/gemma4d-bench/examples/xr08_ssd_cache_policy_variance.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr08_ssd_cache_policy_variance`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --examples`; `cargo test -p gemma4d-kv --lib`; XR08 smoke and full runs with escalated Metal access. |
+| 2026-07-01 | Added XR09 KV compression real-quality A/B harness and goal contract. The runner tokenizes XR00 real workloads, writes BF16/q8/q4 payloads, restores each payload into BF16 active KV, runs deterministic continued-decode quality gates, records greedy agreement, logit delta, payload bytes, warm restore latency, active memory, generated payload paths/checksums, q4 failure analysis, failed hypotheses, blockers, and decision artifacts. It does not optimize runtime code. | `codex/goals/XR09-kv-compression-real-quality-ab.goal.md`, `crates/gemma4d-bench/examples/xr09_kv_compression_real_quality_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr09_kv_compression_real_quality_ab`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --examples`; `cargo test -p gemma4d-kv --lib`; XR09 smoke and full runs with escalated Metal access. |
 
 ## Verification Gates
 
@@ -892,6 +948,13 @@ XR08 interpretation:
 | 2026-07-01 | `cargo test -p gemma4d-kv --lib` | Passed | 18 passed; covers namespace mismatch, adapter partitioning, RAM/SSD restore, cache accounting, compression metadata, corruption rejection, and mid-decode SSD rejection. |
 | 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr08_ssd_cache_policy_variance -- --out-dir benchmarks/out/XR08-ssd-cache-policy-variance-smoke --clear-contexts --context 8192 --trials 1 --modes bf16,q8` | Passed | Required escalated Metal access after sandboxed MLX failed with no Metal device; wrote 2 smoke records and final smoke artifacts. Decision was `reject_candidate` because low-N evidence cannot establish variance. |
 | 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr08_ssd_cache_policy_variance -- --out-dir benchmarks/out/XR08-ssd-cache-policy-variance` | Passed | Required escalated Metal access; wrote 12 real-context records and final XR08 artifacts. Decision is `keep_experimental`; 8K BF16/q8 accepted for opt-in experimentation, 16K BF16/q8 rejected for tiny16 memory. |
+| 2026-07-01 | `cargo fmt --all --check` | Passed | Formatting gate after the XR09 runner. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --example xr09_kv_compression_real_quality_ab` | Passed | Focused compile gate for the XR09 compression real-quality runner. |
+| 2026-07-01 | `cargo check -p gemma4d-ffi` | Passed | Focused native/FFI compile gate before XR09 native MLX execution. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --examples` | Passed | Compile coverage for all benchmark examples after adding XR09. |
+| 2026-07-01 | `cargo test -p gemma4d-kv --lib` | Passed | 18 passed; covers namespace mismatch, adapter partitioning, RAM/SSD restore, cache accounting, compression metadata, corruption rejection, and mid-decode SSD rejection. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr09_kv_compression_real_quality_ab -- --out-dir benchmarks/out/XR09-kv-compression-real-quality-ab-smoke --clear-workload-ids --workload-id tool_json_1k_001 --trials 1` | Passed | Required escalated Metal access; wrote 1 smoke record and final smoke artifacts. Decision was `accept_candidate` for the narrow smoke, but q4 failed the quality gate by logit delta. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr09_kv_compression_real_quality_ab -- --out-dir benchmarks/out/XR09-kv-compression-real-quality-ab` | Passed | Required escalated Metal access; wrote 6 real-context records and final XR09 artifacts. Decision is `reject_candidate`; q8 failed `benchmark_qa_4k_001`, q4 failed 3 families, and active compressed decode remains disabled. |
 
 ## Current Claim Boundaries
 
@@ -1023,3 +1086,6 @@ XR08 interpretation:
 - XR08 supports only exact real-context prefix restore claims for the measured
   8K profiles under BF16/q8 payload storage. The 16K profiles are rejected for
   the 16 GB profile because peak MLX memory crossed `21.986 GB`.
+- XR09 does not justify promoting q8 or q4 compressed payloads. q8 failed one
+  real-context deterministic quality gate, q4 failed three, and active-memory
+  claims remain invalid because active compressed decode stayed disabled.
