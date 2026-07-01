@@ -21,3 +21,4 @@ gemma4d-ffi = { version = "0.1.0", path = "../gemma4d-ffi" }
 gemma4d-kv = { version = "0.1.0", path = "../gemma4d-kv" }
 gemma4d-server = { version = "0.1.0", path = "../gemma4d-server" }
 gemma4d-tui = { version = "0.1.0", path = "../gemma4d-tui" }
+rayon = "1.12"
