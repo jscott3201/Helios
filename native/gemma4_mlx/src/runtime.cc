@@ -1551,21 +1551,32 @@ Gemma4Status gemma4_verify_tokens(
             }
         }
 
-        std::unique_ptr<gemma4d::NativeKvState> staged_kv = cache->native_kv_state->clone();
-        if (staged_kv == nullptr) {
-            return fail(GEMMA4_ERR_RUNTIME, "native MTP verify failed to clone target KV state");
-        }
-
         const uint64_t context_sequence_len = cache->native_tokens.size();
         Gemma4MtpTraceInfo trace{};
         initialize_mtp_trace(&trace, context_sequence_len);
 
-        std::vector<int32_t> staged_tokens = cache->native_tokens;
+        // XR18 prototype: measure KV clone/copy overhead while keeping the
+        // failure-atomic staged verifier as the default path.
+        const bool in_place_verify = env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_INPLACE_VERIFY");
+        std::unique_ptr<gemma4d::NativeKvState> staged_kv;
+        std::vector<int32_t> staged_tokens;
+        gemma4d::NativeKvState* verify_kv = cache->native_kv_state.get();
+        std::vector<int32_t>* verify_tokens = &cache->native_tokens;
+        if (!in_place_verify) {
+            staged_kv = cache->native_kv_state->clone();
+            if (staged_kv == nullptr) {
+                return fail(GEMMA4_ERR_RUNTIME, "native MTP verify failed to clone target KV state");
+            }
+            staged_tokens = cache->native_tokens;
+            verify_kv = staged_kv.get();
+            verify_tokens = &staged_tokens;
+        }
+
         std::vector<int32_t> committed_tail;
         committed_tail.reserve(draft_count + 1);
         Gemma4StepResult current_step = cache->last_step;
         float peak_memory_gb = current_step.peak_memory_gb;
-        uint64_t active_kv_bytes = staged_kv->active_bytes();
+        uint64_t active_kv_bytes = verify_kv->active_bytes();
         uint32_t accepted_count = 0;
         std::unique_ptr<gemma4d::NativeHiddenState> staged_hidden;
 
@@ -1576,13 +1587,13 @@ Gemma4Status gemma4_verify_tokens(
             const bool accepted = draft_tokens[index] == current_step.greedy_token;
             const int32_t token_to_commit = accepted ? draft_tokens[index] : current_step.greedy_token;
             committed_tail.push_back(token_to_commit);
-            staged_tokens.push_back(token_to_commit);
+            verify_tokens->push_back(token_to_commit);
 
             Gemma4StepResult next_step{};
             std::unique_ptr<gemma4d::NativeHiddenState> next_hidden;
             if (!target->native_model->decode_incremental(
                     token_to_commit,
-                    staged_kv.get(),
+                    verify_kv,
                     &next_step,
                     &native_error,
                     &next_hidden)) {
@@ -1619,8 +1630,10 @@ Gemma4Status gemma4_verify_tokens(
         }
         out->mtp_trace = trace;
 
-        cache->native_tokens = std::move(staged_tokens);
-        cache->native_kv_state = std::move(staged_kv);
+        if (!in_place_verify) {
+            cache->native_tokens = std::move(staged_tokens);
+            cache->native_kv_state = std::move(staged_kv);
+        }
         cache->last_hidden = std::move(staged_hidden);
         out->native_last_hidden = cache->last_hidden.get();
         remember_last_step(cache, out);
