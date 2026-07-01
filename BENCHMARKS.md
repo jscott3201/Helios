@@ -38,6 +38,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | XR01 real-context A/B harness | Passed | final SHA recorded in generated summary | `real_context_ab_harness_dry_run_plus_helper_smoke` | `benchmarks/out/XR01-real-context-ab-harness/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2`; writes dry-run and real helper smoke records for the XR00 corpus schema, no runtime optimization. |
 | 2026-06-30 | XR02 native vs helper real-context A/B | Blocked with evidence | `d60664b` plus local XR02 harness changes | `native_incremental_vs_helper_real_contexts` | `benchmarks/out/XR02-native-helper-real-context-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `cargo run -p gemma4d-bench --example xr02_native_helper_real_context_ab -- --trials 2 --max-new-tokens 8`; 5 real XR00 workloads, 2 variants, 2 trials, 20 records. Native is blocked by chat/tool token mismatches and a 16K tiny16 memory cliff; code-review is opt-in only. |
 | 2026-06-30 | XR03 MTP real-context diagnosis | Blocked with evidence | `16efd5d` plus local XR03 trace changes | `native_mtp_real_context_trace` | `benchmarks/out/XR03-mtp-real-context-diagnosis/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 4`; 5 real XR00 workloads x block sizes 1/2, nonzero acceptance observed, but `benchmark_qa_4k_001` failed byte-identical exactness for both block sizes. |
+| 2026-07-01 | XR04 MTP repair and A/B evidence | Accept candidate | `50fe4e2` plus local XR04 verifier repair | `native_mtp_incremental_verify_trace` | `benchmarks/out/XR04-mtp-repair-and-autotune/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` plus `xr03-repro/` and `exactness-smoke/` subruns | Reproduced the XR03 blocker first, then repaired live MTP verify to stage against cloned incremental KV. The 32-token root run stayed byte-identical for 10/10 records with acceptance `162/370 = 0.438`; MTP remains opt-in because generation speedups are workload/block dependent. |
 
 ## P00 Baseline Snapshot
 
@@ -492,6 +493,83 @@ Ranked fix hypotheses:
 3. Keep MTP disabled by default and reject any acceptance-rate optimization until byte-identical exactness is restored.
 4. Do not enable block sizes 3/4 until block sizes 1/2 have exactness and non-trivial acceptance.
 
+## XR04 MTP Repair And A/B Snapshot
+
+XR04 repairs the XR03 target-verifier exactness failure by verifying MTP drafts
+against a cloned incremental target KV state, then committing the staged KV,
+hidden state, and token list only after accepted/fallback tokens are known. It
+does not enable MTP by default and does not test block sizes above `2`.
+
+Generated files:
+
+- Pre-fix repro: `benchmarks/out/XR04-mtp-repair-and-autotune/xr03-repro/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
+- Exactness smoke: `benchmarks/out/XR04-mtp-repair-and-autotune/exactness-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
+- Root A/B evidence: `benchmarks/out/XR04-mtp-repair-and-autotune/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
+
+Commands:
+
+- Pre-fix repro: `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --workload-id benchmark_qa_4k_001 --max-new-tokens 4 --out-dir benchmarks/out/XR04-mtp-repair-and-autotune/xr03-repro`.
+- Exactness smoke: `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 4 --block-sizes 1,2 --out-dir benchmarks/out/XR04-mtp-repair-and-autotune/exactness-smoke`.
+- Root A/B evidence: `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 32 --block-sizes 1,2 --out-dir benchmarks/out/XR04-mtp-repair-and-autotune`.
+
+Workload selection:
+
+| Workload | Family | Target tokens | Actual tokens | Workload max new tokens | XR04 root selected max new tokens | Seed |
+|---|---|---:|---:|---:|---:|---:|
+| `chat_short_1k_001` | `chat_short` | 1024 | 1024 | 128 | 32 | 20260630 |
+| `code_review_rust_4k_001` | `code_review_rust` | 4096 | 4096 | 192 | 32 | 20260631 |
+| `benchmark_qa_4k_001` | `benchmark_qa` | 4096 | 4095 | 192 | 32 | 20260633 |
+| `mtp_candidate_1k_001` | `mtp_candidate` | 1024 | 1024 | 64 | 32 | 20260641 |
+| `mtp_candidate_4k_001` | `mtp_candidate` | 4096 | 4096 | 128 | 32 | 20260642 |
+
+Pre-fix repro outcome:
+
+- Decision: `blocked_with_evidence`.
+- Exactness: `8/10` records byte-identical.
+- Acceptance: `16/46 = 0.348`.
+- Blocker reproduced: `benchmark_qa_4k_001` block sizes `1` and `2` differed at generated index `1`, baseline token `107`, MTP token `45518`.
+
+Post-fix exactness smoke:
+
+- Decision: `accept_candidate`.
+- Exactness: `10/10` records byte-identical.
+- Acceptance: `20/45 = 0.444`.
+- Blockers: none.
+
+Root 32-token A/B outcome:
+
+- Decision: `accept_candidate`.
+- Exactness: `10/10` records byte-identical.
+- Acceptance: `162/370 = 0.438`.
+- Blockers: none.
+- Trace boundary: the repaired live incremental verifier records target top-1
+  rather than XR03's full-forward target top-5; use the raw exactness and
+  acceptance counts as the authoritative XR04 claim.
+
+| Workload | Block | Exact | Accepted/Attempted | Baseline decode ms | MTP draft+verify ms | Generation result |
+|---|---:|---|---:|---:|---:|---|
+| `chat_short_1k_001` | 1 | `true` | 19/32 | 3090.559 | 3128.779 | slower |
+| `chat_short_1k_001` | 2 | `true` | 22/40 | 3090.559 | 3151.925 | slower |
+| `code_review_rust_4k_001` | 1 | `true` | 10/32 | 3614.960 | 9034.778 | slower |
+| `code_review_rust_4k_001` | 2 | `true` | 17/45 | 3614.960 | 5216.344 | slower |
+| `benchmark_qa_4k_001` | 1 | `true` | 8/32 | 7544.450 | 5565.894 | faster |
+| `benchmark_qa_4k_001` | 2 | `true` | 8/49 | 7544.450 | 12475.474 | slower |
+| `mtp_candidate_1k_001` | 1 | `true` | 15/32 | 4293.659 | 3427.004 | faster |
+| `mtp_candidate_1k_001` | 2 | `true` | 13/40 | 4293.659 | 3377.771 | faster |
+| `mtp_candidate_4k_001` | 1 | `true` | 25/32 | 4108.397 | 17801.738 | slower |
+| `mtp_candidate_4k_001` | 2 | `true` | 25/36 | 4108.397 | 7537.366 | slower |
+
+XR04 interpretation:
+
+- Exactness blocker is repaired for the selected XR00 real-context corpus and
+  block sizes `1` and `2`.
+- MTP is a candidate for opt-in, per-family policy only. It won on
+  `benchmark_qa_4k_001` block `1` and `mtp_candidate_1k_001` blocks `1`/`2`,
+  but lost on `chat_short`, `code_review_rust`, and `mtp_candidate_4k`.
+- No default enablement claim is allowed without variance runs, a stable
+  per-family policy gate, restored top-k trace depth, and block-size-specific
+  memory/latency guardrails.
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -521,6 +599,7 @@ Ranked fix hypotheses:
 | 2026-06-30 | Added XR01 real-context A/B harness: reusable `xr_ab` report/evidence module, example runner, explicit baseline/candidate variant config, dry-run mode, failure-closed real-run mode, real helper smoke records, and XR01 decision artifacts. | `codex/goals/XR01-real-context-ab-harness.goal.md`, `crates/gemma4d-bench/src/xr_ab.rs`, `crates/gemma4d-bench/src/lib.rs`, `crates/gemma4d-bench/examples/xr01_real_context_ab.rs` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --lib`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode dry-run --out-dir benchmarks/out/XR01-real-context-ab-harness-dry-run --max-workloads 1 --max-new-tokens 2`; `cargo run -p gemma4d-bench --example xr01_real_context_ab -- --mode both --out-dir benchmarks/out/XR01-real-context-ab-harness --max-workloads 1 --max-new-tokens 2`. |
 | 2026-06-30 | Added XR02 native/helper real-context A/B profile on the reusable XR harness: XR02 defaults, native candidate env, generated-logit comparison, first-token and steady-state decode fields, per-family recommendations, deterministic seed/token metadata in records and reports, and failure-closed decision artifacts. | `codex/goals/XR02-native-helper-real-context-ab.goal.md`, `crates/gemma4d-bench/src/xr_ab.rs`, `crates/gemma4d-bench/examples/xr02_native_helper_real_context_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-bench --all-targets`; `cargo run -p gemma4d-bench --example xr02_native_helper_real_context_ab -- --trials 2 --max-new-tokens 8`. |
 | 2026-06-30 | Added XR03 native MTP real-context diagnosis trace path: C ABI trace metadata on MTP verify, Rust FFI trace decoding, a real-context XR03 runner, and generated decision artifacts. The change records draft tokens, target greedy tokens, target top-k, margins, accepted counts, verify time, sequence length, shared KV shapes, position offsets, artifact hashes, token lengths, and deterministic seeds. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-ffi/src/lib.rs`, `crates/gemma4d-bench/examples/xr03_mtp_real_context_diagnosis.rs`, `codex/goals/XR03-mtp-real-context-diagnosis.goal.md`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --lib --no-run`; `cargo test -p gemma4d-bench --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo test -p gemma4d-ffi --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 4`. |
+| 2026-07-01 | Repaired native MTP verification to stage against cloned incremental target KV instead of full-prefix verifier recompute. The live verifier now compares drafts against the cache's last-step prediction, advances accepted/fallback tokens through `decode_incremental`, swaps staged KV/hidden/tokens only after success, and records top-1 incremental trace evidence. | `native/gemma4_mlx/src/runtime.cc`, `BENCHMARKS.md` | `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --example xr03_mtp_real_context_diagnosis`; `cargo test -p gemma4d-ffi --lib`; `cargo test -p gemma4d-bench --lib`; `cargo check -p gemma4d-bench --example p05_native_mtp --example xr03_mtp_real_context_diagnosis`; XR04 pre-fix repro, exactness smoke, and root 32-token A/B runs. |
 
 ## Verification Gates
 
@@ -581,6 +660,15 @@ Ranked fix hypotheses:
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo test -p gemma4d-ffi --all-targets --no-run` | Passed | Required MLX build gate for native MTP trace ABI changes. |
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-workloads 1 --max-new-tokens 2 --out-dir benchmarks/out/XR03-mtp-real-context-diagnosis-smoke` | Passed | Required escalated Metal access; wrote smoke artifacts for one workload and confirmed trace records/top-k output. Sandboxed attempt failed before benchmark execution because MLX could not access a Metal device. |
 | 2026-06-30 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 4` | Blocked with evidence | Required escalated Metal access; wrote 10 real records and XR03 decision artifacts. Example exits nonzero by design when decision is `blocked_with_evidence`; blocker is `benchmark_qa_4k_001` exactness failure for block sizes 1 and 2. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --workload-id benchmark_qa_4k_001 --max-new-tokens 4 --out-dir benchmarks/out/XR04-mtp-repair-and-autotune/xr03-repro` | Blocked with evidence | Required escalated Metal access; pre-fix reproduction wrote 10 records because default selected workload IDs remained active. Reproduced `benchmark_qa_4k_001` block sizes `1` and `2` mismatch at generated index `1`, baseline `107`, MTP `45518`. |
+| 2026-07-01 | `cargo check -p gemma4d-ffi` | Passed | Focused compile gate for the native runtime verifier repair through the Rust FFI crate. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --example xr03_mtp_real_context_diagnosis` | Passed | Focused compile gate for the XR03/XR04 evidence runner after the native verifier change. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 4 --block-sizes 1,2 --out-dir benchmarks/out/XR04-mtp-repair-and-autotune/exactness-smoke` | Passed | Required escalated Metal access; wrote 10 records, decision `accept_candidate`, exactness `10/10`, acceptance `20/45 = 0.444`, no blockers. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 32 --block-sizes 1,2 --out-dir benchmarks/out/XR04-mtp-repair-and-autotune` | Passed | Required escalated Metal access; wrote root XR04 evidence artifacts, decision `accept_candidate`, exactness `10/10`, acceptance `162/370 = 0.438`, and no blockers. |
+| 2026-07-01 | `cargo test -p gemma4d-ffi --lib` | Passed | 12 passed, 1 ignored; includes native graph full-model test path when local model env is available. |
+| 2026-07-01 | `cargo test -p gemma4d-bench --lib` | Passed | 14 passed; covers benchmark report/schema helpers and workload corpus validation. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --example p05_native_mtp --example xr03_mtp_real_context_diagnosis` | Passed | Ensures the older P05 MTP harness and XR03/XR04 trace runner still compile after the native runtime verifier change. |
+| 2026-07-01 | `cargo fmt --all --check` | Passed | Formatting gate after the XR04 runtime and benchmark-ledger changes. |
 
 ## Current Claim Boundaries
 
@@ -667,3 +755,14 @@ Ranked fix hypotheses:
   artifact hashes, not a fix or a runtime performance claim.
 - XR03 keeps block sizes above `2` disabled; block sizes `3` and `4` remain
   design-only until exactness gates pass.
+- XR04 repairs native MTP exactness for the selected XR00 real-context
+  workloads at block sizes `1` and `2`. It does not enable MTP by default,
+  does not enable block sizes above `2`, and does not change adapter-active,
+  compressed-active-KV, server-default, or sampling behavior.
+- XR04 performance evidence is mixed. The 32-token root run shows generation
+  wins only for `benchmark_qa_4k_001` block `1` and `mtp_candidate_1k_001`
+  blocks `1`/`2`; other measured workload/block pairs were slower.
+- XR04 incremental verifier trace records target top-1, not XR03's full-forward
+  target top-5. Use XR04 exactness, acceptance, and timing artifacts for repair
+  claims; restore deeper incremental score tracing before making rank/top-k
+  drafter-quality claims.

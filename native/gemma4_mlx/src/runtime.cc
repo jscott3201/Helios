@@ -2,6 +2,7 @@
 #include "model_manifest.h"
 #include "native_model.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cctype>
 #include <cstdio>
@@ -154,6 +155,71 @@ void remember_last_step(NativeKvCache* cache, const Gemma4StepResult* step) {
     cache->last_step = *step;
     cache->last_step.native_last_hidden = cache->last_hidden.get();
     cache->has_last_step = true;
+}
+
+void initialize_mtp_trace(Gemma4MtpTraceInfo* trace, uint64_t context_sequence_len) {
+    if (trace == nullptr) {
+        return;
+    }
+    std::memset(trace, 0, sizeof(Gemma4MtpTraceInfo));
+    trace->context_sequence_len = context_sequence_len;
+    trace->first_position = context_sequence_len == 0 ? 0 : context_sequence_len - 1;
+    trace->top_k = 1;
+    trace->full_attention_layer = 47;
+    trace->sliding_attention_layer = 46;
+    for (size_t index = 0; index < GEMMA4_MTP_TRACE_MAX_POSITIONS; ++index) {
+        trace->draft_tokens[index] = -1;
+        trace->target_tokens[index] = -1;
+        for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+            trace->top_token_ids[index * GEMMA4_MTP_TRACE_TOP_K + rank] = -1;
+        }
+    }
+}
+
+void record_mtp_target_step(
+    Gemma4MtpTraceInfo* trace,
+    size_t index,
+    uint64_t context_sequence_len,
+    const Gemma4StepResult& step) {
+    if (trace == nullptr || index >= GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+        return;
+    }
+    trace->position_count = std::max<uint32_t>(trace->position_count, static_cast<uint32_t>(index + 1));
+    trace->position_offsets[index] = (context_sequence_len == 0 ? 0 : context_sequence_len - 1) + index;
+    trace->target_tokens[index] = step.greedy_token;
+    trace->target_logits[index] = step.greedy_logit;
+    trace->top_token_ids[index * GEMMA4_MTP_TRACE_TOP_K] = step.greedy_token;
+    trace->top_logits[index * GEMMA4_MTP_TRACE_TOP_K] = step.greedy_logit;
+}
+
+void record_mtp_draft_score(
+    Gemma4MtpTraceInfo* trace,
+    size_t index,
+    int32_t draft_token,
+    const Gemma4StepResult& target_step) {
+    if (trace == nullptr || index >= GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+        return;
+    }
+    trace->draft_tokens[index] = draft_token;
+    if (draft_token == target_step.greedy_token) {
+        trace->draft_logits[index] = target_step.greedy_logit;
+        trace->logit_margins[index] = 0.0f;
+        trace->draft_in_top_k[index] = true;
+    } else {
+        trace->draft_logits[index] = 0.0f;
+        trace->logit_margins[index] = target_step.greedy_logit;
+        trace->draft_in_top_k[index] = false;
+    }
+}
+
+void record_mtp_hidden_shape(Gemma4MtpTraceInfo* trace, const gemma4d::NativeHiddenState* hidden) {
+    if (trace == nullptr || hidden == nullptr || hidden->hidden_size() == 0) {
+        return;
+    }
+    trace->hidden_rank = 3;
+    trace->hidden_shape[0] = 1;
+    trace->hidden_shape[1] = 1;
+    trace->hidden_shape[2] = hidden->hidden_size();
 }
 
 std::string join_i32_list(const int32_t* values, size_t count) {
@@ -1399,37 +1465,89 @@ Gemma4Status gemma4_verify_tokens(
                 GEMMA4_ERR_UNSUPPORTED_CONFIG,
                 "gemma4_verify_tokens requires a prefilled native target cache");
         }
+        if (cache->native_kv_state == nullptr || !cache->has_last_step) {
+            return fail(
+                GEMMA4_ERR_CACHE,
+                "gemma4_verify_tokens requires a native incremental KV state and last-step prediction");
+        }
+        if (draft_count > 2 || draft_count + 1 > GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+            return fail(
+                GEMMA4_ERR_UNSUPPORTED_CONFIG,
+                "native MTP verify currently supports draft_count <= 2");
+        }
 
-        std::vector<int32_t> committed_tokens;
         std::string native_error;
-        if (!target->native_model->verify_draft_block(
-                cache->native_tokens,
-                draft_tokens,
-                draft_count,
-                &committed_tokens,
-                out,
-                &native_error,
-                nullptr)) {
-            return fail(GEMMA4_ERR_RUNTIME, native_error);
+        std::unique_ptr<gemma4d::NativeKvState> staged_kv = cache->native_kv_state->clone();
+        if (staged_kv == nullptr) {
+            return fail(GEMMA4_ERR_RUNTIME, "native MTP verify failed to clone target KV state");
         }
-        cache->native_tokens = std::move(committed_tokens);
-        std::unique_ptr<gemma4d::NativeKvState> rebuilt_kv_state;
-        std::unique_ptr<gemma4d::NativeHiddenState> rebuilt_hidden;
-        Gemma4StepResult rebuilt_step{};
-        if (!target->native_model->prefill_incremental(
-                cache->native_tokens,
-                &rebuilt_step,
-                &native_error,
-                &rebuilt_kv_state,
-                &rebuilt_hidden)) {
-            return fail(GEMMA4_ERR_RUNTIME, native_error);
+
+        const uint64_t context_sequence_len = cache->native_tokens.size();
+        Gemma4MtpTraceInfo trace{};
+        initialize_mtp_trace(&trace, context_sequence_len);
+
+        std::vector<int32_t> staged_tokens = cache->native_tokens;
+        std::vector<int32_t> committed_tail;
+        committed_tail.reserve(draft_count + 1);
+        Gemma4StepResult current_step = cache->last_step;
+        float peak_memory_gb = current_step.peak_memory_gb;
+        uint64_t active_kv_bytes = staged_kv->active_bytes();
+        uint32_t accepted_count = 0;
+        std::unique_ptr<gemma4d::NativeHiddenState> staged_hidden;
+
+        for (size_t index = 0; index < draft_count; ++index) {
+            record_mtp_target_step(&trace, index, context_sequence_len, current_step);
+            record_mtp_draft_score(&trace, index, draft_tokens[index], current_step);
+
+            const bool accepted = draft_tokens[index] == current_step.greedy_token;
+            const int32_t token_to_commit = accepted ? draft_tokens[index] : current_step.greedy_token;
+            committed_tail.push_back(token_to_commit);
+            staged_tokens.push_back(token_to_commit);
+
+            Gemma4StepResult next_step{};
+            std::unique_ptr<gemma4d::NativeHiddenState> next_hidden;
+            if (!target->native_model->decode_incremental(
+                    token_to_commit,
+                    staged_kv.get(),
+                    &next_step,
+                    &native_error,
+                    &next_hidden)) {
+                return fail(GEMMA4_ERR_RUNTIME, native_error);
+            }
+            current_step = next_step;
+            staged_hidden = std::move(next_hidden);
+            peak_memory_gb = std::max(peak_memory_gb, current_step.peak_memory_gb);
+            active_kv_bytes = std::max(active_kv_bytes, current_step.active_kv_bytes);
+
+            if (accepted) {
+                ++accepted_count;
+                continue;
+            }
+
+            break;
         }
-        cache->native_kv_state = std::move(rebuilt_kv_state);
-        cache->last_hidden = std::move(rebuilt_hidden);
-        out->active_kv_bytes = rebuilt_step.active_kv_bytes;
-        if (out->peak_memory_gb < rebuilt_step.peak_memory_gb) {
-            out->peak_memory_gb = rebuilt_step.peak_memory_gb;
+
+        const size_t lookahead_index = draft_count;
+        record_mtp_target_step(&trace, lookahead_index, context_sequence_len, current_step);
+        record_mtp_hidden_shape(&trace, staged_hidden.get());
+
+        if (staged_hidden == nullptr) {
+            return fail(GEMMA4_ERR_RUNTIME, "native MTP verify did not produce a committed hidden state");
         }
+
+        *out = current_step;
+        out->peak_memory_gb = peak_memory_gb;
+        out->active_kv_bytes = active_kv_bytes;
+        out->accepted_draft_count = accepted_count;
+        out->committed_count = static_cast<uint32_t>(committed_tail.size());
+        for (size_t index = 0; index < committed_tail.size() && index < 4; ++index) {
+            out->committed_tokens[index] = committed_tail[index];
+        }
+        out->mtp_trace = trace;
+
+        cache->native_tokens = std::move(staged_tokens);
+        cache->native_kv_state = std::move(staged_kv);
+        cache->last_hidden = std::move(staged_hidden);
         out->native_last_hidden = cache->last_hidden.get();
         remember_last_step(cache, out);
         target->sequence_len = out->sequence_len;
