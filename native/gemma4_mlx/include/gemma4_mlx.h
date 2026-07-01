@@ -63,6 +63,38 @@ typedef struct Gemma4KvPolicy {
     bool allow_active_compressed_decode;
 } Gemma4KvPolicy;
 
+#define GEMMA4_MTP_TRACE_MAX_POSITIONS 4
+#define GEMMA4_MTP_TRACE_TOP_K 5
+#define GEMMA4_MTP_TRACE_MAX_RANK 4
+
+typedef struct Gemma4MtpTraceInfo {
+    uint32_t position_count;
+    uint32_t top_k;
+    uint64_t context_sequence_len;
+    uint64_t first_position;
+    uint64_t position_offsets[GEMMA4_MTP_TRACE_MAX_POSITIONS];
+    int32_t draft_tokens[GEMMA4_MTP_TRACE_MAX_POSITIONS];
+    int32_t target_tokens[GEMMA4_MTP_TRACE_MAX_POSITIONS];
+    float target_logits[GEMMA4_MTP_TRACE_MAX_POSITIONS];
+    float draft_logits[GEMMA4_MTP_TRACE_MAX_POSITIONS];
+    float logit_margins[GEMMA4_MTP_TRACE_MAX_POSITIONS];
+    bool draft_in_top_k[GEMMA4_MTP_TRACE_MAX_POSITIONS];
+    int32_t top_token_ids[GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K];
+    float top_logits[GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K];
+    uint32_t hidden_rank;
+    uint64_t hidden_shape[GEMMA4_MTP_TRACE_MAX_RANK];
+    uint32_t full_attention_layer;
+    uint32_t full_attention_key_rank;
+    uint64_t full_attention_key_shape[GEMMA4_MTP_TRACE_MAX_RANK];
+    uint32_t full_attention_value_rank;
+    uint64_t full_attention_value_shape[GEMMA4_MTP_TRACE_MAX_RANK];
+    uint32_t sliding_attention_layer;
+    uint32_t sliding_attention_key_rank;
+    uint64_t sliding_attention_key_shape[GEMMA4_MTP_TRACE_MAX_RANK];
+    uint32_t sliding_attention_value_rank;
+    uint64_t sliding_attention_value_shape[GEMMA4_MTP_TRACE_MAX_RANK];
+} Gemma4MtpTraceInfo;
+
 typedef struct Gemma4StepResult {
     int32_t greedy_token;
     float greedy_logit;
@@ -75,6 +107,8 @@ typedef struct Gemma4StepResult {
     int32_t committed_tokens[4];
     /* Opaque view owned by the KV cache; valid until cache reset/free or next cache-advancing call. */
     void* native_last_hidden;
+    /* Trace-only diagnostics populated by gemma4_verify_tokens; zeroed for ordinary prefill/decode. */
+    Gemma4MtpTraceInfo mtp_trace;
 } Gemma4StepResult;
 
 typedef struct Gemma4KvSnapshotInfo {

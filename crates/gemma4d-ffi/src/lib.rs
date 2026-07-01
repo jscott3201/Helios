@@ -22,6 +22,9 @@ mod raw {
     pub const GEMMA4_ERR_MEMORY_GUARD: Gemma4Status = 5;
     pub const GEMMA4_ERR_CACHE: Gemma4Status = 6;
     pub const GEMMA4_ERR_ADAPTER: Gemma4Status = 7;
+    pub const GEMMA4_MTP_TRACE_MAX_POSITIONS: usize = 4;
+    pub const GEMMA4_MTP_TRACE_TOP_K: usize = 5;
+    pub const GEMMA4_MTP_TRACE_MAX_RANK: usize = 4;
 
     #[repr(C)]
     pub struct Gemma4Target {
@@ -80,6 +83,36 @@ mod raw {
 
     #[repr(C)]
     #[derive(Default)]
+    pub struct Gemma4MtpTraceInfo {
+        pub position_count: u32,
+        pub top_k: u32,
+        pub context_sequence_len: u64,
+        pub first_position: u64,
+        pub position_offsets: [u64; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+        pub draft_tokens: [i32; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+        pub target_tokens: [i32; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+        pub target_logits: [f32; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+        pub draft_logits: [f32; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+        pub logit_margins: [f32; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+        pub draft_in_top_k: [bool; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+        pub top_token_ids: [i32; GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K],
+        pub top_logits: [f32; GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K],
+        pub hidden_rank: u32,
+        pub hidden_shape: [u64; GEMMA4_MTP_TRACE_MAX_RANK],
+        pub full_attention_layer: u32,
+        pub full_attention_key_rank: u32,
+        pub full_attention_key_shape: [u64; GEMMA4_MTP_TRACE_MAX_RANK],
+        pub full_attention_value_rank: u32,
+        pub full_attention_value_shape: [u64; GEMMA4_MTP_TRACE_MAX_RANK],
+        pub sliding_attention_layer: u32,
+        pub sliding_attention_key_rank: u32,
+        pub sliding_attention_key_shape: [u64; GEMMA4_MTP_TRACE_MAX_RANK],
+        pub sliding_attention_value_rank: u32,
+        pub sliding_attention_value_shape: [u64; GEMMA4_MTP_TRACE_MAX_RANK],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
     pub struct Gemma4StepResult {
         pub greedy_token: i32,
         pub greedy_logit: f32,
@@ -91,6 +124,7 @@ mod raw {
         pub committed_count: u32,
         pub committed_tokens: [i32; 4],
         pub native_last_hidden: *mut std::ffi::c_void,
+        pub mtp_trace: Gemma4MtpTraceInfo,
     }
 
     #[repr(C)]
@@ -700,7 +734,37 @@ impl NativeLastHiddenView {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MtpTraceInfo {
+    pub position_count: u32,
+    pub top_k: u32,
+    pub context_sequence_len: u64,
+    pub first_position: u64,
+    pub position_offsets: Vec<u64>,
+    pub draft_tokens: Vec<i32>,
+    pub target_tokens: Vec<i32>,
+    pub target_logits: Vec<f32>,
+    pub draft_logits: Vec<f32>,
+    pub logit_margins: Vec<f32>,
+    pub draft_in_top_k: Vec<bool>,
+    pub top_token_ids: Vec<Vec<i32>>,
+    pub top_logits: Vec<Vec<f32>>,
+    pub hidden_shape: Vec<u64>,
+    pub full_attention_layer: u32,
+    pub full_attention_key_shape: Vec<u64>,
+    pub full_attention_value_shape: Vec<u64>,
+    pub sliding_attention_layer: u32,
+    pub sliding_attention_key_shape: Vec<u64>,
+    pub sliding_attention_value_shape: Vec<u64>,
+}
+
+impl MtpTraceInfo {
+    pub fn has_positions(&self) -> bool {
+        self.position_count > 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StepResult {
     pub greedy_token: i32,
     pub greedy_logit: f32,
@@ -712,6 +776,7 @@ pub struct StepResult {
     pub committed_count: u32,
     pub committed_tokens: [i32; 4],
     pub native_last_hidden: Option<NativeLastHiddenView>,
+    pub mtp_trace: MtpTraceInfo,
 }
 
 impl StepResult {
@@ -737,8 +802,70 @@ impl From<raw::Gemma4StepResult> for StepResult {
             committed_tokens: value.committed_tokens,
             native_last_hidden: NonNull::new(value.native_last_hidden)
                 .map(|ptr| NativeLastHiddenView { ptr }),
+            mtp_trace: mtp_trace_from_raw(&value.mtp_trace),
         }
     }
+}
+
+fn mtp_trace_from_raw(raw: &raw::Gemma4MtpTraceInfo) -> MtpTraceInfo {
+    let position_count = raw
+        .position_count
+        .min(raw::GEMMA4_MTP_TRACE_MAX_POSITIONS as u32) as usize;
+    let top_k = raw.top_k.min(raw::GEMMA4_MTP_TRACE_TOP_K as u32) as usize;
+    let positions = 0..position_count;
+    let top_token_ids = positions
+        .clone()
+        .map(|position| {
+            let start = position * raw::GEMMA4_MTP_TRACE_TOP_K;
+            raw.top_token_ids[start..start + top_k].to_vec()
+        })
+        .collect::<Vec<_>>();
+    let top_logits = (0..position_count)
+        .map(|position| {
+            let start = position * raw::GEMMA4_MTP_TRACE_TOP_K;
+            raw.top_logits[start..start + top_k].to_vec()
+        })
+        .collect::<Vec<_>>();
+
+    MtpTraceInfo {
+        position_count: position_count as u32,
+        top_k: top_k as u32,
+        context_sequence_len: raw.context_sequence_len,
+        first_position: raw.first_position,
+        position_offsets: raw.position_offsets[..position_count].to_vec(),
+        draft_tokens: raw.draft_tokens[..position_count].to_vec(),
+        target_tokens: raw.target_tokens[..position_count].to_vec(),
+        target_logits: raw.target_logits[..position_count].to_vec(),
+        draft_logits: raw.draft_logits[..position_count].to_vec(),
+        logit_margins: raw.logit_margins[..position_count].to_vec(),
+        draft_in_top_k: raw.draft_in_top_k[..position_count].to_vec(),
+        top_token_ids,
+        top_logits,
+        hidden_shape: shape_from_raw(raw.hidden_rank, &raw.hidden_shape),
+        full_attention_layer: raw.full_attention_layer,
+        full_attention_key_shape: shape_from_raw(
+            raw.full_attention_key_rank,
+            &raw.full_attention_key_shape,
+        ),
+        full_attention_value_shape: shape_from_raw(
+            raw.full_attention_value_rank,
+            &raw.full_attention_value_shape,
+        ),
+        sliding_attention_layer: raw.sliding_attention_layer,
+        sliding_attention_key_shape: shape_from_raw(
+            raw.sliding_attention_key_rank,
+            &raw.sliding_attention_key_shape,
+        ),
+        sliding_attention_value_shape: shape_from_raw(
+            raw.sliding_attention_value_rank,
+            &raw.sliding_attention_value_shape,
+        ),
+    }
+}
+
+fn shape_from_raw(rank: u32, shape: &[u64; raw::GEMMA4_MTP_TRACE_MAX_RANK]) -> Vec<u64> {
+    let rank = rank.min(raw::GEMMA4_MTP_TRACE_MAX_RANK as u32) as usize;
+    shape[..rank].to_vec()
 }
 
 pub fn prefill(target: &Target, cache: &mut KvCache, tokens: &[i32]) -> Result<StepResult> {

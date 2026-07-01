@@ -372,6 +372,8 @@ struct SharedKvArrays {
 constexpr int kTargetLayerCount = 48;
 constexpr int kHiddenSize = 3840;
 constexpr int kSlidingWindowSize = 1024;
+constexpr uint32_t kMtpFullAttentionSharedLayer = 47;
+constexpr uint32_t kMtpSlidingAttentionSharedLayer = 46;
 constexpr uint64_t kBf16Bytes = 2;
 
 bool target_layer_full_attention(uint32_t layer_idx) {
@@ -857,10 +859,150 @@ struct NativeForwardArrays {
 struct NativeVerifyArrays {
     std::vector<int32_t> greedy_tokens;
     std::vector<float> greedy_logits;
+    std::vector<int32_t> top_token_ids;
+    std::vector<float> top_logits;
+    std::vector<float> draft_logits;
+    std::vector<float> logit_margins;
+    std::vector<bool> draft_in_top_k;
     array last_hidden;
     SharedKvArrays shared_kv;
     float peak_memory_gb = 0.0f;
 };
+
+void insert_topk(
+    std::vector<int32_t>* top_ids,
+    std::vector<float>* top_logits,
+    int32_t token_id,
+    float logit,
+    size_t top_k) {
+    for (size_t index = 0; index < top_k; ++index) {
+        if (token_id == (*top_ids)[index]) {
+            return;
+        }
+        if (logit > (*top_logits)[index]) {
+            for (size_t shift = top_k - 1; shift > index; --shift) {
+                (*top_ids)[shift] = (*top_ids)[shift - 1];
+                (*top_logits)[shift] = (*top_logits)[shift - 1];
+            }
+            (*top_ids)[index] = token_id;
+            (*top_logits)[index] = logit;
+            return;
+        }
+    }
+}
+
+void fill_shape(const array& value, uint32_t* rank, uint64_t* shape) {
+    if (rank == nullptr || shape == nullptr) {
+        return;
+    }
+    *rank = 0;
+    std::fill(shape, shape + GEMMA4_MTP_TRACE_MAX_RANK, 0);
+    const auto& dims = value.shape();
+    *rank = static_cast<uint32_t>(std::min<size_t>(dims.size(), GEMMA4_MTP_TRACE_MAX_RANK));
+    for (size_t index = 0; index < *rank; ++index) {
+        shape[index] = static_cast<uint64_t>(dims[index]);
+    }
+}
+
+void fill_optional_shape(const std::optional<array>& value, uint32_t* rank, uint64_t* shape) {
+    if (!value.has_value()) {
+        if (rank != nullptr) {
+            *rank = 0;
+        }
+        if (shape != nullptr) {
+            std::fill(shape, shape + GEMMA4_MTP_TRACE_MAX_RANK, 0);
+        }
+        return;
+    }
+    fill_shape(*value, rank, shape);
+}
+
+void initialize_mtp_trace(Gemma4MtpTraceInfo* trace) {
+    if (trace == nullptr) {
+        return;
+    }
+    *trace = Gemma4MtpTraceInfo{};
+    std::fill(
+        trace->draft_tokens,
+        trace->draft_tokens + GEMMA4_MTP_TRACE_MAX_POSITIONS,
+        static_cast<int32_t>(-1));
+    std::fill(
+        trace->target_tokens,
+        trace->target_tokens + GEMMA4_MTP_TRACE_MAX_POSITIONS,
+        static_cast<int32_t>(-1));
+    std::fill(
+        trace->top_token_ids,
+        trace->top_token_ids + (GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K),
+        static_cast<int32_t>(-1));
+    trace->full_attention_layer = kMtpFullAttentionSharedLayer;
+    trace->sliding_attention_layer = kMtpSlidingAttentionSharedLayer;
+}
+
+void populate_mtp_trace(
+    Gemma4StepResult* out,
+    uint64_t context_sequence_len,
+    const int32_t* draft_tokens,
+    size_t draft_count,
+    const NativeVerifyArrays& verified) {
+    if (out == nullptr) {
+        return;
+    }
+    Gemma4MtpTraceInfo* trace = &out->mtp_trace;
+    initialize_mtp_trace(trace);
+    trace->context_sequence_len = context_sequence_len;
+    trace->first_position = context_sequence_len == 0 ? 0 : context_sequence_len - 1;
+    trace->position_count = static_cast<uint32_t>(
+        std::min<size_t>(verified.greedy_tokens.size(), GEMMA4_MTP_TRACE_MAX_POSITIONS));
+    trace->top_k = GEMMA4_MTP_TRACE_TOP_K;
+
+    for (size_t position = 0; position < trace->position_count; ++position) {
+        trace->position_offsets[position] = trace->first_position + position;
+        trace->target_tokens[position] = verified.greedy_tokens[position];
+        if (position < verified.greedy_logits.size()) {
+            trace->target_logits[position] = verified.greedy_logits[position];
+        }
+        if (draft_tokens != nullptr && position < draft_count) {
+            trace->draft_tokens[position] = draft_tokens[position];
+            if (position < verified.draft_logits.size()) {
+                trace->draft_logits[position] = verified.draft_logits[position];
+            }
+            if (position < verified.logit_margins.size()) {
+                trace->logit_margins[position] = verified.logit_margins[position];
+            }
+            if (position < verified.draft_in_top_k.size()) {
+                trace->draft_in_top_k[position] = verified.draft_in_top_k[position];
+            }
+        }
+
+        for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+            const size_t trace_index = position * GEMMA4_MTP_TRACE_TOP_K + rank;
+            if (trace_index < verified.top_token_ids.size()) {
+                trace->top_token_ids[trace_index] = verified.top_token_ids[trace_index];
+            }
+            if (trace_index < verified.top_logits.size()) {
+                trace->top_logits[trace_index] = verified.top_logits[trace_index];
+            }
+        }
+    }
+
+    fill_shape(verified.last_hidden, &trace->hidden_rank, trace->hidden_shape);
+    fill_optional_shape(
+        verified.shared_kv.full_attention_key,
+        &trace->full_attention_key_rank,
+        trace->full_attention_key_shape);
+    fill_optional_shape(
+        verified.shared_kv.full_attention_value,
+        &trace->full_attention_value_rank,
+        trace->full_attention_value_shape);
+    fill_optional_shape(
+        verified.shared_kv.sliding_attention_key,
+        &trace->sliding_attention_key_rank,
+        trace->sliding_attention_key_shape);
+    fill_optional_shape(
+        verified.shared_kv.sliding_attention_value,
+        &trace->sliding_attention_value_rank,
+        trace->sliding_attention_value_shape);
+}
 
 NativeHiddenArrays forward_hidden(
     const NativeTextModel::Impl& impl,
@@ -990,7 +1132,9 @@ NativeVerifyArrays forward_verify_logits(
     const NativeTextModel::Impl& impl,
     const std::vector<int32_t>& tokens,
     size_t first_position,
-    size_t position_count) {
+    size_t position_count,
+    const int32_t* draft_tokens,
+    size_t draft_count) {
     if (position_count == 0) {
         throw std::runtime_error("native MTP verify requires at least one logit position");
     }
@@ -1007,28 +1151,75 @@ NativeVerifyArrays forward_verify_logits(
     const int stop = static_cast<int>(first_position + position_count);
     array selected_hidden = mlx::core::slice(forward.hidden, {0, first, 0}, {1, stop, 3840});
     array logits = target_logits_for_hidden(impl, selected_hidden);
+    array logits_f32 = to_float32(logits);
     array greedy = mlx::core::argmax(logits, -1);
     array greedy_logits = to_float32(mlx::core::max(logits, -1));
     array last_hidden = mlx::core::slice(
         forward.hidden,
         {0, static_cast<int>(tokens.size() - 1), 0},
         {1, static_cast<int>(tokens.size()), 3840});
-    mlx::core::eval({greedy, greedy_logits, last_hidden});
+    mlx::core::eval({greedy, greedy_logits, last_hidden, logits_f32});
 
     std::vector<int32_t> greedy_tokens;
     std::vector<float> greedy_logits_out;
+    std::vector<int32_t> top_token_ids;
+    std::vector<float> top_logits;
+    std::vector<float> draft_logits;
+    std::vector<float> logit_margins;
+    std::vector<bool> draft_in_top_k;
     greedy_tokens.reserve(position_count);
     greedy_logits_out.reserve(position_count);
+    top_token_ids.reserve(position_count * GEMMA4_MTP_TRACE_TOP_K);
+    top_logits.reserve(position_count * GEMMA4_MTP_TRACE_TOP_K);
+    draft_logits.reserve(draft_count);
+    logit_margins.reserve(draft_count);
+    draft_in_top_k.reserve(draft_count);
     const int* token_data = greedy.data<int>();
     const float* logit_data = greedy_logits.data<float>();
+    const float* all_logits = logits_f32.data<float>();
+    const auto& logits_shape = logits_f32.shape();
+    const int vocab_size = logits_shape.empty() ? 0 : logits_shape.back();
     for (size_t index = 0; index < position_count; ++index) {
         greedy_tokens.push_back(static_cast<int32_t>(token_data[index]));
         greedy_logits_out.push_back(logit_data[index]);
+
+        std::vector<int32_t> position_top_ids(GEMMA4_MTP_TRACE_TOP_K, -1);
+        std::vector<float> position_top_logits(
+            GEMMA4_MTP_TRACE_TOP_K,
+            -std::numeric_limits<float>::infinity());
+        const float* row = all_logits + (index * static_cast<size_t>(vocab_size));
+        for (int token = 0; token < vocab_size; ++token) {
+            insert_topk(
+                &position_top_ids,
+                &position_top_logits,
+                static_cast<int32_t>(token),
+                row[token],
+                GEMMA4_MTP_TRACE_TOP_K);
+        }
+        top_token_ids.insert(top_token_ids.end(), position_top_ids.begin(), position_top_ids.end());
+        top_logits.insert(top_logits.end(), position_top_logits.begin(), position_top_logits.end());
+
+        if (draft_tokens != nullptr && index < draft_count) {
+            const int32_t draft_token = draft_tokens[index];
+            const bool valid_draft = draft_token >= 0 && draft_token < vocab_size;
+            const float draft_logit =
+                valid_draft ? row[draft_token] : -std::numeric_limits<float>::infinity();
+            draft_logits.push_back(draft_logit);
+            logit_margins.push_back(logit_data[index] - draft_logit);
+            draft_in_top_k.push_back(
+                std::find(position_top_ids.begin(), position_top_ids.end(), draft_token) !=
+                position_top_ids.end());
+        }
     }
     const float peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
     return NativeVerifyArrays{
         std::move(greedy_tokens),
         std::move(greedy_logits_out),
+        std::move(top_token_ids),
+        std::move(top_logits),
+        std::move(draft_logits),
+        std::move(logit_margins),
+        std::move(draft_in_top_k),
         std::move(last_hidden),
         std::move(forward.shared_kv),
         peak_memory_gb,
@@ -2534,7 +2725,9 @@ bool NativeTextModel::verify_draft_block(
             *impl_,
             candidate_tokens,
             context_tokens.size() - 1,
-            draft_count + 1);
+            draft_count + 1,
+            draft_tokens,
+            draft_count);
 
         size_t accepted_count = 0;
         bool rejected = false;
@@ -2565,6 +2758,7 @@ bool NativeTextModel::verify_draft_block(
             }
             *committed_tokens = std::move(fallback_tokens);
             *out = fallback_step;
+            populate_mtp_trace(out, context_tokens.size(), draft_tokens, draft_count, verified);
             out->accepted_draft_count = static_cast<uint32_t>(accepted_count);
             out->committed_count = static_cast<uint32_t>(committed_tokens->size() - context_tokens.size());
             for (size_t index = 0; index < out->committed_count && index < 4; ++index) {
@@ -2597,6 +2791,7 @@ bool NativeTextModel::verify_draft_block(
         out->sequence_len = committed_tokens->size();
         out->peak_memory_gb = verified.peak_memory_gb;
         out->peak_rss_mb = 0.0f;
+        populate_mtp_trace(out, context_tokens.size(), draft_tokens, draft_count, verified);
         out->accepted_draft_count = static_cast<uint32_t>(draft_count);
         out->committed_count = static_cast<uint32_t>(draft_count);
         for (size_t index = 0; index < draft_count && index < 4; ++index) {
