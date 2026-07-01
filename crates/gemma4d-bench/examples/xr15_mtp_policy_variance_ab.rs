@@ -11,7 +11,8 @@ use std::{
 
 use gemma4d_bench::{CliError, manifest, workload_corpus::WorkloadRecord};
 use gemma4d_ffi::{
-    Drafter, KvCache, KvPolicy, LoadConfig, Target, decode_one, draft_block, prefill, verify_tokens,
+    Drafter, KvCache, KvPolicy, LoadConfig, Target, decode_one, draft_block, prefill,
+    verify_tokens, verify_tokens_terminal_no_lookahead,
 };
 use gemma4d_tokenizer::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -156,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_speedup_percent: args.min_speedup_percent,
         regression_gate_percent: args.regression_gate_percent,
         memory_cliff_gb: args.memory_cliff_gb,
+        experimental_terminal_no_lookahead: args.experimental_terminal_no_lookahead,
         low_n: args.trials < 3,
         record_count: records.len(),
         measured_record_count: records.iter().filter(|record| record.measured).count(),
@@ -207,6 +209,7 @@ struct Args {
     min_speedup_percent: f64,
     regression_gate_percent: f64,
     memory_cliff_gb: f64,
+    experimental_terminal_no_lookahead: bool,
 }
 
 impl Args {
@@ -234,6 +237,7 @@ impl Args {
             min_speedup_percent: DEFAULT_MIN_SPEEDUP_PERCENT,
             regression_gate_percent: DEFAULT_REGRESSION_GATE_PERCENT,
             memory_cliff_gb: DEFAULT_MEMORY_CLIFF_GB,
+            experimental_terminal_no_lookahead: false,
         };
         let mut args = args.into_iter().map(Into::into).peekable();
         while let Some(arg) = args.next() {
@@ -299,6 +303,9 @@ impl Args {
                         &required_value(&mut args, "--memory-cliff-gb")?,
                         "--memory-cliff-gb",
                     )?
+                }
+                "--experimental-terminal-no-lookahead" => {
+                    out.experimental_terminal_no_lookahead = true
                 }
                 "-h" | "--help" => return Err(CliError::Usage(usage())),
                 other => {
@@ -369,6 +376,7 @@ struct Summary {
     min_speedup_percent: f64,
     regression_gate_percent: f64,
     memory_cliff_gb: f64,
+    experimental_terminal_no_lookahead: bool,
     low_n: bool,
     record_count: usize,
     measured_record_count: usize,
@@ -450,6 +458,7 @@ struct MtpRun {
     accepted_tokens_per_verify: f64,
     target_verify_passes: u64,
     rollback_count: u64,
+    terminal_no_lookahead_count: u64,
     peak_memory_gb: f32,
     active_kv_bytes: u64,
     events: Vec<MtpEvent>,
@@ -463,6 +472,8 @@ struct MtpEvent {
     committed_tokens: Vec<i32>,
     accepted_draft_count: u32,
     rejected: bool,
+    remaining_token_budget: usize,
+    terminal_no_lookahead: bool,
     context_sequence_len: u64,
     sequence_len: u64,
     verify_ms: f64,
@@ -648,6 +659,7 @@ fn run_mtp(
     let mut accepted_draft_tokens = 0_u64;
     let mut target_verify_passes = 0_u64;
     let mut rollback_count = 0_u64;
+    let mut terminal_no_lookahead_count = 0_u64;
     let mut peak_memory_gb = first.peak_memory_gb;
     let mut active_kv_bytes = first.active_kv_bytes;
     let mut events = Vec::new();
@@ -668,8 +680,14 @@ fn run_mtp(
 
         attempted_draft_tokens += draft.len() as u64;
         target_verify_passes += 1;
+        let terminal_no_lookahead =
+            args.experimental_terminal_no_lookahead && draft.len() == remaining;
         let verify_started = Instant::now();
-        let step = verify_tokens(&target, &mut cache, &draft)?;
+        let step = if terminal_no_lookahead {
+            verify_tokens_terminal_no_lookahead(&target, &mut cache, &draft, remaining)?
+        } else {
+            verify_tokens(&target, &mut cache, &draft)?
+        };
         let verify_elapsed = verify_started.elapsed();
         verify_duration += verify_elapsed;
         peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
@@ -685,6 +703,12 @@ fn run_mtp(
         if rejected {
             rollback_count += 1;
         }
+        let terminal_skip_applied = terminal_no_lookahead
+            && committed.len() >= remaining
+            && step.native_last_hidden.is_none();
+        if terminal_skip_applied {
+            terminal_no_lookahead_count += 1;
+        }
         for token in &committed {
             if generated.len() < workload.max_new_tokens {
                 generated.push(*token);
@@ -697,6 +721,8 @@ fn run_mtp(
             committed_tokens: committed,
             accepted_draft_count: step.accepted_draft_count,
             rejected,
+            remaining_token_budget: remaining,
+            terminal_no_lookahead: terminal_skip_applied,
             context_sequence_len: step.mtp_trace.context_sequence_len,
             sequence_len: step.sequence_len,
             verify_ms: duration_ms(verify_elapsed),
@@ -727,6 +753,7 @@ fn run_mtp(
         accepted_tokens_per_verify: ratio(accepted_draft_tokens, target_verify_passes),
         target_verify_passes,
         rollback_count,
+        terminal_no_lookahead_count,
         peak_memory_gb,
         active_kv_bytes,
         events,
@@ -1276,6 +1303,19 @@ fn startup_blockers(args: &Args, source_replay: &Option<SourceReplaySummary>) ->
     if env::var_os("GEMMA4D_REQUIRE_MLX").is_none() {
         blockers.push("GEMMA4D_REQUIRE_MLX=1 is required for XR15".to_owned());
     }
+    if args.experimental_terminal_no_lookahead {
+        for flag in [
+            "GEMMA4D_EXPERIMENTAL_MTP_BATCH_VERIFY",
+            "GEMMA4D_EXPERIMENTAL_MTP_SKIP_FINAL_PROJECTION",
+            "GEMMA4D_EXPERIMENTAL_MTP_INPLACE_VERIFY",
+        ] {
+            if env::var_os(flag).is_some() {
+                blockers.push(format!(
+                    "--experimental-terminal-no-lookahead cannot be combined with {flag}"
+                ));
+            }
+        }
+    }
     blockers
 }
 
@@ -1316,6 +1356,10 @@ fn render_report(summary: &Summary) -> String {
         "| Trials | `{}` measured, `{}` warmup |\n",
         summary.requested_trials, summary.warmup_trials
     ));
+    out.push_str(&format!(
+        "| Terminal no-lookahead | `{}` |\n",
+        summary.experimental_terminal_no_lookahead
+    ));
     out.push_str(&format!("| Low-N | `{}` |\n\n", summary.low_n));
 
     out.push_str("## Policy Results\n\n");
@@ -1338,11 +1382,11 @@ fn render_report(summary: &Summary) -> String {
     out.push('\n');
 
     out.push_str("## Records\n\n");
-    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Speedup % | Accepted/Attempted | Peak GB | Status |\n");
-    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Speedup % | Accepted/Attempted | Terminal skips | Peak GB | Status |\n");
+    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|\n");
     for record in &summary.records {
         out.push_str(&format!(
-            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {}/{} | {:.3} | `{}` |\n",
+            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {}/{} | {} | {:.3} | `{}` |\n",
             record.workload_id,
             record.trial_kind,
             record.trial_index,
@@ -1353,6 +1397,7 @@ fn render_report(summary: &Summary) -> String {
             speedup_percent(record.baseline.decode_ms, record.mtp.decode_phase_ms),
             record.mtp.accepted_draft_tokens,
             record.mtp.attempted_draft_tokens,
+            record.mtp.terminal_no_lookahead_count,
             record.mtp.peak_memory_gb,
             record.status
         ));
@@ -1405,6 +1450,7 @@ fn measurement_notes() -> Vec<String> {
     vec![
         "baseline is native non-MTP greedy decode with GEMMA4D_REQUIRE_MLX=1 and GEMMA4D_USE_NATIVE_GRAPH=1".to_owned(),
         "candidate MTP decode phase is draft_ms + verify_ms; model load and prefill are recorded but excluded from policy speed decisions".to_owned(),
+        "terminal no-lookahead mode only calls the experimental verifier on a final draft block whose returned draft count can satisfy the remaining generation budget".to_owned(),
         "warmup records remain in records.jsonl and summary.json but policy summaries use measured records only".to_owned(),
         "the net-latency guard requires exact MTP output, at least 5% decode-phase speedup, and peak MLX memory under the configured gate".to_owned(),
     ]
@@ -1473,7 +1519,7 @@ where
 
 fn usage() -> String {
     format!(
-        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
+        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
     )
 }
 

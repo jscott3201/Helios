@@ -196,6 +196,13 @@ Gemma4Status gemma4_verify_tokens(
     const int32_t* draft_tokens,
     size_t draft_count,
     Gemma4StepResult* out);
+Gemma4Status gemma4_verify_tokens_terminal_no_lookahead(
+    Gemma4Target* target,
+    Gemma4KvCache* cache,
+    const int32_t* draft_tokens,
+    size_t draft_count,
+    size_t terminal_commit_count,
+    Gemma4StepResult* out);
 
 #ifdef __cplusplus
 }

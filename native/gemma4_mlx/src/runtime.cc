@@ -1423,11 +1423,12 @@ Gemma4Status gemma4_mtp_draft_block(
     return ok();
 }
 
-Gemma4Status gemma4_verify_tokens(
+Gemma4Status verify_tokens_impl(
     Gemma4Target* target,
     Gemma4KvCache* cache,
     const int32_t* draft_tokens,
     size_t draft_count,
+    size_t terminal_commit_count,
     Gemma4StepResult* out) {
     clear_step_result(out);
 
@@ -1445,6 +1446,11 @@ Gemma4Status gemma4_verify_tokens(
     }
     if (draft_count == 0) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_verify_tokens requires at least one draft token");
+    }
+    if (terminal_commit_count > draft_count) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_verify_tokens terminal commit count cannot exceed draft_count");
     }
     if (!target->model_loaded) {
         return fail(
@@ -1480,7 +1486,8 @@ Gemma4Status gemma4_verify_tokens(
         // Experimental XR16 prototype: commit a batched block only when all
         // draft tokens are accepted; otherwise fall back to exact sequential
         // rollback without changing the default verifier.
-        if (env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BATCH_VERIFY") && draft_count == 2 &&
+        if (terminal_commit_count == 0 &&
+            env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BATCH_VERIFY") && draft_count == 2 &&
             draft_tokens[0] == cache->last_step.greedy_token) {
             std::unique_ptr<gemma4d::NativeKvState> block_kv = cache->native_kv_state->clone();
             if (block_kv == nullptr) {
@@ -1557,7 +1564,8 @@ Gemma4Status gemma4_verify_tokens(
 
         // XR18 prototype: measure KV clone/copy overhead while keeping the
         // failure-atomic staged verifier as the default path.
-        const bool in_place_verify = env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_INPLACE_VERIFY");
+        const bool in_place_verify =
+            terminal_commit_count == 0 && env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_INPLACE_VERIFY");
         std::unique_ptr<gemma4d::NativeKvState> staged_kv;
         std::vector<int32_t> staged_tokens;
         gemma4d::NativeKvState* verify_kv = cache->native_kv_state.get();
@@ -1579,6 +1587,7 @@ Gemma4Status gemma4_verify_tokens(
         uint64_t active_kv_bytes = verify_kv->active_bytes();
         uint32_t accepted_count = 0;
         std::unique_ptr<gemma4d::NativeHiddenState> staged_hidden;
+        bool terminal_lookahead_skipped = false;
 
         for (size_t index = 0; index < draft_count; ++index) {
             record_mtp_target_step(&trace, index, context_sequence_len, current_step);
@@ -1588,6 +1597,14 @@ Gemma4Status gemma4_verify_tokens(
             const int32_t token_to_commit = accepted ? draft_tokens[index] : current_step.greedy_token;
             committed_tail.push_back(token_to_commit);
             verify_tokens->push_back(token_to_commit);
+            if (accepted) {
+                ++accepted_count;
+            }
+
+            if (terminal_commit_count > 0 && committed_tail.size() >= terminal_commit_count) {
+                terminal_lookahead_skipped = true;
+                break;
+            }
 
             Gemma4StepResult next_step{};
             std::unique_ptr<gemma4d::NativeHiddenState> next_hidden;
@@ -1604,20 +1621,24 @@ Gemma4Status gemma4_verify_tokens(
             peak_memory_gb = std::max(peak_memory_gb, current_step.peak_memory_gb);
             active_kv_bytes = std::max(active_kv_bytes, current_step.active_kv_bytes);
 
-            if (accepted) {
-                ++accepted_count;
-                continue;
+            if (!accepted) {
+                break;
             }
-
-            break;
         }
 
-        const size_t lookahead_index = draft_count;
-        record_mtp_target_step(&trace, lookahead_index, context_sequence_len, current_step);
-        record_mtp_hidden_shape(&trace, staged_hidden.get());
+        if (!terminal_lookahead_skipped) {
+            const size_t lookahead_index = draft_count;
+            record_mtp_target_step(&trace, lookahead_index, context_sequence_len, current_step);
+            record_mtp_hidden_shape(&trace, staged_hidden.get());
+        }
 
-        if (staged_hidden == nullptr) {
+        if (staged_hidden == nullptr && !terminal_lookahead_skipped) {
             return fail(GEMMA4_ERR_RUNTIME, "native MTP verify did not produce a committed hidden state");
+        }
+
+        if (terminal_lookahead_skipped) {
+            current_step.sequence_len = context_sequence_len + committed_tail.size();
+            active_kv_bytes = std::max(active_kv_bytes, current_step.active_kv_bytes);
         }
 
         *out = current_step;
@@ -1629,6 +1650,12 @@ Gemma4Status gemma4_verify_tokens(
             out->committed_tokens[index] = committed_tail[index];
         }
         out->mtp_trace = trace;
+
+        if (terminal_lookahead_skipped) {
+            out->native_last_hidden = nullptr;
+            target->sequence_len = out->sequence_len;
+            return ok();
+        }
 
         if (!in_place_verify) {
             cache->native_tokens = std::move(staged_tokens);
@@ -1644,4 +1671,23 @@ Gemma4Status gemma4_verify_tokens(
     return fail(
         GEMMA4_ERR_UNSUPPORTED_CONFIG,
         "gemma4_verify_tokens exact rollback requires the native target graph");
+}
+
+Gemma4Status gemma4_verify_tokens(
+    Gemma4Target* target,
+    Gemma4KvCache* cache,
+    const int32_t* draft_tokens,
+    size_t draft_count,
+    Gemma4StepResult* out) {
+    return verify_tokens_impl(target, cache, draft_tokens, draft_count, 0, out);
+}
+
+Gemma4Status gemma4_verify_tokens_terminal_no_lookahead(
+    Gemma4Target* target,
+    Gemma4KvCache* cache,
+    const int32_t* draft_tokens,
+    size_t draft_count,
+    size_t terminal_commit_count,
+    Gemma4StepResult* out) {
+    return verify_tokens_impl(target, cache, draft_tokens, draft_count, terminal_commit_count, out);
 }

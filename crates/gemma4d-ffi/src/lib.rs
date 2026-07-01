@@ -251,6 +251,14 @@ mod raw {
             draft_count: usize,
             out: *mut Gemma4StepResult,
         ) -> Gemma4Status;
+        pub fn gemma4_verify_tokens_terminal_no_lookahead(
+            target: *mut Gemma4Target,
+            cache: *mut Gemma4KvCache,
+            draft_tokens: *const i32,
+            draft_count: usize,
+            terminal_commit_count: usize,
+            out: *mut Gemma4StepResult,
+        ) -> Gemma4Status;
     }
 }
 
@@ -940,6 +948,41 @@ pub fn verify_tokens(
             cache.ptr.as_ptr(),
             token_ptr,
             draft_tokens.len(),
+            &mut out,
+        )
+    })?;
+
+    Ok(out.into())
+}
+
+/// Verifies a terminal MTP draft block without preparing lookahead state once
+/// `terminal_commit_count` committed tokens have been produced.
+///
+/// When the native path skips the final lookahead, the returned `StepResult`
+/// has `native_last_hidden == None` and the cache must be discarded rather than
+/// used for continuation.
+pub fn verify_tokens_terminal_no_lookahead(
+    target: &Target,
+    cache: &mut KvCache,
+    draft_tokens: &[i32],
+    terminal_commit_count: usize,
+) -> Result<StepResult> {
+    let mut out = raw::Gemma4StepResult::default();
+    let token_ptr = if draft_tokens.is_empty() {
+        ptr::null()
+    } else {
+        draft_tokens.as_ptr()
+    };
+
+    // SAFETY: handles come from safe wrappers; token pointer/count describe `draft_tokens`;
+    // `terminal_commit_count` is a caller-supplied generation budget; `out` is writable.
+    check(unsafe {
+        raw::gemma4_verify_tokens_terminal_no_lookahead(
+            target.ptr.as_ptr(),
+            cache.ptr.as_ptr(),
+            token_ptr,
+            draft_tokens.len(),
+            terminal_commit_count,
             &mut out,
         )
     })?;
