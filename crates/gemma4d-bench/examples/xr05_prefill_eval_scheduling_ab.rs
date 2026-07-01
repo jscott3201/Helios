@@ -498,9 +498,24 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             "selective_full_attention",
         ),
         native_variant_with_extra_env(
+            "native_chunked_prefill_256",
+            "per_layer",
+            [("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS", "256")],
+        ),
+        native_variant_with_extra_env(
+            "native_chunked_prefill_384",
+            "per_layer",
+            [("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS", "384")],
+        ),
+        native_variant_with_extra_env(
             "native_chunked_prefill_512",
             "per_layer",
             [("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS", "512")],
+        ),
+        native_variant_with_extra_env(
+            "native_chunked_prefill_768",
+            "per_layer",
+            [("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS", "768")],
         ),
         native_variant_with_extra_env(
             "native_chunked_prefill_1024",
