@@ -1,6 +1,6 @@
 # Decision Record: XR13 Novel Metal/KV Exploration
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-07-01
 - Goal: XR13
 
@@ -56,3 +56,14 @@ This is intentionally a prototype slice:
   implementation with XR13 evidence as input.
 - XR09 remains the real-model BF16/q8/q4 authority; XR13 is only a synthetic
   score-path exploration tied to XR09 workload shapes and seeds.
+
+## Evidence
+
+- Clean run `xr13-1782890847` at code commit `4e1bc28` generated
+  `benchmarks/out/XR13-novel-metal-kv-exploration/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
+- Decision is `reject_candidate`: Turbo score estimation failed correctness on
+  18/18 samples.
+- Planar4 K-only passed the isolated synthetic score gate but remains
+  prototype-only because XR13 did not add a real-model active decode path, C ABI,
+  or Metal kernel.
+- Active compressed KV decode remains disabled by default.
