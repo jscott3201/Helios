@@ -236,7 +236,9 @@ public:
         uint32_t block_size,
         int32_t* out_tokens,
         size_t* inout_count,
-        std::string* error) const;
+        std::string* error,
+        bool lazy_second_draft = false,
+        int32_t first_accept_token = 0) const;
 
 private:
     std::unique_ptr<Impl> impl_;

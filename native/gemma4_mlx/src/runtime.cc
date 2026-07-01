@@ -1490,6 +1490,9 @@ Gemma4Status gemma4_mtp_draft_block(
     }
 
     std::string native_error;
+    const bool lazy_second_draft =
+        env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_LAZY_SECOND_DRAFT") && block_size == 2 &&
+        cache->has_last_step;
     if (!drafter->native_model->draft_block(
             *drafter->target_native_model,
             *cache->last_hidden,
@@ -1497,7 +1500,9 @@ Gemma4Status gemma4_mtp_draft_block(
             block_size,
             out_tokens,
             inout_count,
-            &native_error)) {
+            &native_error,
+            lazy_second_draft,
+            cache->last_step.greedy_token)) {
         *inout_count = 0;
         return fail(GEMMA4_ERR_RUNTIME, native_error);
     }

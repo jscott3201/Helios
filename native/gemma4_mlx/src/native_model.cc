@@ -3751,7 +3751,9 @@ bool NativeMtpAssistantModel::draft_block(
     uint32_t block_size,
     int32_t* out_tokens,
     size_t* inout_count,
-    std::string* error) const {
+    std::string* error,
+    bool lazy_second_draft,
+    int32_t first_accept_token) const {
     if (out_tokens == nullptr || inout_count == nullptr || error == nullptr) {
         return false;
     }
@@ -3812,8 +3814,11 @@ bool NativeMtpAssistantModel::draft_block(
         int32_t token_id = context_tokens.back();
         size_t produced = 0;
         const bool skip_final_projection = experimental_mtp_skip_final_projection_enabled();
+        const bool lazy_block2 = lazy_second_draft && block_size == 2;
         for (uint32_t step = 0; step < block_size; ++step) {
-            const bool need_projected_hidden = !skip_final_projection || step + 1 < block_size;
+            const bool defer_first_projection = lazy_block2 && step == 0;
+            const bool need_projected_hidden =
+                (!skip_final_projection || step + 1 < block_size) && !defer_first_projection;
             NativeMtpDraftStep draft = assistant_draft_one(
                 *impl_,
                 *target_model.impl_,
@@ -3823,9 +3828,17 @@ bool NativeMtpAssistantModel::draft_block(
                 static_cast<int>(first_position + step),
                 need_projected_hidden);
             out_tokens[produced++] = draft.token;
+            if (defer_first_projection && draft.token != first_accept_token) {
+                break;
+            }
             token_id = draft.token;
             if (step + 1 < block_size) {
-                current_hidden = std::move(draft.projected_hidden);
+                if (defer_first_projection) {
+                    current_hidden = quantized_linear(*impl_, draft.projected_hidden, "post_projection");
+                    mlx::core::eval(current_hidden);
+                } else {
+                    current_hidden = std::move(draft.projected_hidden);
+                }
             }
         }
 
