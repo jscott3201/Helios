@@ -1632,7 +1632,7 @@ Gemma4Status verify_tokens_impl(
             const bool partial_reject_serial_repair =
                 env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_PARTIAL_REJECT_REPAIR");
             const bool state_only_serial_repair =
-                serial_state_repair &&
+                (serial_state_repair || partial_reject_serial_repair) &&
                 env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_STATE_ONLY_REPAIR");
             std::unique_ptr<gemma4d::NativeKvState> block_kv = cache->native_kv_state->clone();
             if (block_kv == nullptr) {
