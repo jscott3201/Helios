@@ -1627,6 +1627,8 @@ Gemma4Status verify_tokens_impl(
             draft_tokens[0] == cache->last_step.greedy_token) {
             const bool serial_state_repair =
                 env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_SERIAL_STATE_REPAIR");
+            const bool partial_only_repair_full_accept =
+                env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_PARTIAL_ONLY_REPAIR");
             const bool state_only_serial_repair =
                 serial_state_repair &&
                 env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_STATE_ONLY_REPAIR");
@@ -1737,7 +1739,7 @@ Gemma4Status verify_tokens_impl(
 
             if (draft_tokens[1] == block_greedy_tokens[0]) {
                 const int32_t committed_tokens[2] = {draft_tokens[0], draft_tokens[1]};
-                if (serial_state_repair) {
+                if (serial_state_repair || partial_only_repair_full_accept) {
                     return commit_serial_repaired_state(committed_tokens, 2, 2);
                 }
 
