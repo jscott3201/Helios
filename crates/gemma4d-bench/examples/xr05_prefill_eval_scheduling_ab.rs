@@ -36,6 +36,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_MLX_LM_PREFILL_CLEAR_CACHE",
     "GEMMA4D_NATIVE_PREFILL_KV_EVAL",
     "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS",
+    "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -501,6 +502,11 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             "native_chunked_prefill_256",
             "per_layer",
             [("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS", "256")],
+        ),
+        native_variant_with_extra_env(
+            "native_chunked_prefill_policy_long_context_256",
+            "per_layer",
+            [("GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY", "long_context_256")],
         ),
         native_variant_with_extra_env(
             "native_chunked_prefill_384",

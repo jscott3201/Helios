@@ -88,6 +88,7 @@ struct NativeTextModel::Impl {
     std::string manifest_summary;
     bool experimental_gather_greedy_logit = false;
     size_t native_prefill_chunk_tokens = 0;
+    bool native_prefill_policy_long_context_256 = false;
     bool experimental_skip_decode_peak_reset = false;
 };
 
@@ -1910,6 +1911,21 @@ size_t native_prefill_chunk_tokens_env() {
     return static_cast<size_t>(parsed);
 }
 
+bool native_prefill_policy_long_context_256_env_enabled() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY");
+    return value != nullptr && std::string(value) == "long_context_256";
+}
+
+size_t selected_native_prefill_chunk_tokens(const NativeTextModel::Impl& impl, size_t token_count) {
+    if (impl.native_prefill_chunk_tokens != 0) {
+        return impl.native_prefill_chunk_tokens;
+    }
+    if (impl.native_prefill_policy_long_context_256 && token_count >= 4096) {
+        return 256;
+    }
+    return 0;
+}
+
 bool experimental_skip_decode_peak_reset_env_enabled() {
     const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
@@ -2883,6 +2899,8 @@ bool NativeTextModel::load(
         model->impl_->experimental_gather_greedy_logit =
             experimental_native_gather_greedy_logit_env_enabled();
         model->impl_->native_prefill_chunk_tokens = native_prefill_chunk_tokens_env();
+        model->impl_->native_prefill_policy_long_context_256 =
+            native_prefill_policy_long_context_256_env_enabled();
         model->impl_->experimental_skip_decode_peak_reset =
             experimental_skip_decode_peak_reset_env_enabled();
 
@@ -3131,7 +3149,7 @@ bool NativeTextModel::prefill_incremental(
             *impl_,
             tokens,
             state->impl_.get(),
-            impl_->native_prefill_chunk_tokens);
+            selected_native_prefill_chunk_tokens(*impl_, tokens.size()));
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits);
         array max_logit =
