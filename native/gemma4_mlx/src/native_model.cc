@@ -88,6 +88,7 @@ struct NativeTextModel::Impl {
     std::string manifest_summary;
     bool experimental_gather_greedy_logit = false;
     size_t native_prefill_chunk_tokens = 0;
+    bool experimental_skip_decode_peak_reset = false;
 };
 
 struct NativeMtpAssistantModel::Impl {
@@ -1909,6 +1910,11 @@ size_t native_prefill_chunk_tokens_env() {
     return static_cast<size_t>(parsed);
 }
 
+bool experimental_skip_decode_peak_reset_env_enabled() {
+    const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
 array greedy_logit_for_vector_logits(const array& logits, const array& greedy, bool use_gather) {
     if (use_gather) {
         return to_float32(mlx::core::take(logits, greedy, 0));
@@ -2877,6 +2883,8 @@ bool NativeTextModel::load(
         model->impl_->experimental_gather_greedy_logit =
             experimental_native_gather_greedy_logit_env_enabled();
         model->impl_->native_prefill_chunk_tokens = native_prefill_chunk_tokens_env();
+        model->impl_->experimental_skip_decode_peak_reset =
+            experimental_skip_decode_peak_reset_env_enabled();
 
         const std::vector<std::filesystem::path> files = safetensor_files(model_path);
         if (files.empty()) {
@@ -3197,7 +3205,9 @@ bool NativeTextModel::decode_incremental(
             return false;
         }
 
-        mlx::core::reset_peak_memory();
+        if (!impl_->experimental_skip_decode_peak_reset) {
+            mlx::core::reset_peak_memory();
+        }
         NativeForwardArrays forward = decode_last_logits(*impl_, token, kv_state->impl_.get());
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits);

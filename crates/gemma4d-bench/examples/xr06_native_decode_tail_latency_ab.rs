@@ -41,6 +41,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_USE_NATIVE_GRAPH",
     "GEMMA4D_NATIVE_DECODE_KV_EVAL",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -564,6 +565,14 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             48,
             0,
             [("GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT", "1")],
+        ),
+        native_variant_with_extra_env(
+            "native_decode_skip_peak_reset",
+            "per_layer",
+            Some("native_decode_eval_per_layer"),
+            48,
+            0,
+            [("GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET", "1")],
         ),
     ];
     if !options.variant_names.is_empty() {
