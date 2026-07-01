@@ -42,6 +42,7 @@ which code produced it, and what claims are allowed.
 | 2026-07-01 | XR05 prefill and MLX eval scheduling A/B | Reject candidate | `5b145fc` plus local candidate-wide decision-gate fix | `prefill_eval_scheduling_real_context_ab` | `benchmarks/out/XR05-prefill-and-eval-scheduling-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr05-1782873617-153379000`; command `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr05_prefill_eval_scheduling_ab -- --out-dir benchmarks/out/XR05-prefill-and-eval-scheduling-ab`; 72/72 records passed runtime with no blockers, but no candidate satisfied the candidate-wide no-correctness-regression gate. |
 | 2026-07-01 | XR06 native decode tail-latency A/B | Accept candidate | `92b0757` | `native_decode_tail_latency_real_context_ab` | `benchmarks/out/XR06-native-decode-tail-latency-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr06-1782877235-943162000`; command `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab`; 60/60 records passed with no blockers. Native decode eval scheduling remains opt-in; accepted comparisons were workload-local and several tail hypotheses failed. |
 | 2026-07-01 | XR07 prefix cache real reuse A/B | Blocked with evidence | `6e4280b` | `native_ram_prefix_cache_real_reuse_ab` | `benchmarks/out/XR07-prefix-cache-real-reuse-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr07-1782880867-63480000`; command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab --trials 2 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 4`; namespace isolation passed, but restored continuation/continued decode parity failed and tiny16 memory gates failed at 8K/16K. Default policy is `do_not_enable_ram_prefix_cache_by_default_for_tiny16`. |
+| 2026-07-01 | XR08 SSD cache policy and variance A/B | Keep experimental | `0e4b0cd` | `native_ssd_cache_policy_variance` | `benchmarks/out/XR08-ssd-cache-policy-variance/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr08-1782883921-278286000`; command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr08_ssd_cache_policy_variance -- --out-dir benchmarks/out/XR08-ssd-cache-policy-variance`; 12/12 restore records passed correctness and rejection gates. 8K BF16/q8 profiles passed TTFT, variance, and memory gates; 16K BF16/q8 profiles were rejected for the 14 GB tiny16 memory gate. Policy remains opt-in, profile-gated, and experimental. |
 
 ## P00 Baseline Snapshot
 
@@ -704,6 +705,67 @@ XR07 interpretation:
   corrected implementation. It is not a default policy recommendation while the
   decision remains `blocked_with_evidence`.
 
+## XR08 SSD Cache Policy and Variance A/B Snapshot
+
+XR08 measures repeated SSD prefix restore over real-context 8K and 16K
+prefix-reuse workloads. It compares BF16 payloads against q8-compressed payloads
+already available from P08. Runtime code was not optimized, and mid-decode SSD
+fetch was tested only as a rejection path.
+
+| Field | Value |
+|---|---|
+| Command | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr08_ssd_cache_policy_variance -- --out-dir benchmarks/out/XR08-ssd-cache-policy-variance` |
+| Evidence | `benchmarks/out/XR08-ssd-cache-policy-variance/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Smoke evidence | `benchmarks/out/XR08-ssd-cache-policy-variance-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Run ID | `xr08-1782883921-278286000` |
+| Git SHA | `0e4b0cd599f10a60e916d4b17c1abef1e7e78d38` |
+| Mode | `native_ssd_cache_policy_variance` |
+| Records | `12`: 2 contexts x 3 trials x 2 storage formats |
+| Generated files | `records.jsonl`, `summary.json`, `report.md`, `blockers.md`, `decision.md`; per-trial SSD metadata, payload manifests, and safetensors payload paths are recorded in each record under `ssd_write` |
+| Admission policy | `min_prefix_tokens=8192`, `max_cache_size_bytes=2147483648`, `ssd_metadata_budget_bytes=67108864`; 4K minimum-prefix and synthetic max-cache rejection probes passed |
+| Decision | `keep_experimental` |
+| Profile policy | `ssd_prefix_cache_opt_in_only_for_accepted_profiles` |
+
+Workload cases:
+
+| Case | Context | Source workload | Token length | Source deterministic seed | Prefix hash |
+|---|---:|---|---:|---:|---|
+| `xr08_8k_prefix_reuse_edit_8k_a_001` | 8192 | `prefix_reuse_edit_8k_a_001` | 8192 | 20260636 | `c54fb9aa08c7a1e5758782cc3cc8d5bd0e965bda133a294248f6dd2b380a05c5` |
+| `xr08_16k_long_repo_pack_16k_001` | 16384 | `long_repo_pack_16k_001` | 16384 | 20260639 | `24b46f9ada942263e9c8a6fe134800b1b6dfeab8a0e14e05e30c4b4d55736e3e` |
+
+Aggregate results:
+
+| Case | Variant | Trials | Fresh p50 ms | Warm p50 ms | Warm p95 ms | p50 improvement | p95 improvement | Warm CV | Payload MiB | Metadata bytes | Peak MLX GB | Correct | Rejects | Memory |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| `xr08_8k_prefix_reuse_edit_8k_a_001` | `bf16` | 3/3 | 31654.550 | 3702.107 | 3976.410 | 88.305% | 87.695% | 0.036 | 528.069 | 52648 | 12.829 | `true` | `true` | `true` |
+| `xr08_8k_prefix_reuse_edit_8k_a_001` | `mlx_affine_q8` | 3/3 | 31654.550 | 3224.018 | 3231.880 | 89.815% | 89.999% | 0.002 | 464.091 | 53577 | 12.829 | `true` | `true` | `true` |
+| `xr08_16k_long_repo_pack_16k_001` | `bf16` | 3/3 | 94422.032 | 5124.271 | 5203.594 | 94.573% | 94.551% | 0.007 | 736.123 | 52983 | 21.986 | `true` | `true` | `false` |
+| `xr08_16k_long_repo_pack_16k_001` | `mlx_affine_q8` | 3/3 | 94422.032 | 4231.843 | 4236.473 | 95.518% | 95.563% | 0.003 | 608.145 | 53912 | 21.986 | `true` | `true` | `false` |
+
+XR08 blockers and caveats:
+
+- No hard blockers were recorded.
+- 8K BF16 and q8 both passed correctness, namespace/corruption/cache-mode
+  rejection, zero-mid-decode-fetch, p50/p95 TTFT, variance, and memory gates.
+- 16K BF16 and q8 passed correctness, rejection, p50/p95 TTFT, and variance
+  gates, but crossed the 14 GB tiny16 memory gate in all three trials with peak
+  MLX memory `21.986 GB`.
+- q8 reduced payload size versus BF16 at both contexts, but active decode is
+  restored into BF16 state; compressed active decode remains disabled.
+- Full-run system snapshots showed substantial compression/swap history and zero
+  throttled pages during sampled intervals. Treat 16K results as memory-risk
+  evidence, not an enablement signal.
+
+XR08 interpretation:
+
+- SSD prefix cache should stay disabled by default. The measured evidence only
+  supports opt-in, profile-gated experimentation for exact 8K real-context
+  prefix restores under the same model/artifact/profile.
+- 16K should not be accepted for the 16 GB profile despite strong warm TTFT
+  wins because it repeatedly exceeded the memory cliff.
+- Mid-decode SSD fetch remains disallowed; all measured restores happen before
+  prefill and payload import.
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -737,6 +799,7 @@ XR07 interpretation:
 | 2026-07-01 | Added XR05 prefill/eval scheduling A/B harness and opt-in knobs: helper `GEMMA4D_MLX_LM_PREFILL_CHUNK_TOKENS`, helper `GEMMA4D_MLX_LM_PREFILL_CLEAR_CACHE`, and native `GEMMA4D_NATIVE_PREFILL_KV_EVAL`. The runner records command, seeds, token lengths, MLX peak memory, RSS, prefill tok/s, TTFT, correctness gates, low-N status, blockers, and decision artifacts. It also enforces candidate-wide no-correctness-regression before accepting any workload-local win. | `.codex/agents/tui-ux-engineer.toml`, `codex/goals/XR05-prefill-and-eval-scheduling-ab.goal.md`, `native/gemma4_mlx/scripts/gemma4d_mlx_lm_helper.py`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-bench/examples/xr05_prefill_eval_scheduling_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr05_prefill_eval_scheduling_ab`; `cargo check -p gemma4d-ffi`; TOML parse for `.codex/agents/tui-ux-engineer.toml`; smoke and full XR05 runs with escalated Metal access. |
 | 2026-07-01 | Added XR06 native decode tail-latency A/B harness and opt-in native decode KV eval scheduling modes. The runner records deterministic workload seeds/token lengths, per-token latency traces, position before/after decode, active KV bytes, peak MLX memory, eval-policy markers, correctness gates, blockers, failed hypotheses, and decision artifacts. | `codex/goals/XR06-native-decode-tail-latency-ab.goal.md`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --example xr06_native_decode_tail_latency_ab`; smoke and full XR06 runs with escalated Metal access. |
 | 2026-07-01 | Added XR07 real-prefix RAM cache A/B harness and goal contract. The runner derives 4K/8K/16K real-context repeated-prefix cases from the XR00 corpus, applies deterministic small suffix edits, compares fresh full prefill against RAM restore plus native import and suffix replay, records hit rate, warm TTFT, restore/import/replay latency, continued decode parity, active KV bytes, cache residency, adapter namespace isolation, failed hypotheses, blockers, and default-policy decision artifacts. It does not optimize runtime code. | `codex/goals/XR07-prefix-cache-real-reuse-ab.goal.md`, `crates/gemma4d-bench/examples/xr07_prefix_cache_real_reuse_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab`; `cargo check -p gemma4d-ffi`; `cargo test -p gemma4d-kv --lib`; XR07 smoke and full runs with escalated Metal access. |
+| 2026-07-01 | Added XR08 SSD cache policy and variance harness and goal contract. The runner measures real-context SSD prefix restore variance for BF16 and q8 payloads, records exact generated artifacts, deterministic seeds, token lengths, metadata/payload IO, warm TTFT, fresh prefill, payload checksum time, native import time, cache accounting, corruption/namespace/cache-mode rejection, mid-decode rejection, admission probes, failed hypotheses, blockers, and profile-gated decision artifacts. It does not optimize runtime code. | `codex/goals/XR08-ssd-cache-policy-variance.goal.md`, `crates/gemma4d-bench/examples/xr08_ssd_cache_policy_variance.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr08_ssd_cache_policy_variance`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --examples`; `cargo test -p gemma4d-kv --lib`; XR08 smoke and full runs with escalated Metal access. |
 
 ## Verification Gates
 
@@ -822,6 +885,13 @@ XR07 interpretation:
 | 2026-07-01 | `cargo test -p gemma4d-kv --lib` | Passed | 18 passed; covers namespace mismatch, adapter partitioning, RAM/SSD restore, cache accounting, and compression metadata tests. |
 | 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab-smoke --clear-contexts --context 4096 --trials 1 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 1` | Blocked with evidence | Required escalated Metal access; wrote smoke artifacts and exposed restored-continuation plus continued-decode parity blockers at 4K. |
 | 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab -- --out-dir benchmarks/out/XR07-prefix-cache-real-reuse-ab --trials 2 --suffix-tokens 4 --suffix-edit-tokens 2 --continued-decode-tokens 4` | Blocked with evidence | Required escalated Metal access; wrote 6 real-context records and final XR07 artifacts. Decision is `blocked_with_evidence`; default policy is `do_not_enable_ram_prefix_cache_by_default_for_tiny16`. |
+| 2026-07-01 | `cargo fmt --all --check` | Passed | Formatting gate after the XR08 runner. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --example xr08_ssd_cache_policy_variance` | Passed | Focused compile gate for the XR08 SSD policy and variance runner. |
+| 2026-07-01 | `cargo check -p gemma4d-ffi` | Passed | Focused native/FFI compile gate before XR08 native MLX execution. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --examples` | Passed | Compile coverage for all benchmark examples after adding XR08. |
+| 2026-07-01 | `cargo test -p gemma4d-kv --lib` | Passed | 18 passed; covers namespace mismatch, adapter partitioning, RAM/SSD restore, cache accounting, compression metadata, corruption rejection, and mid-decode SSD rejection. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr08_ssd_cache_policy_variance -- --out-dir benchmarks/out/XR08-ssd-cache-policy-variance-smoke --clear-contexts --context 8192 --trials 1 --modes bf16,q8` | Passed | Required escalated Metal access after sandboxed MLX failed with no Metal device; wrote 2 smoke records and final smoke artifacts. Decision was `reject_candidate` because low-N evidence cannot establish variance. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr08_ssd_cache_policy_variance -- --out-dir benchmarks/out/XR08-ssd-cache-policy-variance` | Passed | Required escalated Metal access; wrote 12 real-context records and final XR08 artifacts. Decision is `keep_experimental`; 8K BF16/q8 accepted for opt-in experimentation, 16K BF16/q8 rejected for tiny16 memory. |
 
 ## Current Claim Boundaries
 
@@ -947,3 +1017,9 @@ XR07 interpretation:
 - XR07's `634 MiB` cap is only a candidate sizing note after blockers are
   resolved. It is not an adoption recommendation while the decision remains
   `blocked_with_evidence`.
+- XR08 keeps SSD prefix cache experimental and profile-gated. It does not enable
+  SSD prefix cache by default, does not permit mid-decode SSD fetch, and does not
+  make production serving readiness claims.
+- XR08 supports only exact real-context prefix restore claims for the measured
+  8K profiles under BF16/q8 payload storage. The 16K profiles are rejected for
+  the 16 GB profile because peak MLX memory crossed `21.986 GB`.
