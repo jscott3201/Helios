@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -369,6 +370,12 @@ struct SharedKvArrays {
     std::optional<array> sliding_attention_value;
 };
 
+enum class PrefillKvEvalMode {
+    PerLayer,
+    EndOfPrefill,
+    SelectiveFullAttention,
+};
+
 constexpr int kTargetLayerCount = 48;
 constexpr int kHiddenSize = 3840;
 constexpr int kSlidingWindowSize = 1024;
@@ -378,6 +385,33 @@ constexpr uint64_t kBf16Bytes = 2;
 
 bool target_layer_full_attention(uint32_t layer_idx) {
     return ((layer_idx + 1) % 6) == 0;
+}
+
+PrefillKvEvalMode prefill_kv_eval_mode() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_PREFILL_KV_EVAL");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "current") == 0 ||
+        std::strcmp(value, "per_layer") == 0) {
+        return PrefillKvEvalMode::PerLayer;
+    }
+    if (std::strcmp(value, "end") == 0 || std::strcmp(value, "end_of_prefill") == 0 ||
+        std::strcmp(value, "grouped") == 0) {
+        return PrefillKvEvalMode::EndOfPrefill;
+    }
+    if (std::strcmp(value, "selective") == 0 ||
+        std::strcmp(value, "selective_full_attention") == 0) {
+        return PrefillKvEvalMode::SelectiveFullAttention;
+    }
+    return PrefillKvEvalMode::PerLayer;
+}
+
+bool eval_prefill_kv_when_stored(PrefillKvEvalMode mode, bool full_attention) {
+    return mode == PrefillKvEvalMode::PerLayer ||
+        (mode == PrefillKvEvalMode::SelectiveFullAttention && full_attention);
+}
+
+bool eval_prefill_kv_at_end(PrefillKvEvalMode mode, bool full_attention) {
+    return mode == PrefillKvEvalMode::EndOfPrefill ||
+        (mode == PrefillKvEvalMode::SelectiveFullAttention && !full_attention);
 }
 
 uint64_t estimate_target_kv_bytes(uint64_t sequence_len) {
@@ -409,7 +443,31 @@ void store_target_layer_kv(
         layer->key = mlx::core::slice(keys, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
         layer->value = mlx::core::slice(values, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
     }
-    mlx::core::eval({*layer->key, *layer->value});
+    if (eval_prefill_kv_when_stored(prefill_kv_eval_mode(), full_attention)) {
+        mlx::core::eval({*layer->key, *layer->value});
+    }
+}
+
+void eval_deferred_prefill_kv(NativeKvState::Impl* target_kv, PrefillKvEvalMode mode) {
+    if (target_kv == nullptr || mode == PrefillKvEvalMode::PerLayer) {
+        return;
+    }
+    std::vector<array> eval_arrays;
+    eval_arrays.reserve(target_kv->layers.size() * 2);
+    for (const NativeKvState::Impl::Layer& layer : target_kv->layers) {
+        if (!eval_prefill_kv_at_end(mode, layer.full_attention)) {
+            continue;
+        }
+        if (layer.key.has_value()) {
+            eval_arrays.push_back(*layer.key);
+        }
+        if (layer.value.has_value()) {
+            eval_arrays.push_back(*layer.value);
+        }
+    }
+    if (!eval_arrays.empty()) {
+        mlx::core::eval(eval_arrays);
+    }
 }
 
 bool should_capture_shared_kv(uint32_t layer_idx, bool full_attention) {
@@ -1046,6 +1104,7 @@ NativeHiddenArrays forward_hidden(
     dump_hidden_tensor("final_norm", h);
     trace_hidden_stats("final_norm", h, sequence_len);
     if (target_kv != nullptr) {
+        eval_deferred_prefill_kv(target_kv, prefill_kv_eval_mode());
         target_kv->sequence_len = tokens.size();
         target_kv->active_bytes = estimate_target_kv_bytes(tokens.size());
     }

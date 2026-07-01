@@ -8,6 +8,7 @@ token prefill/decode commands so Rust still talks to the narrow C ABI.
 from __future__ import annotations
 
 import json
+import os
 import resource
 import sys
 import time
@@ -48,9 +49,32 @@ except Exception as exc:  # noqa: BLE001 - propagate to native parent as data.
     fail(f"failed to load MLX-LM Gemma 4 text model: {exc}")
     raise SystemExit(1)
 
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        fail(f"{name} must be an integer, got {raw!r}")
+        raise SystemExit(1) from exc
+    if parsed <= 0:
+        fail(f"{name} must be greater than zero, got {parsed}")
+        raise SystemExit(1)
+    return parsed
+
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw not in {"0", "false", "FALSE", "off", "OFF"}
+
+
 prompt_cache = None
 sequence_len = 0
-prefill_chunk_tokens = 2048
+prefill_chunk_tokens = env_int("GEMMA4D_MLX_LM_PREFILL_CHUNK_TOKENS", 2048)
+prefill_clear_cache = env_flag("GEMMA4D_MLX_LM_PREFILL_CLEAR_CACHE", True)
 
 emit(
     {
@@ -58,6 +82,8 @@ emit(
         "backend": "mlx_lm_gemma4_text_helper",
         "model_type": config.get("model_type"),
         "load_s": load_s,
+        "prefill_chunk_tokens": prefill_chunk_tokens,
+        "prefill_clear_cache": prefill_clear_cache,
     }
 )
 
@@ -113,7 +139,8 @@ def prefill(tokens: list[int]) -> tuple[int, float, int]:
         mx.eval(cache_state())
         sequence_len += len(chunk)
         remaining = remaining[prefill_chunk_tokens:]
-        mx.clear_cache()
+        if prefill_clear_cache:
+            mx.clear_cache()
 
     token, logit = model_step(remaining)
     sequence_len += len(remaining)

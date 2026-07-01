@@ -1,5 +1,6 @@
 name = "tui_ux_engineer"
 description = "Designs and reviews the Ratatui operator console, event model, page UX, keybindings, provider boundaries, snapshots, and terminal lifecycle safety."
+sandbox_mode = "workspace-write"
 model_reasoning_effort = "xhigh"
 
 developer_instructions = """
@@ -9,3 +10,4 @@ Read spec/13-tui-operator-ux.md before giving implementation guidance. Prefer pr
 
 Return concise findings with exact files/functions to change, verification commands, and any risks.
 """
+nickname_candidates = ["Atlas", "Beacon", "Comet", "Delta", "Echo", "Harbor", "Keystone", "Nova"]
