@@ -35,6 +35,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_MLX_LM_PREFILL_CHUNK_TOKENS",
     "GEMMA4D_MLX_LM_PREFILL_CLEAR_CACHE",
     "GEMMA4D_NATIVE_PREFILL_KV_EVAL",
+    "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -496,6 +497,16 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             "native_eval_selective_full_attention",
             "selective_full_attention",
         ),
+        native_variant_with_extra_env(
+            "native_chunked_prefill_512",
+            "per_layer",
+            [("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS", "512")],
+        ),
+        native_variant_with_extra_env(
+            "native_chunked_prefill_1024",
+            "per_layer",
+            [("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS", "1024")],
+        ),
     ];
     if !options.variant_names.is_empty() {
         let requested = options
@@ -557,6 +568,14 @@ fn helper_variant_with_clear_cache(chunk_tokens: usize, prefill_clear_cache: boo
 }
 
 fn native_variant(name: &str, eval_mode: &str) -> Variant {
+    native_variant_with_extra_env(name, eval_mode, [])
+}
+
+fn native_variant_with_extra_env<const N: usize>(
+    name: &str,
+    eval_mode: &str,
+    extra_env: [(&str, &str); N],
+) -> Variant {
     let mut config = BTreeMap::new();
     config.insert("prefill_kv_eval".to_owned(), eval_mode.to_owned());
     let mut env = BTreeMap::new();
@@ -566,12 +585,16 @@ fn native_variant(name: &str, eval_mode: &str) -> Variant {
         "GEMMA4D_NATIVE_PREFILL_KV_EVAL".to_owned(),
         eval_mode.to_owned(),
     );
+    for (key, value) in extra_env {
+        config.insert(key.to_owned(), value.to_owned());
+        env.insert(key.to_owned(), value.to_owned());
+    }
     Variant {
         name: name.to_owned(),
         backend: Backend::Native,
         config,
         env,
-        baseline_variant: if eval_mode == "per_layer" {
+        baseline_variant: if name == "native_eval_per_layer" {
             None
         } else {
             Some("native_eval_per_layer".to_owned())

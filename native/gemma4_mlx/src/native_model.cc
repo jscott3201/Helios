@@ -1,9 +1,11 @@
 #include "native_model.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -85,6 +87,7 @@ struct NativeTextModel::Impl {
     size_t total_tensor_count_seen = 0;
     std::string manifest_summary;
     bool experimental_gather_greedy_logit = false;
+    size_t native_prefill_chunk_tokens = 0;
 };
 
 struct NativeMtpAssistantModel::Impl {
@@ -1183,6 +1186,75 @@ struct NativeVerifyArrays {
     float peak_memory_gb = 0.0f;
 };
 
+NativeHiddenArrays decode_block_hidden(
+    const NativeTextModel::Impl& impl,
+    const int32_t* tokens,
+    size_t token_count,
+    NativeKvState::Impl* target_kv,
+    NativeKvState::Impl* prefix_kv = nullptr,
+    size_t prefix_token_count = 0) {
+    if (target_kv == nullptr || target_kv->sequence_len == 0 || target_kv->layers.size() != kTargetLayerCount) {
+        throw std::runtime_error("native incremental block decode requires a populated target KV cache");
+    }
+    if (tokens == nullptr || token_count == 0) {
+        throw std::runtime_error("native incremental block decode requires at least one token");
+    }
+    if (token_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native incremental block decode token count exceeds MLX shape limits");
+    }
+    if (target_kv->sequence_len + token_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native incremental block decode position exceeds MLX shape limits");
+    }
+    if (prefix_kv != nullptr && (prefix_token_count == 0 || prefix_token_count > token_count)) {
+        throw std::runtime_error("native incremental block decode prefix token count is invalid");
+    }
+
+    const uint64_t previous_sequence_len = target_kv->sequence_len;
+    const int block_len = static_cast<int>(token_count);
+    const int prefix_len = static_cast<int>(prefix_token_count);
+    std::vector<int32_t> ids(tokens, tokens + token_count);
+    array token_ids(ids.begin(), {1, block_len}, mlx::core::int32);
+    array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
+    SharedKvArrays shared_kv;
+    if (prefix_kv != nullptr) {
+        prefix_kv->layers.clear();
+        prefix_kv->layers.reserve(kTargetLayerCount);
+        prefix_kv->sequence_len = 0;
+        prefix_kv->active_bytes = 0;
+    }
+
+    for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
+        NativeKvState::Impl::Layer* prefix_layer = nullptr;
+        if (prefix_kv != nullptr) {
+            prefix_kv->layers.emplace_back();
+            prefix_layer = &prefix_kv->layers.back();
+        }
+        h = target_layer_decode_block_forward(
+            impl,
+            h,
+            layer,
+            previous_sequence_len,
+            block_len,
+            &target_kv->layers[layer],
+            &shared_kv,
+            prefix_layer,
+            prefix_len);
+    }
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
+        1e-6f));
+    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    target_kv->sequence_len = previous_sequence_len + token_count;
+    target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
+    if (prefix_kv != nullptr) {
+        eval_deferred_decode_kv(prefix_kv, decode_kv_eval_mode());
+        prefix_kv->sequence_len = previous_sequence_len + prefix_token_count;
+        prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
+    }
+    return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
+}
+
 void insert_topk(
     std::vector<int32_t>* top_ids,
     std::vector<float>* top_logits,
@@ -1383,9 +1455,10 @@ array target_logits_for_hidden(const NativeTextModel::Impl& impl, const array& h
     return model_dtype(mlx::core::tanh(logits / model_scalar(30.0f)) * model_scalar(30.0f));
 }
 
-NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
-    NativeHiddenArrays forward = forward_hidden(impl, tokens);
-    const int sequence_len = static_cast<int>(tokens.size());
+NativeForwardArrays last_logits_from_hidden(
+    const NativeTextModel::Impl& impl,
+    NativeHiddenArrays forward,
+    int sequence_len) {
     array last_hidden = mlx::core::slice(forward.hidden, {0, sequence_len - 1, 0}, {1, sequence_len, 3840});
     array logits = target_logits_for_hidden(impl, last_hidden);
     logits = mlx::core::reshape(logits, {262144});
@@ -1393,17 +1466,39 @@ NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const
     return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(forward.shared_kv)};
 }
 
+NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
+    return last_logits_from_hidden(impl, forward_hidden(impl, tokens), static_cast<int>(tokens.size()));
+}
+
 NativeForwardArrays prefill_last_logits(
     const NativeTextModel::Impl& impl,
     const std::vector<int32_t>& tokens,
     NativeKvState::Impl* target_kv) {
-    NativeHiddenArrays forward = forward_hidden(impl, tokens, target_kv);
-    const int sequence_len = static_cast<int>(tokens.size());
-    array last_hidden = mlx::core::slice(forward.hidden, {0, sequence_len - 1, 0}, {1, sequence_len, 3840});
-    array logits = target_logits_for_hidden(impl, last_hidden);
-    logits = mlx::core::reshape(logits, {262144});
-    dump_hidden_tensor("logits", logits);
-    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(forward.shared_kv)};
+    return last_logits_from_hidden(impl, forward_hidden(impl, tokens, target_kv), static_cast<int>(tokens.size()));
+}
+
+NativeForwardArrays prefill_chunked_last_logits(
+    const NativeTextModel::Impl& impl,
+    const std::vector<int32_t>& tokens,
+    NativeKvState::Impl* target_kv,
+    size_t chunk_tokens) {
+    if (chunk_tokens == 0 || chunk_tokens >= tokens.size()) {
+        return prefill_last_logits(impl, tokens, target_kv);
+    }
+
+    const size_t first_count = std::min(chunk_tokens, tokens.size());
+    std::vector<int32_t> first_chunk(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(first_count));
+    NativeHiddenArrays forward = forward_hidden(impl, first_chunk, target_kv);
+    size_t offset = first_count;
+    size_t last_count = first_count;
+    while (offset < tokens.size()) {
+        const size_t current_count = std::min(chunk_tokens, tokens.size() - offset);
+        forward = decode_block_hidden(impl, tokens.data() + offset, current_count, target_kv);
+        offset += current_count;
+        last_count = current_count;
+    }
+
+    return last_logits_from_hidden(impl, std::move(forward), static_cast<int>(last_count));
 }
 
 NativeForwardArrays decode_last_logits(
@@ -1798,6 +1893,20 @@ bool trace_parity_logits_enabled() {
 bool experimental_native_gather_greedy_logit_env_enabled() {
     const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+size_t native_prefill_chunk_tokens_env() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS");
+    if (value == nullptr || value[0] == '\0') {
+        return 0;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno != 0 || end == value || (end != nullptr && *end != '\0')) {
+        return 0;
+    }
+    return static_cast<size_t>(parsed);
 }
 
 array greedy_logit_for_vector_logits(const array& logits, const array& greedy, bool use_gather) {
@@ -2767,6 +2876,7 @@ bool NativeTextModel::load(
         model->impl_->quantization_overrides = manifest.quantization_overrides;
         model->impl_->experimental_gather_greedy_logit =
             experimental_native_gather_greedy_logit_env_enabled();
+        model->impl_->native_prefill_chunk_tokens = native_prefill_chunk_tokens_env();
 
         const std::vector<std::filesystem::path> files = safetensor_files(model_path);
         if (files.empty()) {
@@ -3009,7 +3119,11 @@ bool NativeTextModel::prefill_incremental(
 
         mlx::core::reset_peak_memory();
         std::unique_ptr<NativeKvState> state(new NativeKvState());
-        NativeForwardArrays forward = prefill_last_logits(*impl_, tokens, state->impl_.get());
+        NativeForwardArrays forward = prefill_chunked_last_logits(
+            *impl_,
+            tokens,
+            state->impl_.get(),
+            impl_->native_prefill_chunk_tokens);
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits);
         array max_logit =
