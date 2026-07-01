@@ -980,6 +980,20 @@ fn build_comparisons(aggregates: &[Aggregate], variants: &[Variant]) -> Vec<Comp
             aggregate,
         );
     }
+    let mut variant_correctness_clean = BTreeMap::new();
+    for variant in variants {
+        let variant_aggregates = aggregates
+            .iter()
+            .filter(|aggregate| aggregate.variant == variant.name)
+            .collect::<Vec<_>>();
+        let clean = !variant_aggregates.is_empty()
+            && variant_aggregates.iter().all(|aggregate| {
+                aggregate.trial_count > 0
+                    && aggregate.passed_trials == aggregate.trial_count
+                    && aggregate.correctness_passed_trials == aggregate.trial_count
+            });
+        variant_correctness_clean.insert(variant.name.clone(), clean);
+    }
 
     let mut out = Vec::new();
     for variant in variants {
@@ -1019,6 +1033,9 @@ fn build_comparisons(aggregates: &[Aggregate], variants: &[Variant]) -> Vec<Comp
             let correctness_passed = candidate.passed_trials > 0
                 && baseline.passed_trials > 0
                 && candidate.correctness_passed_trials == candidate.trial_count;
+            let candidate_variant_clean = *variant_correctness_clean
+                .get(&candidate.variant)
+                .unwrap_or(&false);
             let enough_trials = candidate.passed_trials >= 3 && baseline.passed_trials >= 3;
             let prefill_gate = p50_delta
                 .map(|delta| delta >= PREFILL_IMPROVEMENT_GATE_PERCENT)
@@ -1029,10 +1046,16 @@ fn build_comparisons(aggregates: &[Aggregate], variants: &[Variant]) -> Vec<Comp
             let p95_ok = p95_regression
                 .map(|regression| regression <= MAX_P95_REGRESSION_PERCENT)
                 .unwrap_or(false);
-            let accepted =
-                correctness_passed && enough_trials && p95_ok && (prefill_gate || memory_gate);
+            let accepted = correctness_passed
+                && candidate_variant_clean
+                && enough_trials
+                && p95_ok
+                && (prefill_gate || memory_gate);
             let reason = if !correctness_passed {
                 "correctness gate failed or records missing".to_owned()
+            } else if !candidate_variant_clean {
+                "candidate variant had a correctness regression on another selected workload"
+                    .to_owned()
             } else if !enough_trials {
                 "fewer than three passed trials for candidate or baseline".to_owned()
             } else if !p95_ok {
