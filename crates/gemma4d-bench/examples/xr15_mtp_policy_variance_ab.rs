@@ -158,6 +158,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         regression_gate_percent: args.regression_gate_percent,
         memory_cliff_gb: args.memory_cliff_gb,
         experimental_terminal_no_lookahead: args.experimental_terminal_no_lookahead,
+        adaptive_zero_accept_run: args.adaptive_zero_accept_run,
+        adaptive_min_generated_tokens: args.adaptive_min_generated_tokens,
         low_n: args.trials < 3,
         record_count: records.len(),
         measured_record_count: records.iter().filter(|record| record.measured).count(),
@@ -210,6 +212,8 @@ struct Args {
     regression_gate_percent: f64,
     memory_cliff_gb: f64,
     experimental_terminal_no_lookahead: bool,
+    adaptive_zero_accept_run: Option<usize>,
+    adaptive_min_generated_tokens: usize,
 }
 
 impl Args {
@@ -238,6 +242,8 @@ impl Args {
             regression_gate_percent: DEFAULT_REGRESSION_GATE_PERCENT,
             memory_cliff_gb: DEFAULT_MEMORY_CLIFF_GB,
             experimental_terminal_no_lookahead: false,
+            adaptive_zero_accept_run: None,
+            adaptive_min_generated_tokens: 0,
         };
         let mut args = args.into_iter().map(Into::into).peekable();
         while let Some(arg) = args.next() {
@@ -306,6 +312,18 @@ impl Args {
                 }
                 "--experimental-terminal-no-lookahead" => {
                     out.experimental_terminal_no_lookahead = true
+                }
+                "--adaptive-zero-accept-run" => {
+                    out.adaptive_zero_accept_run = Some(parse_positive_usize(
+                        &required_value(&mut args, "--adaptive-zero-accept-run")?,
+                        "--adaptive-zero-accept-run",
+                    )?)
+                }
+                "--adaptive-min-generated-tokens" => {
+                    out.adaptive_min_generated_tokens = parse_usize(
+                        &required_value(&mut args, "--adaptive-min-generated-tokens")?,
+                        "--adaptive-min-generated-tokens",
+                    )?
                 }
                 "-h" | "--help" => return Err(CliError::Usage(usage())),
                 other => {
@@ -377,6 +395,8 @@ struct Summary {
     regression_gate_percent: f64,
     memory_cliff_gb: f64,
     experimental_terminal_no_lookahead: bool,
+    adaptive_zero_accept_run: Option<usize>,
+    adaptive_min_generated_tokens: usize,
     low_n: bool,
     record_count: usize,
     measured_record_count: usize,
@@ -450,6 +470,7 @@ struct MtpRun {
     prefill_ms: f64,
     draft_ms: f64,
     verify_ms: f64,
+    fallback_decode_ms: f64,
     total_ms: f64,
     decode_phase_ms: f64,
     attempted_draft_tokens: u64,
@@ -459,6 +480,10 @@ struct MtpRun {
     target_verify_passes: u64,
     rollback_count: u64,
     terminal_no_lookahead_count: u64,
+    auto_disabled: bool,
+    auto_disable_reason: Option<String>,
+    auto_disable_pass: Option<u64>,
+    auto_disable_generated_tokens: Option<usize>,
     peak_memory_gb: f32,
     active_kv_bytes: u64,
     events: Vec<MtpEvent>,
@@ -655,16 +680,40 @@ fn run_mtp(
     let mut generated = Vec::with_capacity(workload.max_new_tokens);
     let mut draft_duration = Duration::ZERO;
     let mut verify_duration = Duration::ZERO;
+    let mut fallback_decode_duration = Duration::ZERO;
     let mut attempted_draft_tokens = 0_u64;
     let mut accepted_draft_tokens = 0_u64;
     let mut target_verify_passes = 0_u64;
     let mut rollback_count = 0_u64;
     let mut terminal_no_lookahead_count = 0_u64;
+    let mut consecutive_zero_accepts = 0_usize;
+    let mut auto_disabled = false;
+    let mut auto_disable_reason = None;
+    let mut auto_disable_pass = None;
+    let mut auto_disable_generated_tokens = None;
+    let mut pending_greedy = None;
     let mut peak_memory_gb = first.peak_memory_gb;
     let mut active_kv_bytes = first.active_kv_bytes;
     let mut events = Vec::new();
 
     while generated.len() < workload.max_new_tokens {
+        if auto_disabled {
+            if let Some(token) = pending_greedy.take() {
+                generated.push(token);
+                continue;
+            }
+            let token = *generated
+                .last()
+                .ok_or("auto-disabled MTP has no committed token")?;
+            let decode_started = Instant::now();
+            let step = decode_one(&target, &mut cache, token)?;
+            fallback_decode_duration += decode_started.elapsed();
+            peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
+            active_kv_bytes = active_kv_bytes.max(step.active_kv_bytes);
+            generated.push(step.greedy_token);
+            continue;
+        }
+
         let remaining = workload.max_new_tokens - generated.len();
         let current_block_size = block_size.min(remaining).max(1);
         let draft_started = Instant::now();
@@ -698,6 +747,11 @@ fn run_mtp(
         }
         let accepted = u64::from(step.accepted_draft_count);
         accepted_draft_tokens += accepted;
+        if accepted == 0 {
+            consecutive_zero_accepts += 1;
+        } else {
+            consecutive_zero_accepts = 0;
+        }
         let rejected =
             usize::try_from(step.accepted_draft_count).unwrap_or(usize::MAX) < draft.len();
         if rejected {
@@ -734,10 +788,28 @@ fn run_mtp(
             target_tokens: step.mtp_trace.target_tokens.clone(),
             draft_in_target_top_k: step.mtp_trace.draft_in_top_k.clone(),
         });
+
+        if let Some(zero_accept_run) = args.adaptive_zero_accept_run {
+            if consecutive_zero_accepts >= zero_accept_run
+                && generated.len() >= args.adaptive_min_generated_tokens
+            {
+                auto_disabled = true;
+                auto_disable_pass = Some(target_verify_passes);
+                auto_disable_generated_tokens = Some(generated.len());
+                auto_disable_reason = Some(format!(
+                    "consecutive zero-accept passes {} reached threshold {} after {} generated tokens",
+                    consecutive_zero_accepts,
+                    zero_accept_run,
+                    generated.len()
+                ));
+                pending_greedy = Some(step.greedy_token);
+            }
+        }
     }
 
     let draft_ms = duration_ms(draft_duration);
     let verify_ms = duration_ms(verify_duration);
+    let fallback_decode_ms = duration_ms(fallback_decode_duration);
     Ok(MtpRun {
         generated_tokens: generated,
         model_load_ms: duration_ms(model_load),
@@ -745,8 +817,9 @@ fn run_mtp(
         prefill_ms: duration_ms(prefill),
         draft_ms,
         verify_ms,
+        fallback_decode_ms,
         total_ms: duration_ms(started.elapsed()),
-        decode_phase_ms: draft_ms + verify_ms,
+        decode_phase_ms: draft_ms + verify_ms + fallback_decode_ms,
         attempted_draft_tokens,
         accepted_draft_tokens,
         acceptance_rate: ratio(accepted_draft_tokens, attempted_draft_tokens),
@@ -754,6 +827,10 @@ fn run_mtp(
         target_verify_passes,
         rollback_count,
         terminal_no_lookahead_count,
+        auto_disabled,
+        auto_disable_reason,
+        auto_disable_pass,
+        auto_disable_generated_tokens,
         peak_memory_gb,
         active_kv_bytes,
         events,
@@ -1360,6 +1437,17 @@ fn render_report(summary: &Summary) -> String {
         "| Terminal no-lookahead | `{}` |\n",
         summary.experimental_terminal_no_lookahead
     ));
+    out.push_str(&format!(
+        "| Adaptive zero-accept run | `{}` |\n",
+        summary
+            .adaptive_zero_accept_run
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "disabled".to_owned())
+    ));
+    out.push_str(&format!(
+        "| Adaptive min generated tokens | `{}` |\n",
+        summary.adaptive_min_generated_tokens
+    ));
     out.push_str(&format!("| Low-N | `{}` |\n\n", summary.low_n));
 
     out.push_str("## Policy Results\n\n");
@@ -1382,11 +1470,11 @@ fn render_report(summary: &Summary) -> String {
     out.push('\n');
 
     out.push_str("## Records\n\n");
-    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Speedup % | Accepted/Attempted | Terminal skips | Peak GB | Status |\n");
-    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Fallback decode ms | Speedup % | Accepted/Attempted | Terminal skips | Auto disabled | Peak GB | Status |\n");
+    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|---:|---|\n");
     for record in &summary.records {
         out.push_str(&format!(
-            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {}/{} | {} | {:.3} | `{}` |\n",
+            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {:.3} | {}/{} | {} | `{}` | {:.3} | `{}` |\n",
             record.workload_id,
             record.trial_kind,
             record.trial_index,
@@ -1394,10 +1482,12 @@ fn render_report(summary: &Summary) -> String {
             record.comparison.byte_identical,
             record.baseline.decode_ms,
             record.mtp.decode_phase_ms,
+            record.mtp.fallback_decode_ms,
             speedup_percent(record.baseline.decode_ms, record.mtp.decode_phase_ms),
             record.mtp.accepted_draft_tokens,
             record.mtp.attempted_draft_tokens,
             record.mtp.terminal_no_lookahead_count,
+            record.mtp.auto_disabled,
             record.mtp.peak_memory_gb,
             record.status
         ));
@@ -1449,8 +1539,9 @@ fn render_decision(summary: &Summary) -> String {
 fn measurement_notes() -> Vec<String> {
     vec![
         "baseline is native non-MTP greedy decode with GEMMA4D_REQUIRE_MLX=1 and GEMMA4D_USE_NATIVE_GRAPH=1".to_owned(),
-        "candidate MTP decode phase is draft_ms + verify_ms; model load and prefill are recorded but excluded from policy speed decisions".to_owned(),
+        "candidate MTP decode phase is draft_ms + verify_ms + fallback_decode_ms; model load and prefill are recorded but excluded from policy speed decisions".to_owned(),
         "terminal no-lookahead mode only calls the experimental verifier on a final draft block whose returned draft count can satisfy the remaining generation budget".to_owned(),
+        "adaptive zero-accept fallback is disabled unless --adaptive-zero-accept-run is passed; when active it uses native decode_one for the remaining tail after the gate fires".to_owned(),
         "warmup records remain in records.jsonl and summary.json but policy summaries use measured records only".to_owned(),
         "the net-latency guard requires exact MTP output, at least 5% decode-phase speedup, and peak MLX memory under the configured gate".to_owned(),
     ]
@@ -1519,7 +1610,7 @@ where
 
 fn usage() -> String {
     format!(
-        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
+        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
     )
 }
 
