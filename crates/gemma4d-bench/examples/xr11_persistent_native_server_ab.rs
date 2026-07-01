@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use gemma4d_bench::manifest;
 use gemma4d_server::http::{
     PERSISTENT_NATIVE_GATE_ENV, ServerBackend, ServerConfig, ServerRuntime, http_request,
     serve_listener,
@@ -40,6 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = command_display(&args);
     let environment = capture_environment();
     let relevant_environment = capture_relevant_environment();
+    let model_identity =
+        manifest::capture_artifact_identity(&args.model_path, "GEMMA4D_MODEL_REVISION");
     let mut blockers = Vec::new();
 
     if !args.model_path.exists() {
@@ -84,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut records = Vec::new();
     let mut final_metrics = FinalMetrics::default();
     if blockers.is_empty() {
-        match run_cases(&args, &selected, &run_id) {
+        match run_cases(&args, &selected, &run_id, &environment, &model_identity) {
             Ok(run) => {
                 records = run.records;
                 final_metrics = run.final_metrics;
@@ -93,7 +96,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if !blockers.is_empty() && records.is_empty() {
-        records = blocked_records(&args, &selected, &run_id, &blockers)?;
+        records = blocked_records(
+            &args,
+            &selected,
+            &run_id,
+            &blockers,
+            &environment,
+            &model_identity,
+        )?;
     }
 
     let comparison_blockers = records
@@ -120,15 +130,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let decision = if !all_blockers.is_empty() {
         "blocked_with_evidence"
     } else if token_text_matches && candidate_load_count_ok && baseline_load_count_ok {
-        "accept_candidate_for_load_amortization_evidence"
+        "accept_candidate"
     } else if token_text_matches {
-        "blocked_missing_load_count_evidence"
+        "needs_more_data"
     } else {
-        "reject_candidate_token_or_text_mismatch"
+        "reject_candidate"
     };
-    let status = if all_blockers.is_empty()
-        && decision == "accept_candidate_for_load_amortization_evidence"
-    {
+    let status = if all_blockers.is_empty() && decision == "accept_candidate" {
         "passed"
     } else if decision.starts_with("blocked") {
         "blocked"
@@ -152,6 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode: MODE.to_owned(),
         command,
         model_path: args.model_path.display().to_string(),
+        model_identity,
         workloads_path: args.workloads_path.display().to_string(),
         out_dir: args.out_dir.display().to_string(),
         repeats: args.repeats,
@@ -320,6 +329,9 @@ struct Xr11Record {
     schema_version: u32,
     goal: String,
     run_id: String,
+    git_sha: String,
+    git_status_short: String,
+    model_identity: manifest::ArtifactIdentity,
     timestamp_unix: u64,
     workload_id: String,
     family: String,
@@ -413,6 +425,7 @@ struct Summary {
     mode: String,
     command: String,
     model_path: String,
+    model_identity: manifest::ArtifactIdentity,
     workloads_path: String,
     out_dir: String,
     repeats: usize,
@@ -463,6 +476,8 @@ fn run_cases(
     args: &Args,
     workloads: &[WorkloadRecord],
     run_id: &str,
+    environment: &Environment,
+    model_identity: &manifest::ArtifactIdentity,
 ) -> Result<RunOutput, Box<dyn std::error::Error>> {
     let baseline_server = start_server(args, ServerBackend::RealHelper)?;
     let mut baseline = Vec::new();
@@ -512,6 +527,9 @@ fn run_cases(
                 schema_version: 1,
                 goal: GOAL.to_owned(),
                 run_id: run_id.to_owned(),
+                git_sha: environment.git_sha.clone(),
+                git_status_short: environment.git_status_short.clone(),
+                model_identity: model_identity.clone(),
                 timestamp_unix: unix_now(),
                 workload_id: workload.workload_id.clone(),
                 family: workload.family.clone(),
@@ -734,6 +752,8 @@ fn blocked_records(
     workloads: &[WorkloadRecord],
     run_id: &str,
     blockers: &[String],
+    environment: &Environment,
+    model_identity: &manifest::ArtifactIdentity,
 ) -> Result<Vec<Xr11Record>, Box<dyn std::error::Error>> {
     let mut records = Vec::new();
     for workload in workloads {
@@ -742,6 +762,9 @@ fn blocked_records(
             schema_version: 1,
             goal: GOAL.to_owned(),
             run_id: run_id.to_owned(),
+            git_sha: environment.git_sha.clone(),
+            git_status_short: environment.git_status_short.clone(),
+            model_identity: model_identity.clone(),
             timestamp_unix: unix_now(),
             workload_id: workload.workload_id.clone(),
             family: workload.family.clone(),
@@ -868,6 +891,30 @@ fn render_report(summary: &Summary) -> String {
     out.push_str(&format!("- Run ID: `{}`\n", summary.run_id));
     out.push_str(&format!("- Mode: `{}`\n", summary.mode));
     out.push_str(&format!("- Command: `{}`\n\n", summary.command));
+    out.push_str("## Model Identity\n\n");
+    out.push_str("| Field | Value |\n");
+    out.push_str("|---|---|\n");
+    out.push_str(&format!("| Path | `{}` |\n", summary.model_identity.path));
+    out.push_str(&format!(
+        "| Exists | `{}` |\n",
+        summary.model_identity.exists
+    ));
+    out.push_str(&format!(
+        "| Revision source | `{}` |\n",
+        summary.model_identity.revision_source
+    ));
+    out.push_str(&format!(
+        "| Config SHA-256 | `{}` |\n",
+        summary.model_identity.config_sha256
+    ));
+    out.push_str(&format!(
+        "| Tokenizer SHA-256 | `{}` |\n",
+        summary.model_identity.tokenizer_sha256
+    ));
+    out.push_str(&format!(
+        "| Safetensors inventory SHA-256 | `{}` |\n\n",
+        summary.model_identity.safetensors_inventory_sha256
+    ));
     out.push_str("## Load Residency\n\n");
     out.push_str("| Backend | Requests | Model load count | Model load seconds | Resident loaded | Worker requests |\n");
     out.push_str("|---|---:|---:|---:|---:|---:|\n");
