@@ -46,6 +46,7 @@ which code produced it, and what claims are allowed.
 | 2026-07-01 | XR09 KV compression real-quality A/B | Reject candidate | `1dabccc` | `native_kv_compression_real_quality_ab` | `benchmarks/out/XR09-kv-compression-real-quality-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr09-1782886055`; command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr09_kv_compression_real_quality_ab -- --out-dir benchmarks/out/XR09-kv-compression-real-quality-ab`; no hard blockers and BF16 exact restore passed on 6 real workloads, but q8 failed `benchmark_qa_4k_001` quality gate and q4 failed 3 families. Recommendation is `no_go_for_compression_candidate`; active compressed decode remains disabled. |
 | 2026-07-01 | XR11 persistent native/server backend A/B | Passed | `d8ae489` | `server_real_helper_vs_persistent_native_real_contexts` | `benchmarks/out/XR11-persistent-native-server-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr11-1782888158`; decision `accept_candidate`; command `GEMMA4D_EXPERIMENTAL_PERSISTENT_SERVER=1 cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- --out-dir benchmarks/out/XR11-persistent-native-server-ab --model-path artifacts/models/gemma-4-12B-it-4bit --workloads benchmarks/workloads/real-contexts/workloads.jsonl --workload-ids chat_short_1k_001 --repeats 2 --max-new-tokens 1`; workload seed `20260630`, target/actual context `1024/1024`, generated `1` token per repeat. Baseline `real_helper` loaded twice; `persistent_native` loaded once and served two worker requests. Both repeats matched token IDs/text, model identity is recorded in summary/records, and no blockers were recorded. Localhost bind required approved escalation. |
 | 2026-07-01 | XR13 novel Metal/KV exploration | Reject candidate | `4e1bc28` | `feature_gated_l1_compressed_k_score_microbenchmark` | `benchmarks/out/XR13-novel-metal-kv-exploration/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr13-1782890847`; command `cargo run -p gemma4d-bench --features xr13-prototypes --example xr13_novel_metal_kv_exploration -- --out-dir benchmarks/out/XR13-novel-metal-kv-exploration`; 18 records from 6 XR09 real-context shapes x 3 deterministic trials. XR09 q8 baseline still has 0% active reduction and failed `benchmark_qa_4k_001`; XR13 Planar4 K-only passed the isolated synthetic score gate but remains prototype-only, while Turbo score estimation failed correctness on 18/18 samples. No default runtime path, active compressed decode path, C ABI, or Metal kernel changed. |
+| 2026-07-01 | XR14 MTP policy autotune replay | Needs more data | `aed6f07` plus local XR14 replay changes | `xr04_mtp_policy_replay` | `benchmarks/out/XR14-mtp-policy-autotune/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr14-1782892549`; command `cargo run -p gemma4d-bench --example xr14_mtp_policy_autotune -- --out-dir benchmarks/out/XR14-mtp-policy-autotune`; 30 replay records from 5 XR04 workloads x 6 policies. Fixed block-size policies and the 35% acceptance threshold were rejected; net-latency-guarded replay selected `benchmark_qa_4k_001:block1` and `mtp_candidate_1k_001:block2` for a 12.778% aggregate decode-phase replay speedup, but remains `needs_more_data` because there is no holdout variance run. No runtime path changed. |
 
 ## P00 Baseline Snapshot
 
@@ -823,6 +824,58 @@ XR09 interpretation:
 - Payload reductions are storage-only: active KV memory reduction was `0.000%`
   for BF16, q8, and q4 because active compressed decode remains disabled.
 
+## XR14 MTP Policy Autotune Replay Snapshot
+
+XR14 replays the repaired XR04 MTP root summary without running the model. It
+compares baseline native non-MTP `decode_ms` against MTP `draft_ms + verify_ms`
+for fixed block-size, acceptance-threshold, net-latency-guarded, and oracle
+selection policies. Runtime code and defaults were not changed.
+
+| Field | Value |
+|---|---|
+| Command | `cargo run -p gemma4d-bench --example xr14_mtp_policy_autotune -- --out-dir benchmarks/out/XR14-mtp-policy-autotune` |
+| Evidence | `benchmarks/out/XR14-mtp-policy-autotune/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Run ID | `xr14-1782892549` |
+| Source run | `xr03-1782871680-737256000` from XR04 |
+| Source summary SHA-256 | `e17cae919519961ea25f0ce40fe5c067c0d97047553ea83ef91d98919624c9f7` |
+| Source Git SHA | `50fe4e201f7475180ac3f59041b8b6923b63b19f` plus XR04 local verifier repair |
+| Mode | `xr04_mtp_policy_replay` |
+| Records | `30`: 5 workloads x 6 policies |
+| Source max new tokens | `32` |
+| Source block sizes | `1,2` |
+| Decision | `needs_more_data` |
+| Recommendation | Run `XR14-mtp-policy-variance-ab` with the latency-guarded policy as the candidate before any runtime policy change. |
+
+Policy replay results:
+
+| Policy | Decision | MTP selections | Baseline decode ms | Selected decode ms | Speedup % | Regressions | Weighted acceptance |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `acceptance_threshold_35pct` | `reject_candidate` | 4 | 22652.026 | 37118.315 | -63.863 | 2 | 0.539 |
+| `disabled_baseline` | `baseline` | 0 | 22652.026 | 22652.026 | 0.000 | 0 | 0.000 |
+| `fixed_block_1` | `reject_candidate` | 5 | 22652.026 | 38958.194 | -71.985 | 2 | 0.481 |
+| `fixed_block_2` | `reject_candidate` | 5 | 22652.026 | 31758.881 | -40.203 | 3 | 0.405 |
+| `net_latency_guarded_5pct` | `needs_more_data` | 2 | 22652.026 | 19757.582 | 12.778 | 0 | 0.292 |
+| `oracle_fastest_exact` | `needs_more_data` | 2 | 22652.026 | 19757.582 | 12.778 | 0 | 0.292 |
+
+Latency-guarded selected workload/block pairs:
+
+| Workload | Family | Tokens | Seed | Selected block | Replay speedup |
+|---|---|---:|---:|---:|---:|
+| `benchmark_qa_4k_001` | `benchmark_qa` | 4095 | 20260633 | 1 | 26.225% |
+| `mtp_candidate_1k_001` | `mtp_candidate` | 1024 | 20260641 | 2 | 21.331% |
+
+XR14 interpretation:
+
+- Acceptance-only gating is unsafe: the 35% threshold selected
+  `mtp_candidate_4k_001:block1` with acceptance `0.781`, but that replay was
+  333.301% slower than baseline decode phase.
+- Net latency matters more than raw acceptance. The latency-guarded replay kept
+  MTP disabled on high-acceptance slow cases and selected only the two exact
+  workload/block pairs that beat baseline by at least 5%.
+- XR14 is same-run replay evidence only. It cannot justify default MTP
+  enablement until a fresh native non-MTP vs native MTP variance run passes on
+  holdout workloads.
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -858,12 +911,16 @@ XR09 interpretation:
 | 2026-07-01 | Added XR07 real-prefix RAM cache A/B harness and goal contract. The runner derives 4K/8K/16K real-context repeated-prefix cases from the XR00 corpus, applies deterministic small suffix edits, compares fresh full prefill against RAM restore plus native import and suffix replay, records hit rate, warm TTFT, restore/import/replay latency, continued decode parity, active KV bytes, cache residency, adapter namespace isolation, failed hypotheses, blockers, and default-policy decision artifacts. It does not optimize runtime code. | `codex/goals/XR07-prefix-cache-real-reuse-ab.goal.md`, `crates/gemma4d-bench/examples/xr07_prefix_cache_real_reuse_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr07_prefix_cache_real_reuse_ab`; `cargo check -p gemma4d-ffi`; `cargo test -p gemma4d-kv --lib`; XR07 smoke and full runs with escalated Metal access. |
 | 2026-07-01 | Added XR08 SSD cache policy and variance harness and goal contract. The runner measures real-context SSD prefix restore variance for BF16 and q8 payloads, records exact generated artifacts, deterministic seeds, token lengths, metadata/payload IO, warm TTFT, fresh prefill, payload checksum time, native import time, cache accounting, corruption/namespace/cache-mode rejection, mid-decode rejection, admission probes, failed hypotheses, blockers, and profile-gated decision artifacts. It does not optimize runtime code. | `codex/goals/XR08-ssd-cache-policy-variance.goal.md`, `crates/gemma4d-bench/examples/xr08_ssd_cache_policy_variance.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr08_ssd_cache_policy_variance`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --examples`; `cargo test -p gemma4d-kv --lib`; XR08 smoke and full runs with escalated Metal access. |
 | 2026-07-01 | Added XR09 KV compression real-quality A/B harness and goal contract. The runner tokenizes XR00 real workloads, writes BF16/q8/q4 payloads, restores each payload into BF16 active KV, runs deterministic continued-decode quality gates, records greedy agreement, logit delta, payload bytes, warm restore latency, active memory, generated payload paths/checksums, q4 failure analysis, failed hypotheses, blockers, and decision artifacts. It does not optimize runtime code. | `codex/goals/XR09-kv-compression-real-quality-ab.goal.md`, `crates/gemma4d-bench/examples/xr09_kv_compression_real_quality_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr09_kv_compression_real_quality_ab`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --examples`; `cargo test -p gemma4d-kv --lib`; XR09 smoke and full runs with escalated Metal access. |
+| 2026-07-01 | Added XR14 MTP policy autotune replay harness and goal contract. The runner reads the XR04 root summary, records source artifact hashes, deterministic seeds, token lengths, block sizes, fixed-block policy outcomes, acceptance-threshold failures, and net-latency-guarded replay decisions. It does not run the model, optimize runtime code, or enable MTP by default. | `codex/goals/XR14-mtp-policy-autotune.goal.md`, `crates/gemma4d-bench/examples/xr14_mtp_policy_autotune.rs`, `BENCHMARKS.md` | `cargo fmt --check`; `cargo test -p gemma4d-bench --example xr14_mtp_policy_autotune`; `cargo run -p gemma4d-bench --example xr14_mtp_policy_autotune -- --out-dir benchmarks/out/XR14-mtp-policy-autotune`. |
 
 ## Verification Gates
 
 | Date | Command | Status | Notes |
 |---|---|---|---|
 | 2026-06-30 | `cargo test -p gemma4d-server -p gemma4d-bench --all-targets` | Passed | Focused compile/test coverage for changed server and benchmark code. |
+| 2026-07-01 | `cargo fmt --check` | Passed | Formatting gate after adding the XR14 replay harness and ledger entries. |
+| 2026-07-01 | `cargo test -p gemma4d-bench --example xr14_mtp_policy_autotune` | Passed | 3 policy-unit tests passed: acceptance threshold can select a net-slow candidate, net-latency guard can select low-acceptance fast candidates, and aggregate regressions reject a policy. |
+| 2026-07-01 | `cargo run -p gemma4d-bench --example xr14_mtp_policy_autotune -- --out-dir benchmarks/out/XR14-mtp-policy-autotune` | Passed | Wrote 30 replay records and all required XR14 artifacts; decision is `needs_more_data` with no hard blockers. |
 | 2026-06-30 | `cargo run -p gemma4d-bench --example p00_performance_baseline -- --out-dir benchmarks/out/P00-performance-baseline --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Wrote P00 records, summary, report, and blocker report. |
 | 2026-06-30 | `cargo run -p gemma4d-bench --example m12_real_tiny16_matrix -- --out-dir benchmarks/out/M12/real-matrix --model-path artifacts/models/gemma-4-12B-it-4bit` | Passed | Confirms existing M12 matrix still runs after P00 JSON additions. |
 | 2026-06-30 | `cargo run -p gemma4d-bench --example p01_persistent_helper_session -- --out-dir benchmarks/out/P01-persistent-helper-session --model-path artifacts/models/gemma-4-12B-it-4bit --cold-records benchmarks/out/M12/real-matrix/records.jsonl` | Passed | Wrote warm-session records, summary, report, and blocker report. |
