@@ -40,6 +40,7 @@ which code produced it, and what claims are allowed.
 | 2026-06-30 | XR03 MTP real-context diagnosis | Blocked with evidence | `16efd5d` plus local XR03 trace changes | `native_mtp_real_context_trace` | `benchmarks/out/XR03-mtp-real-context-diagnosis/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Command `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 4`; 5 real XR00 workloads x block sizes 1/2, nonzero acceptance observed, but `benchmark_qa_4k_001` failed byte-identical exactness for both block sizes. |
 | 2026-07-01 | XR04 MTP repair and A/B evidence | Accept candidate | `50fe4e2` plus local XR04 verifier repair | `native_mtp_incremental_verify_trace` | `benchmarks/out/XR04-mtp-repair-and-autotune/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` plus `xr03-repro/` and `exactness-smoke/` subruns | Reproduced the XR03 blocker first, then repaired live MTP verify to stage against cloned incremental KV. The 32-token root run stayed byte-identical for 10/10 records with acceptance `162/370 = 0.438`; MTP remains opt-in because generation speedups are workload/block dependent. |
 | 2026-07-01 | XR05 prefill and MLX eval scheduling A/B | Reject candidate | `5b145fc` plus local candidate-wide decision-gate fix | `prefill_eval_scheduling_real_context_ab` | `benchmarks/out/XR05-prefill-and-eval-scheduling-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr05-1782873617-153379000`; command `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr05_prefill_eval_scheduling_ab -- --out-dir benchmarks/out/XR05-prefill-and-eval-scheduling-ab`; 72/72 records passed runtime with no blockers, but no candidate satisfied the candidate-wide no-correctness-regression gate. |
+| 2026-07-01 | XR06 native decode tail-latency A/B | Accept candidate | `92b0757` | `native_decode_tail_latency_real_context_ab` | `benchmarks/out/XR06-native-decode-tail-latency-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` | Run ID `xr06-1782877235-943162000`; command `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab`; 60/60 records passed with no blockers. Native decode eval scheduling remains opt-in; accepted comparisons were workload-local and several tail hypotheses failed. |
 
 ## P00 Baseline Snapshot
 
@@ -571,6 +572,75 @@ XR04 interpretation:
   per-family policy gate, restored top-k trace depth, and block-size-specific
   memory/latency guardrails.
 
+## XR06 Native Decode Tail-Latency A/B Snapshot
+
+XR06 compares native decode KV eval scheduling policies against the current
+per-layer eval behavior. The benchmark records per-token decode traces with
+input/output token IDs, position before/after `decode_one`, wall latency,
+active KV bytes, peak MLX memory, and eval-policy markers. It does not optimize
+runtime defaults.
+
+| Field | Value |
+|---|---|
+| Command | `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab` |
+| Evidence | `benchmarks/out/XR06-native-decode-tail-latency-ab/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Smoke evidence | `benchmarks/out/XR06-native-decode-tail-latency-ab-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}` |
+| Run ID | `xr06-1782877235-943162000` |
+| Git SHA | `92b0757fac8e789c98d02201a918d8b253a889ed` |
+| Mode | `native_decode_tail_latency_real_context_ab` |
+| Variants | `native_decode_eval_per_layer`, `native_decode_eval_end_of_decode`, `native_decode_eval_selective_full_attention`, `native_decode_eval_defer_to_logits` |
+| Records | `60`: 5 workloads x 4 variants x 3 trials |
+| Generated tokens per record | `64` |
+| Correctness | `60/60` records passed native-vs-native token/logit gates |
+| Memory gate | All selected workloads stayed below the 14 GB tiny16 gate; max selected peak was `12.829 GB` on `code_review_rust_8k_001` |
+| Decision | `accept_candidate` |
+| Blockers | none recorded |
+| Runtime observation | System memory pressure was observed in yellow during the run with roughly `5 GB` swap; the benchmark process completed and wrote all artifacts |
+
+Workload selection:
+
+| Workload | Family | Target tokens | Actual tokens | Workload max new tokens | Selected max new tokens | Seed |
+|---|---|---:|---:|---:|---:|---:|
+| `chat_short_1k_001` | `chat_short` | 1024 | 1024 | 128 | 64 | 20260630 |
+| `code_review_rust_4k_001` | `code_review_rust` | 4096 | 4096 | 192 | 64 | 20260631 |
+| `code_review_rust_8k_001` | `code_review_rust` | 8192 | 8192 | 256 | 64 | 20260632 |
+| `benchmark_qa_4k_001` | `benchmark_qa` | 4096 | 4095 | 192 | 64 | 20260633 |
+| `tool_json_1k_001` | `tool_json` | 1024 | 1024 | 160 | 64 | 20260635 |
+
+Baseline aggregates:
+
+| Workload | Baseline raw p50 ms | Baseline raw p95 ms | Baseline raw p99 ms | Baseline steady p50 ms | Peak MLX GB | Tail reproduced |
+|---|---:|---:|---:|---:|---:|---|
+| `chat_short_1k_001` | 82.400 | 84.598 | 510.888 | 82.418 | 7.322 | `true` |
+| `tool_json_1k_001` | 82.799 | 84.840 | 116.613 | 82.799 | 7.322 | `true` |
+| `code_review_rust_4k_001` | 84.226 | 107.560 | 259.325 | 84.238 | 9.279 | `true` |
+| `benchmark_qa_4k_001` | 84.314 | 89.092 | 620.689 | 84.214 | 9.279 | `true` |
+| `code_review_rust_8k_001` | 85.333 | 86.731 | 2161.658 | 85.327 | 12.829 | `true` |
+
+Accepted comparisons:
+
+| Workload | Candidate | Raw p50 regression % | Raw p95 improvement % | Raw p99 improvement % | Interpretation |
+|---|---|---:|---:|---:|---|
+| `tool_json_1k_001` | `native_decode_eval_end_of_decode` | -13.546 | 11.772 | 23.168 | Passed via p99 tail gate with p50 improvement. |
+| `chat_short_1k_001` | `native_decode_eval_selective_full_attention` | -12.353 | 9.772 | 19.082 | Passed via p99 tail gate with p50 improvement. |
+| `code_review_rust_4k_001` | `native_decode_eval_selective_full_attention` | -8.458 | 16.065 | -134.795 | Passed via p95 tail gate; p99 worsened and must be treated as a workload-local tradeoff. |
+
+XR06 interpretation:
+
+- The current per-layer native decode eval path reproduced raw tail spikes on
+  every selected workload while steady p50 stayed around `82-85 ms`.
+- All candidates preserved native-vs-native greedy token/logit correctness and
+  stayed below the selected-workload memory gate.
+- `native_decode_eval_selective_full_attention` is the strongest follow-up
+  candidate because it met gates on two workloads and kept p50 improved, but it
+  worsened p99 on `code_review_rust_4k_001`, `code_review_rust_8k_001`,
+  `benchmark_qa_4k_001`, and `tool_json_1k_001`.
+- `native_decode_eval_defer_to_logits` improved p50 but failed every XR06
+  p95/p99 tail gate and produced large p99 regressions on several workloads.
+- No default runtime policy should change from XR06 alone. The evidence supports
+  keeping decode eval scheduling opt-in while pursuing a stricter per-family or
+  per-position policy and adding progress logging to the long runner.
+
 ## Measurement Changes
 
 | Date | Change | Files | Verification |
@@ -602,6 +672,7 @@ XR04 interpretation:
 | 2026-06-30 | Added XR03 native MTP real-context diagnosis trace path: C ABI trace metadata on MTP verify, Rust FFI trace decoding, a real-context XR03 runner, and generated decision artifacts. The change records draft tokens, target greedy tokens, target top-k, margins, accepted counts, verify time, sequence length, shared KV shapes, position offsets, artifact hashes, token lengths, and deterministic seeds. | `native/gemma4_mlx/include/gemma4_mlx.h`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-ffi/src/lib.rs`, `crates/gemma4d-bench/examples/xr03_mtp_real_context_diagnosis.rs`, `codex/goals/XR03-mtp-real-context-diagnosis.goal.md`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo test -p gemma4d-ffi --lib --no-run`; `cargo test -p gemma4d-bench --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo test -p gemma4d-ffi --all-targets --no-run`; `GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr03_mtp_real_context_diagnosis -- --max-new-tokens 4`. |
 | 2026-07-01 | Repaired native MTP verification to stage against cloned incremental target KV instead of full-prefix verifier recompute. The live verifier now compares drafts against the cache's last-step prediction, advances accepted/fallback tokens through `decode_incremental`, swaps staged KV/hidden/tokens only after success, and records top-1 incremental trace evidence. | `native/gemma4_mlx/src/runtime.cc`, `BENCHMARKS.md` | `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --example xr03_mtp_real_context_diagnosis`; `cargo test -p gemma4d-ffi --lib`; `cargo test -p gemma4d-bench --lib`; `cargo check -p gemma4d-bench --example p05_native_mtp --example xr03_mtp_real_context_diagnosis`; XR04 pre-fix repro, exactness smoke, and root 32-token A/B runs. |
 | 2026-07-01 | Added XR05 prefill/eval scheduling A/B harness and opt-in knobs: helper `GEMMA4D_MLX_LM_PREFILL_CHUNK_TOKENS`, helper `GEMMA4D_MLX_LM_PREFILL_CLEAR_CACHE`, and native `GEMMA4D_NATIVE_PREFILL_KV_EVAL`. The runner records command, seeds, token lengths, MLX peak memory, RSS, prefill tok/s, TTFT, correctness gates, low-N status, blockers, and decision artifacts. It also enforces candidate-wide no-correctness-regression before accepting any workload-local win. | `.codex/agents/tui-ux-engineer.toml`, `codex/goals/XR05-prefill-and-eval-scheduling-ab.goal.md`, `native/gemma4_mlx/scripts/gemma4d_mlx_lm_helper.py`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-bench/examples/xr05_prefill_eval_scheduling_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-bench --example xr05_prefill_eval_scheduling_ab`; `cargo check -p gemma4d-ffi`; TOML parse for `.codex/agents/tui-ux-engineer.toml`; smoke and full XR05 runs with escalated Metal access. |
+| 2026-07-01 | Added XR06 native decode tail-latency A/B harness and opt-in native decode KV eval scheduling modes. The runner records deterministic workload seeds/token lengths, per-token latency traces, position before/after decode, active KV bytes, peak MLX memory, eval-policy markers, correctness gates, blockers, failed hypotheses, and decision artifacts. | `codex/goals/XR06-native-decode-tail-latency-ab.goal.md`, `native/gemma4_mlx/src/native_model.cc`, `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs`, `BENCHMARKS.md` | `cargo fmt --all --check`; `cargo check -p gemma4d-ffi`; `cargo check -p gemma4d-bench --example xr06_native_decode_tail_latency_ab`; smoke and full XR06 runs with escalated Metal access. |
 
 ## Verification Gates
 
@@ -676,6 +747,11 @@ XR04 interpretation:
 | 2026-07-01 | `cargo check -p gemma4d-ffi` | Passed | Focused native/FFI compile gate after helper/native scheduling knobs. |
 | 2026-07-01 | `python3 -c 'import pathlib,tomllib; data=tomllib.loads(pathlib.Path(".codex/agents/tui-ux-engineer.toml").read_text()); assert data["developer_instructions"].strip(); assert data["sandbox_mode"] == "workspace-write"; print("tui agent toml ok")'` | Passed | Confirms the `tui_ux_engineer` agent role has a parseable `developer_instructions` field and normalized schema metadata. |
 | 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr05_prefill_eval_scheduling_ab -- --out-dir benchmarks/out/XR05-prefill-and-eval-scheduling-ab` | Passed | Required escalated Metal access; wrote 72 real-context prefill records for 4K/8K/16K across helper chunk/cache and native eval variants. Derived decision is `reject_candidate` after candidate-wide correctness gating. |
+| 2026-07-01 | `cargo fmt --all --check` | Passed | Formatting gate after XR06 native decode eval scheduling and benchmark runner changes. |
+| 2026-07-01 | `cargo check -p gemma4d-ffi` | Passed | Focused native/FFI compile gate for the XR06 decode KV eval scheduling knob. |
+| 2026-07-01 | `cargo check -p gemma4d-bench --example xr06_native_decode_tail_latency_ab` | Passed | Focused compile gate for the XR06 benchmark runner. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --trials 1 --max-new-tokens 8 --clear-workload-ids --workload-id chat_short_1k_001 --variants native_decode_eval_per_layer,native_decode_eval_defer_to_logits --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab-smoke` | Passed | Required escalated Metal access; wrote smoke artifacts with 2/2 records passed and no blockers. Decision was `reject_candidate` because the smoke intentionally had fewer than three trials. |
+| 2026-07-01 | `GEMMA4D_REQUIRE_MLX=1 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR06-native-decode-tail-latency-ab` | Passed | Required escalated Metal access; wrote 60 real-context records, 3 trials, 64 generated tokens, no blockers, and decision `accept_candidate`. |
 
 ## Current Claim Boundaries
 
@@ -782,3 +858,13 @@ XR04 interpretation:
 - XR05 records the native 16K memory cliff as still present: native 16K peak MLX
   stayed around `22 GB`, above the tiny16 comfort envelope. No default runtime
   code path or policy should change from XR05 alone.
+- XR06 accepts native decode eval scheduling as an opt-in experimental candidate
+  only. It does not change the default per-layer decode eval policy.
+- XR06 tail improvements are workload-local. `end_of_decode` met the p99 gate
+  on `tool_json_1k_001`; `selective_full_attention` met the p99 gate on
+  `chat_short_1k_001` and the p95 gate on `code_review_rust_4k_001`, but it
+  worsened p99 on several other selected workloads.
+- XR06 excludes 16K/24K memory-sentinel workloads. The selected 1K/4K/8K matrix
+  stayed below 14 GB peak MLX, but system memory pressure reached yellow with
+  roughly 5 GB swap during the run. Treat tiny16 adoption as unresolved until a
+  smaller policy matrix and sentinel run pass.
