@@ -390,6 +390,28 @@ constexpr uint32_t kMtpFullAttentionSharedLayer = 47;
 constexpr uint32_t kMtpSlidingAttentionSharedLayer = 46;
 constexpr uint64_t kBf16Bytes = 2;
 
+std::optional<array> decode_block_causal_mask(
+    int query_len,
+    int key_len,
+    int first_query_position,
+    int first_key_position,
+    bool full_attention) {
+    if (query_len <= 1) {
+        return std::nullopt;
+    }
+    const array query_positions = mlx::core::expand_dims(
+        mlx::core::arange(first_query_position, first_query_position + query_len),
+        1);
+    const array key_positions = mlx::core::expand_dims(
+        mlx::core::arange(first_key_position, first_key_position + key_len),
+        0);
+    array mask = key_positions <= query_positions;
+    if (!full_attention) {
+        mask = mask && (key_positions > (query_positions - kSlidingWindowSize));
+    }
+    return mask;
+}
+
 bool target_layer_full_attention(uint32_t layer_idx) {
     return ((layer_idx + 1) % 6) == 0;
 }
@@ -795,6 +817,104 @@ array target_attention_decode_forward(
     return quantized_linear(impl, output, base + ".self_attn.o_proj");
 }
 
+array target_attention_decode_block_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    uint64_t previous_sequence_len,
+    int block_len,
+    NativeKvState::Impl::Layer* target_kv,
+    SharedKvArrays* shared_kv) {
+    if (target_kv == nullptr || !target_kv->key.has_value() || !target_kv->value.has_value()) {
+        throw std::runtime_error("native incremental block decode requires materialized per-layer KV state");
+    }
+    const bool full_attention = target_layer_full_attention(layer_idx);
+    const int head_dim = full_attention ? 512 : 256;
+    const int n_heads = 16;
+    const int n_kv_heads = full_attention ? 1 : 8;
+    const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
+
+    const auto& previous_key_shape = target_kv->key->shape();
+    if (previous_key_shape.size() < 3) {
+        throw std::runtime_error("native incremental block decode received malformed KV key shape");
+    }
+    const int previous_key_len = previous_key_shape[2];
+    const int first_key_position = full_attention
+        ? 0
+        : static_cast<int>(previous_sequence_len) - previous_key_len;
+
+    array queries = quantized_linear(impl, x, base + ".self_attn.q_proj");
+    queries = mlx::core::reshape(queries, {1, block_len, n_heads, head_dim});
+    queries = model_dtype(mlx::core::fast::rms_norm(
+        queries,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.q_norm.weight")),
+        1e-6f));
+    queries = mlx::core::transpose(queries, {0, 2, 1, 3});
+    queries = apply_rope(queries, full_attention, head_dim, static_cast<int>(previous_sequence_len));
+
+    array keys = quantized_linear(impl, x, base + ".self_attn.k_proj");
+    keys = mlx::core::reshape(keys, {1, block_len, n_kv_heads, head_dim});
+    array values = keys;
+    if (!full_attention) {
+        values = quantized_linear(impl, x, base + ".self_attn.v_proj");
+        values = mlx::core::reshape(values, {1, block_len, n_kv_heads, head_dim});
+    }
+    keys = model_dtype(mlx::core::fast::rms_norm(
+        keys,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.k_norm.weight")),
+        1e-6f));
+    keys = mlx::core::transpose(keys, {0, 2, 1, 3});
+    keys = apply_rope(keys, full_attention, head_dim, static_cast<int>(previous_sequence_len));
+    values = model_dtype(mlx::core::fast::rms_norm(values, std::nullopt, 1e-6f));
+    values = mlx::core::transpose(values, {0, 2, 1, 3});
+
+    // Attend over the unsliced cache plus new block keys; slice only the stored
+    // KV below so earlier queries in the block keep their valid sliding window.
+    array attention_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
+    array attention_values = mlx::core::concatenate({*target_kv->value, values}, 2);
+    array stored_keys = attention_keys;
+    array stored_values = attention_values;
+    const auto& attention_key_shape = attention_keys.shape();
+    if (attention_key_shape.size() < 3) {
+        throw std::runtime_error("native incremental block decode produced malformed KV key shape");
+    }
+    const int attention_key_len = attention_key_shape[2];
+    if (!full_attention && attention_key_len > kSlidingWindowSize) {
+        stored_keys = mlx::core::slice(
+            attention_keys,
+            {0, 0, attention_key_len - kSlidingWindowSize, 0},
+            {1, n_kv_heads, attention_key_len, head_dim});
+        stored_values = mlx::core::slice(
+            attention_values,
+            {0, 0, attention_key_len - kSlidingWindowSize, 0},
+            {1, n_kv_heads, attention_key_len, head_dim});
+    }
+    target_kv->full_attention = full_attention;
+    target_kv->key = stored_keys;
+    target_kv->value = stored_values;
+    if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
+        mlx::core::eval({*target_kv->key, *target_kv->value});
+    }
+    capture_shared_kv(shared_kv, layer_idx, full_attention, *target_kv->key, *target_kv->value);
+
+    const std::optional<array> mask = decode_block_causal_mask(
+        block_len,
+        attention_key_len,
+        static_cast<int>(previous_sequence_len),
+        first_key_position,
+        full_attention);
+    array output = mlx::core::fast::scaled_dot_product_attention(
+        queries,
+        attention_keys,
+        attention_values,
+        1.0f,
+        "",
+        mask);
+    output = mlx::core::transpose(output, {0, 2, 1, 3});
+    output = mlx::core::reshape(output, {1, block_len, n_heads * head_dim});
+    return quantized_linear(impl, output, base + ".self_attn.o_proj");
+}
+
 array target_layer_decode_forward(
     const NativeTextModel::Impl& impl,
     const array& x,
@@ -810,6 +930,52 @@ array target_layer_decode_forward(
         std::optional<array>(tensor_or_throw(impl, base + ".input_layernorm.weight")),
         1e-6f));
     h = target_attention_decode_forward(impl, h, layer_idx, previous_sequence_len, target_kv, shared_kv);
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(residual + h);
+
+    const array mlp_residual = h;
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".pre_feedforward_layernorm.weight")),
+        1e-6f));
+    array gate = quantized_linear(impl, h, base + ".mlp.gate_proj");
+    array up = quantized_linear(impl, h, base + ".mlp.up_proj");
+    h = model_dtype(geglu(gate, up));
+    h = quantized_linear(impl, h, base + ".mlp.down_proj");
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_feedforward_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(mlp_residual + h);
+    return model_dtype(h * tensor_or_throw(impl, base + ".layer_scalar"));
+}
+
+array target_layer_decode_block_forward(
+    const NativeTextModel::Impl& impl,
+    const array& x,
+    uint32_t layer_idx,
+    uint64_t previous_sequence_len,
+    int block_len,
+    NativeKvState::Impl::Layer* target_kv,
+    SharedKvArrays* shared_kv) {
+    const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
+    const array residual = x;
+
+    array h = model_dtype(mlx::core::fast::rms_norm(
+        x,
+        std::optional<array>(tensor_or_throw(impl, base + ".input_layernorm.weight")),
+        1e-6f));
+    h = target_attention_decode_block_forward(
+        impl,
+        h,
+        layer_idx,
+        previous_sequence_len,
+        block_len,
+        target_kv,
+        shared_kv);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
@@ -1249,6 +1415,54 @@ NativeForwardArrays decode_last_logits(
     target_kv->sequence_len = previous_sequence_len + 1;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
     return NativeForwardArrays{std::move(logits), std::move(h), std::move(shared_kv)};
+}
+
+NativeForwardArrays decode_block_logits(
+    const NativeTextModel::Impl& impl,
+    const int32_t* tokens,
+    size_t token_count,
+    NativeKvState::Impl* target_kv) {
+    if (target_kv == nullptr || target_kv->sequence_len == 0 || target_kv->layers.size() != kTargetLayerCount) {
+        throw std::runtime_error("native incremental block decode requires a populated target KV cache");
+    }
+    if (tokens == nullptr || token_count == 0) {
+        throw std::runtime_error("native incremental block decode requires at least one token");
+    }
+    if (token_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native incremental block decode token count exceeds MLX shape limits");
+    }
+    if (target_kv->sequence_len + token_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native incremental block decode position exceeds MLX shape limits");
+    }
+
+    const uint64_t previous_sequence_len = target_kv->sequence_len;
+    const int block_len = static_cast<int>(token_count);
+    std::vector<int32_t> ids(tokens, tokens + token_count);
+    array token_ids(ids.begin(), {1, block_len}, mlx::core::int32);
+    array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
+    SharedKvArrays shared_kv;
+
+    for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
+        h = target_layer_decode_block_forward(
+            impl,
+            h,
+            layer,
+            previous_sequence_len,
+            block_len,
+            &target_kv->layers[layer],
+            &shared_kv);
+    }
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
+        1e-6f));
+    array logits = target_logits_for_hidden(impl, h);
+    const int stop = static_cast<int>(token_count);
+    array last_hidden = mlx::core::slice(h, {0, stop - 1, 0}, {1, stop, 3840});
+    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    target_kv->sequence_len = previous_sequence_len + token_count;
+    target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
+    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(shared_kv)};
 }
 
 NativeVerifyArrays forward_verify_logits(
@@ -2791,6 +3005,101 @@ bool NativeTextModel::decode_incremental(
         return false;
     } catch (...) {
         *error = "native Gemma 4 incremental decode failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+bool NativeTextModel::decode_incremental_block(
+    const int32_t* tokens,
+    size_t token_count,
+    NativeKvState* kv_state,
+    Gemma4StepResult* out,
+    std::vector<int32_t>* greedy_tokens,
+    std::vector<float>* greedy_logits,
+    std::string* error,
+    std::unique_ptr<NativeHiddenState>* last_hidden) const {
+    if (out == nullptr || greedy_tokens == nullptr || greedy_logits == nullptr || error == nullptr || kv_state == nullptr) {
+        return false;
+    }
+    *out = Gemma4StepResult{};
+    greedy_tokens->clear();
+    greedy_logits->clear();
+    error->clear();
+    if (last_hidden != nullptr) {
+        last_hidden->reset();
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)tokens;
+    (void)token_count;
+    *error = "native Gemma 4 graph was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->language_tensor_count == 0) {
+            *error = "native Gemma 4 model state is not loaded";
+            return false;
+        }
+        if (tokens == nullptr || token_count == 0) {
+            *error = "native incremental block decode requires at least one token";
+            return false;
+        }
+        if (token_count > 2) {
+            *error = "native incremental block decode currently supports token_count <= 2";
+            return false;
+        }
+        if (kv_state->impl_ == nullptr || kv_state->sequence_len() == 0) {
+            *error = "native incremental block decode requires a prior native prefill";
+            return false;
+        }
+
+        mlx::core::reset_peak_memory();
+        NativeForwardArrays forward = decode_block_logits(*impl_, tokens, token_count, kv_state->impl_.get());
+        array logits = std::move(forward.logits);
+        array greedy = mlx::core::argmax(logits, -1);
+        array max_logits = to_float32(mlx::core::max(logits, -1));
+        mlx::core::eval({greedy, max_logits, forward.last_hidden});
+
+        const int* token_data = greedy.data<int>();
+        const float* logit_data = max_logits.data<float>();
+        greedy_tokens->reserve(token_count);
+        greedy_logits->reserve(token_count);
+        for (size_t index = 0; index < token_count; ++index) {
+            greedy_tokens->push_back(token_data[index]);
+            greedy_logits->push_back(logit_data[index]);
+        }
+
+        std::unique_ptr<NativeHiddenState> hidden;
+        if (last_hidden != nullptr) {
+            std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
+                std::move(forward.last_hidden),
+                std::move(forward.shared_kv.full_attention_key),
+                std::move(forward.shared_kv.full_attention_value),
+                std::move(forward.shared_kv.sliding_attention_key),
+                std::move(forward.shared_kv.sliding_attention_value),
+                kv_state->sequence_len(),
+                kHiddenSize,
+            });
+            hidden.reset(new NativeHiddenState(std::move(hidden_impl)));
+        }
+
+        out->greedy_token = greedy_tokens->empty() ? 0 : greedy_tokens->back();
+        out->greedy_logit = greedy_logits->empty() ? 0.0f : greedy_logits->back();
+        out->sequence_len = kv_state->sequence_len();
+        out->active_kv_bytes = kv_state->active_bytes();
+        out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
+        out->peak_rss_mb = 0.0f;
+        out->native_last_hidden = hidden.get();
+        if (last_hidden != nullptr) {
+            *last_hidden = std::move(hidden);
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("native Gemma 4 incremental block decode failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native Gemma 4 incremental block decode failed with an unknown exception";
         return false;
     }
 #endif

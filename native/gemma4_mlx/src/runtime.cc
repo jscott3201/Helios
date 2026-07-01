@@ -1477,6 +1477,80 @@ Gemma4Status gemma4_verify_tokens(
         }
 
         std::string native_error;
+        // Experimental XR16 prototype: commit a batched block only when all
+        // draft tokens are accepted; otherwise fall back to exact sequential
+        // rollback without changing the default verifier.
+        if (env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BATCH_VERIFY") && draft_count == 2 &&
+            draft_tokens[0] == cache->last_step.greedy_token) {
+            std::unique_ptr<gemma4d::NativeKvState> block_kv = cache->native_kv_state->clone();
+            if (block_kv == nullptr) {
+                return fail(GEMMA4_ERR_RUNTIME, "native MTP batch verify failed to clone target KV state");
+            }
+
+            Gemma4StepResult block_step{};
+            std::vector<int32_t> block_greedy_tokens;
+            std::vector<float> block_greedy_logits;
+            std::unique_ptr<gemma4d::NativeHiddenState> block_hidden;
+            if (!target->native_model->decode_incremental_block(
+                    draft_tokens,
+                    draft_count,
+                    block_kv.get(),
+                    &block_step,
+                    &block_greedy_tokens,
+                    &block_greedy_logits,
+                    &native_error,
+                    &block_hidden)) {
+                return fail(GEMMA4_ERR_RUNTIME, native_error);
+            }
+            if (block_greedy_tokens.size() < draft_count || block_greedy_logits.size() < draft_count) {
+                return fail(GEMMA4_ERR_RUNTIME, "native MTP batch verify returned incomplete target logits");
+            }
+
+            const bool full_block_accepted = draft_tokens[1] == block_greedy_tokens[0];
+            if (full_block_accepted) {
+                const uint64_t context_sequence_len = cache->native_tokens.size();
+                Gemma4MtpTraceInfo trace{};
+                initialize_mtp_trace(&trace, context_sequence_len);
+
+                record_mtp_target_step(&trace, 0, context_sequence_len, cache->last_step);
+                record_mtp_draft_score(&trace, 0, draft_tokens[0], cache->last_step);
+
+                Gemma4StepResult second_target_step{};
+                second_target_step.greedy_token = block_greedy_tokens[0];
+                second_target_step.greedy_logit = block_greedy_logits[0];
+                second_target_step.sequence_len = context_sequence_len + 1;
+                second_target_step.active_kv_bytes = block_kv->active_bytes();
+                record_mtp_target_step(&trace, 1, context_sequence_len, second_target_step);
+                record_mtp_draft_score(&trace, 1, draft_tokens[1], second_target_step);
+
+                Gemma4StepResult lookahead_step = block_step;
+                lookahead_step.greedy_token = block_greedy_tokens[1];
+                lookahead_step.greedy_logit = block_greedy_logits[1];
+                record_mtp_target_step(&trace, 2, context_sequence_len, lookahead_step);
+                record_mtp_hidden_shape(&trace, block_hidden.get());
+
+                block_step.greedy_token = block_greedy_tokens[1];
+                block_step.greedy_logit = block_greedy_logits[1];
+                block_step.peak_memory_gb = std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
+                block_step.accepted_draft_count = 2;
+                block_step.committed_count = 2;
+                block_step.committed_tokens[0] = draft_tokens[0];
+                block_step.committed_tokens[1] = draft_tokens[1];
+                block_step.mtp_trace = trace;
+
+                cache->native_tokens.push_back(draft_tokens[0]);
+                cache->native_tokens.push_back(draft_tokens[1]);
+                cache->native_kv_state = std::move(block_kv);
+                cache->last_hidden = std::move(block_hidden);
+                block_step.native_last_hidden = cache->last_hidden.get();
+                *out = block_step;
+                out->native_last_hidden = cache->last_hidden.get();
+                remember_last_step(cache, out);
+                target->sequence_len = out->sequence_len;
+                return ok();
+            }
+        }
+
         std::unique_ptr<gemma4d::NativeKvState> staged_kv = cache->native_kv_state->clone();
         if (staged_kv == nullptr) {
             return fail(GEMMA4_ERR_RUNTIME, "native MTP verify failed to clone target KV state");

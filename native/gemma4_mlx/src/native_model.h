@@ -164,6 +164,16 @@ public:
         std::string* error,
         std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
 
+    bool decode_incremental_block(
+        const int32_t* tokens,
+        size_t token_count,
+        NativeKvState* kv_state,
+        Gemma4StepResult* out,
+        std::vector<int32_t>* greedy_tokens,
+        std::vector<float>* greedy_logits,
+        std::string* error,
+        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+
     bool verify_draft_block(
         const std::vector<int32_t>& context_tokens,
         const int32_t* draft_tokens,
