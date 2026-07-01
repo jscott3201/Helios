@@ -9,14 +9,16 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{GenerateOptions, GenerateSummary, detokenize_tokens, generate};
+use crate::{GenerateOptions, GenerateSummary, ResidentTarget, detokenize_tokens, generate};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+pub const PERSISTENT_NATIVE_GATE_ENV: &str = "GEMMA4D_EXPERIMENTAL_PERSISTENT_SERVER";
 const SERVER_NAME: &str = "gemma4d";
 
 pub type HttpResult<T> = std::result::Result<T, HttpError>;
@@ -69,6 +71,7 @@ pub struct ServerConfig {
 pub enum ServerBackend {
     Stub,
     RealHelper,
+    PersistentNative,
 }
 
 impl ServerBackend {
@@ -76,6 +79,15 @@ impl ServerBackend {
         match self {
             Self::Stub => "stub",
             Self::RealHelper => "real_helper",
+            Self::PersistentNative => "persistent_native",
+        }
+    }
+
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Self::Stub => "stub",
+            Self::RealHelper => "real-helper",
+            Self::PersistentNative => "persistent-native",
         }
     }
 }
@@ -155,6 +167,9 @@ pub struct ServerMetrics {
     pub memory_peak_mlx_bytes: u64,
     pub memory_guard_rejections_total: u64,
     pub model_load_seconds: f64,
+    pub model_load_count: u64,
+    pub resident_model_loaded: u64,
+    pub persistent_worker_requests_total: u64,
     pub prefill_tokens_total: u64,
     pub decode_tokens_total: u64,
     pub prefill_seconds: f64,
@@ -166,22 +181,148 @@ pub struct ServerMetrics {
     pub adapter_requests_total: BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PersistentNativeState {
+    status: String,
+    model_loaded: bool,
+    model_load_count: u64,
+    model_load_seconds: f64,
+    requests_total: u64,
+    errors_total: u64,
+    last_error: Option<String>,
+}
+
+impl PersistentNativeState {
+    fn loading() -> Self {
+        Self {
+            status: "loading".to_owned(),
+            model_loaded: false,
+            model_load_count: 0,
+            model_load_seconds: 0.0,
+            requests_total: 0,
+            errors_total: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PersistentNativeBackend {
+    sender: mpsc::Sender<PersistentNativeRequest>,
+    state: Arc<Mutex<PersistentNativeState>>,
+}
+
+struct PersistentNativeRequest {
+    prompt: String,
+    max_new_tokens: usize,
+    reply: mpsc::Sender<Result<GenerateSummary, String>>,
+}
+
+impl PersistentNativeBackend {
+    fn start(model_path: PathBuf, max_context_tokens: NonZeroU32) -> Self {
+        let (sender, receiver) = mpsc::channel::<PersistentNativeRequest>();
+        let state = Arc::new(Mutex::new(PersistentNativeState::loading()));
+        let worker_state = Arc::clone(&state);
+        thread::spawn(move || {
+            let resident = match ResidentTarget::load(model_path, max_context_tokens) {
+                Ok(resident) => {
+                    let mut state = worker_state.lock().expect("persistent state lock");
+                    state.status = "ready".to_owned();
+                    state.model_loaded = true;
+                    state.model_load_count = 1;
+                    state.model_load_seconds = resident.model_load().as_secs_f64();
+                    state.last_error = None;
+                    Some(resident)
+                }
+                Err(error) => {
+                    let mut state = worker_state.lock().expect("persistent state lock");
+                    state.status = "error".to_owned();
+                    state.model_loaded = false;
+                    state.errors_total = state.errors_total.saturating_add(1);
+                    state.last_error = Some(error.to_string());
+                    None
+                }
+            };
+
+            while let Ok(request) = receiver.recv() {
+                {
+                    let mut state = worker_state.lock().expect("persistent state lock");
+                    state.requests_total = state.requests_total.saturating_add(1);
+                }
+                let result = match resident.as_ref() {
+                    Some(resident) => resident
+                        .generate_prompt(&request.prompt, request.max_new_tokens)
+                        .map_err(|error| error.to_string()),
+                    None => {
+                        let state = worker_state.lock().expect("persistent state lock");
+                        Err(state.last_error.clone().unwrap_or_else(|| {
+                            "persistent-native target failed to load".to_owned()
+                        }))
+                    }
+                };
+                if let Err(error) = result.as_ref() {
+                    let mut state = worker_state.lock().expect("persistent state lock");
+                    state.status = "error".to_owned();
+                    state.errors_total = state.errors_total.saturating_add(1);
+                    state.last_error = Some(error.clone());
+                } else {
+                    let mut state = worker_state.lock().expect("persistent state lock");
+                    state.status = "ready".to_owned();
+                    state.last_error = None;
+                }
+                let _ = request.reply.send(result);
+            }
+        });
+        Self { sender, state }
+    }
+
+    fn generate(&self, prompt: String, max_new_tokens: usize) -> Result<GenerateSummary, String> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(PersistentNativeRequest {
+                prompt,
+                max_new_tokens,
+                reply,
+            })
+            .map_err(|error| format!("persistent-native worker is unavailable: {error}"))?;
+        receiver
+            .recv()
+            .map_err(|error| format!("persistent-native worker did not reply: {error}"))?
+    }
+
+    fn snapshot(&self) -> PersistentNativeState {
+        self.state.lock().expect("persistent state lock").clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerRuntime {
     config: ServerConfig,
     metrics: Arc<Mutex<ServerMetrics>>,
     adapters: Arc<Mutex<Vec<ServerAdapter>>>,
     active_generation: Arc<AtomicBool>,
+    persistent_backend: Option<PersistentNativeBackend>,
 }
 
 impl ServerRuntime {
     pub fn new(config: ServerConfig) -> Self {
         let adapters = config.adapters.clone();
+        let persistent_backend = match (
+            config.backend,
+            config.model_path.clone(),
+            usize_to_nonzero_u32(config.max_context_tokens),
+        ) {
+            (ServerBackend::PersistentNative, Some(model_path), Some(max_context_tokens)) => Some(
+                PersistentNativeBackend::start(model_path, max_context_tokens),
+            ),
+            _ => None,
+        };
         let runtime = Self {
             config,
             metrics: Arc::new(Mutex::new(ServerMetrics::default())),
             adapters: Arc::new(Mutex::new(adapters)),
             active_generation: Arc::new(AtomicBool::new(false)),
+            persistent_backend,
         };
         runtime.refresh_adapter_metrics();
         runtime
@@ -192,7 +333,15 @@ impl ServerRuntime {
     }
 
     pub fn metrics_snapshot(&self) -> ServerMetrics {
-        self.metrics.lock().expect("metrics lock").clone()
+        let mut metrics = self.metrics.lock().expect("metrics lock").clone();
+        if let Some(persistent_backend) = self.persistent_backend.as_ref() {
+            let state = persistent_backend.snapshot();
+            metrics.model_load_seconds = state.model_load_seconds;
+            metrics.model_load_count = state.model_load_count;
+            metrics.resident_model_loaded = if state.model_loaded { 1 } else { 0 };
+            metrics.persistent_worker_requests_total = state.requests_total;
+        }
+        metrics
     }
 
     pub fn handle_request(&self, method: &str, path: &str, body: &[u8]) -> HttpResponse {
@@ -231,6 +380,7 @@ impl ServerRuntime {
                 "model_path": self.config.model_path.as_ref().map(|path| path.display().to_string()),
                 "max_context_tokens": self.config.max_context_tokens,
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
+                "persistent_native_gate_env": PERSISTENT_NATIVE_GATE_ENV,
             })),
             ("POST", "/v1/config/validate") => self.json_ok(json!({
                 "status": "valid",
@@ -284,6 +434,9 @@ impl ServerRuntime {
         match self.config.backend {
             ServerBackend::Stub => self.stub_chat_completions_response(request, admitted),
             ServerBackend::RealHelper => self.real_chat_completions_response(request, admitted),
+            ServerBackend::PersistentNative => {
+                self.persistent_native_chat_completions_response(request, admitted)
+            }
         }
     }
 
@@ -381,7 +534,87 @@ impl ServerRuntime {
         };
         let completion_id = format!("chatcmpl-gemma4d-real-{}", now_unix_seconds());
         let created = now_unix_seconds();
-        self.record_real_generation(&summary, admitted.adapter_id.as_deref());
+        self.record_generation(&summary, admitted.adapter_id.as_deref(), true);
+
+        if request.stream.unwrap_or(false) {
+            self.increment_streaming();
+            HttpResponse::ok(
+                "text/event-stream",
+                streaming_chat_body(&completion_id, created, &request.model, &response_text),
+            )
+        } else {
+            self.increment_chat();
+            let prompt_tokens = summary.input_tokens;
+            let completion_tokens = summary.generated_tokens.len();
+            self.json_ok(json!({
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text,
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+                "system_fingerprint": admitted.adapter_id.unwrap_or_else(|| "base".to_owned()),
+                "gemma4d_metrics": real_generation_metrics_json(&summary),
+            }))
+        }
+    }
+
+    fn persistent_native_chat_completions_response(
+        &self,
+        request: ChatCompletionRequest,
+        admitted: AdmittedRequest,
+    ) -> HttpResponse {
+        let Some(model_path) = self.config.model_path.clone() else {
+            return self.error_response(
+                500,
+                "native_backend_error",
+                "persistent-native backend requires a configured model path",
+            );
+        };
+        let Some(backend) = self.persistent_backend.as_ref() else {
+            return self.error_response(
+                500,
+                "native_backend_error",
+                "persistent-native backend is unavailable",
+            );
+        };
+        let max_new_tokens = request.max_tokens.unwrap_or(16);
+        let prompt = render_chat_prompt(&request.messages);
+        let summary = match backend.generate(prompt, max_new_tokens) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return self.error_response(
+                    500,
+                    "native_backend_error",
+                    format!("persistent-native generation failed: {error}"),
+                );
+            }
+        };
+        let response_text = match detokenize_tokens(&model_path, &summary.generated_tokens) {
+            Ok(text) if !text.is_empty() => text,
+            Ok(_) => generated_tokens_text(&summary.generated_tokens),
+            Err(error) => {
+                return self.error_response(
+                    500,
+                    "native_backend_error",
+                    format!("persistent-native detokenize failed: {error}"),
+                );
+            }
+        };
+        let completion_id = format!("chatcmpl-gemma4d-persistent-{}", now_unix_seconds());
+        let created = now_unix_seconds();
+        self.record_generation(&summary, admitted.adapter_id.as_deref(), false);
 
         if request.stream.unwrap_or(false) {
             self.increment_streaming();
@@ -477,11 +710,14 @@ impl ServerRuntime {
             .filter(|adapter| !adapter.is_empty() && *adapter != "none")
             .map(str::to_owned);
         if let Some(adapter_id) = adapter_id.as_deref() {
-            if self.config.backend == ServerBackend::RealHelper {
+            if matches!(
+                self.config.backend,
+                ServerBackend::RealHelper | ServerBackend::PersistentNative
+            ) {
                 return Err(ApiError::new(
                     400,
                     "unsupported_model_config",
-                    "real-helper backend does not apply adapters in P02",
+                    "real server backends do not apply adapters in this mode",
                 ));
             }
             let adapters = self.adapters.lock().expect("adapters lock");
@@ -556,13 +792,19 @@ impl ServerRuntime {
     fn runtime_snapshot_response(&self) -> HttpResponse {
         let metrics = self.metrics_snapshot();
         let adapters = self.adapters.lock().expect("adapters lock").clone();
+        let persistent_backend = self
+            .persistent_backend
+            .as_ref()
+            .map(PersistentNativeBackend::snapshot);
         self.json_ok(json!({
             "health": {
                 "status": "ok",
-                "model_loaded": true,
+                "backend": self.config.backend.as_str(),
+                "model_loaded": self.backend_model_available(),
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
             },
             "metrics": metrics,
+            "persistent_backend": persistent_backend,
             "adapters": adapters,
             "cache": cache_summary_json(),
             "benchmark": {
@@ -624,6 +866,18 @@ impl ServerRuntime {
         lines.push(format!(
             "gemma4d_model_load_seconds {:.6}",
             metrics.model_load_seconds
+        ));
+        lines.push(format!(
+            "gemma4d_model_load_count {}",
+            metrics.model_load_count
+        ));
+        lines.push(format!(
+            "gemma4d_resident_model_loaded {}",
+            metrics.resident_model_loaded
+        ));
+        lines.push(format!(
+            "gemma4d_persistent_worker_requests_total {}",
+            metrics.persistent_worker_requests_total
         ));
         lines.push(format!(
             "gemma4d_prefill_tokens_total {}",
@@ -742,7 +996,12 @@ impl ServerRuntime {
         }
     }
 
-    fn record_real_generation(&self, summary: &GenerateSummary, adapter_id: Option<&str>) {
+    fn record_generation(
+        &self,
+        summary: &GenerateSummary,
+        adapter_id: Option<&str>,
+        count_model_load: bool,
+    ) {
         let mut metrics = self.metrics.lock().expect("metrics lock");
         let prompt_tokens = summary.input_tokens as u64;
         let completion_tokens = summary.generated_tokens.len() as u64;
@@ -750,7 +1009,10 @@ impl ServerRuntime {
         metrics.decode_tokens_total = metrics
             .decode_tokens_total
             .saturating_add(completion_tokens);
-        metrics.model_load_seconds += summary.model_load.as_secs_f64();
+        if count_model_load {
+            metrics.model_load_seconds += summary.model_load.as_secs_f64();
+            metrics.model_load_count = metrics.model_load_count.saturating_add(1);
+        }
         metrics.prefill_seconds += summary.prefill.as_secs_f64();
         metrics.decode_seconds += summary.decode.as_secs_f64();
         metrics.ttft_seconds += summary.ttft.as_secs_f64();
@@ -790,6 +1052,10 @@ impl ServerRuntime {
                 .model_path
                 .as_ref()
                 .is_some_and(|path| path.exists()),
+            ServerBackend::PersistentNative => self
+                .persistent_backend
+                .as_ref()
+                .is_some_and(|backend| backend.snapshot().model_loaded),
         }
     }
 }
@@ -1145,6 +1411,7 @@ fn real_generation_metrics_json(summary: &GenerateSummary) -> serde_json::Value 
     json!({
         "input_tokens": summary.input_tokens,
         "generated_tokens": summary.generated_tokens.len(),
+        "generated_token_ids": summary.generated_tokens.clone(),
         "model_load_ms": duration_ms(summary.model_load),
         "prefill_ms": duration_ms(summary.prefill),
         "ttft_ms": duration_ms(summary.ttft),
@@ -1347,6 +1614,9 @@ mod tests {
             "gemma4d_active_generations",
             "gemma4d_errors_total",
             "gemma4d_model_load_seconds",
+            "gemma4d_model_load_count",
+            "gemma4d_resident_model_loaded",
+            "gemma4d_persistent_worker_requests_total",
             "gemma4d_prefill_tokens_total",
             "gemma4d_decode_tokens_total",
             "gemma4d_memory_peak_mlx_bytes",
@@ -1392,6 +1662,24 @@ mod tests {
     fn real_helper_requires_configured_model_path() {
         let config = ServerConfig {
             backend: ServerBackend::RealHelper,
+            model_path: None,
+            ..ServerConfig::default()
+        };
+        let response = ServerRuntime::new(config).handle_request(
+            "POST",
+            "/v1/chat/completions",
+            chat_body(false, None).as_bytes(),
+        );
+
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("native_backend_error"));
+        assert!(response.body.contains("model path"));
+    }
+
+    #[test]
+    fn persistent_native_requires_configured_model_path() {
+        let config = ServerConfig {
+            backend: ServerBackend::PersistentNative,
             model_path: None,
             ..ServerConfig::default()
         };

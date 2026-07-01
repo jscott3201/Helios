@@ -3,6 +3,7 @@
 pub mod http;
 
 use std::{
+    env,
     io::Write,
     num::NonZeroU32,
     path::PathBuf,
@@ -14,7 +15,9 @@ use gemma4d_adapters::{
     AdapterCompatibility, AdapterRegistry, AdapterSummary, ImportedAdapter, TrustedPathPolicy,
 };
 use gemma4d_ffi::{self as ffi, KvCache, KvPolicy, LoadConfig, Target};
-use http::{ServerBackend, ServerConfig, parse_bind_addr, serve_blocking};
+use http::{
+    PERSISTENT_NATIVE_GATE_ENV, ServerBackend, ServerConfig, parse_bind_addr, serve_blocking,
+};
 
 pub const CRATE_NAME: &str = "gemma4d-server";
 
@@ -46,6 +49,54 @@ pub struct GenerateSummary {
     pub peak_memory_gb: f32,
     pub peak_rss_mb: f32,
     pub active_kv_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct ResidentTarget {
+    model_path: PathBuf,
+    target: Target,
+    model_load: Duration,
+}
+
+impl ResidentTarget {
+    pub fn load(model_path: PathBuf, max_context_tokens: NonZeroU32) -> Result<Self, CliError> {
+        let load_config = LoadConfig {
+            model_path: model_path.display().to_string(),
+            model_id: Some("mlx-community/gemma-4-12B-it-4bit".to_owned()),
+            model_revision: None,
+            expected_architecture: Some("gemma4".to_owned()),
+            max_context_tokens,
+            allow_unsupported_config: false,
+        };
+        let model_load_started = Instant::now();
+        let target = Target::load(&load_config)
+            .map_err(|error| CliError::Runtime(format!("failed to load target model: {error}")))?;
+        Ok(Self {
+            model_path,
+            target,
+            model_load: model_load_started.elapsed(),
+        })
+    }
+
+    pub fn model_load(&self) -> Duration {
+        self.model_load
+    }
+
+    pub fn generate_prompt(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<GenerateSummary, CliError> {
+        let total_started = Instant::now();
+        let token_ids = tokenize_prompt(&self.model_path, prompt)?;
+        generate_with_target(
+            total_started,
+            &self.target,
+            token_ids,
+            max_new_tokens,
+            Duration::ZERO,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +243,9 @@ where
             "--real-helper" => {
                 backend = ServerBackend::RealHelper;
             }
+            "--persistent-native" => {
+                backend = ServerBackend::PersistentNative;
+            }
             "--model-path" => {
                 model_path = Some(PathBuf::from(required_value(&mut args, "--model-path")?));
             }
@@ -226,15 +280,24 @@ where
     match backend {
         ServerBackend::Stub if model_path.is_some() => {
             return Err(CliError::Usage(
-                "--model-path requires --backend real-helper".to_owned(),
+                "--model-path requires --backend real-helper or persistent-native".to_owned(),
             ));
         }
-        ServerBackend::RealHelper if model_path.is_none() => {
-            return Err(CliError::Usage(
-                "serve --backend real-helper requires --model-path".to_owned(),
-            ));
+        ServerBackend::RealHelper | ServerBackend::PersistentNative if model_path.is_none() => {
+            return Err(CliError::Usage(format!(
+                "serve --backend {} requires --model-path",
+                backend.cli_name()
+            )));
         }
         _ => {}
+    }
+
+    if backend == ServerBackend::PersistentNative
+        && env::var(PERSISTENT_NATIVE_GATE_ENV).ok().as_deref() != Some("1")
+    {
+        return Err(CliError::Usage(format!(
+            "serve --backend persistent-native requires {PERSISTENT_NATIVE_GATE_ENV}=1"
+        )));
     }
 
     Ok(ServeOptions {
@@ -566,24 +629,29 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
         options.token_ids.clone()
     };
 
-    let load_config = LoadConfig {
-        model_path: options.model_path.display().to_string(),
-        model_id: Some("mlx-community/gemma-4-12B-it-4bit".to_owned()),
-        model_revision: None,
-        expected_architecture: Some("gemma4".to_owned()),
-        max_context_tokens: options.max_context_tokens,
-        allow_unsupported_config: false,
-    };
+    let resident = ResidentTarget::load(options.model_path, options.max_context_tokens)?;
+    let model_load = resident.model_load();
 
-    let model_load_started = Instant::now();
-    let target = Target::load(&load_config)
-        .map_err(|error| CliError::Runtime(format!("failed to load target model: {error}")))?;
-    let model_load = model_load_started.elapsed();
+    generate_with_target(
+        total_started,
+        &resident.target,
+        token_ids,
+        options.max_new_tokens,
+        model_load,
+    )
+}
 
+fn generate_with_target(
+    total_started: Instant,
+    target: &Target,
+    token_ids: Vec<i32>,
+    max_new_tokens: usize,
+    model_load: Duration,
+) -> Result<GenerateSummary, CliError> {
     let mut cache = KvCache::create(&KvPolicy::default())
         .map_err(|error| CliError::Runtime(format!("failed to create KV cache: {error}")))?;
     let prefill_started = Instant::now();
-    let mut step = ffi::prefill(&target, &mut cache, &token_ids)
+    let mut step = ffi::prefill(target, &mut cache, &token_ids)
         .map_err(|error| CliError::Runtime(format!("prefill failed: {error}")))?;
     let prefill = prefill_started.elapsed();
     let ttft = prefill;
@@ -591,16 +659,16 @@ pub fn generate(options: GenerateOptions) -> Result<GenerateSummary, CliError> {
     let mut peak_rss_mb = step.peak_rss_mb;
     let mut active_kv_bytes = step.active_kv_bytes;
 
-    let mut generated_tokens = Vec::with_capacity(options.max_new_tokens);
-    let mut generated_logits = Vec::with_capacity(options.max_new_tokens);
-    let mut decode_token_latencies = Vec::with_capacity(options.max_new_tokens.saturating_sub(1));
+    let mut generated_tokens = Vec::with_capacity(max_new_tokens);
+    let mut generated_logits = Vec::with_capacity(max_new_tokens);
+    let mut decode_token_latencies = Vec::with_capacity(max_new_tokens.saturating_sub(1));
     let decode_started = Instant::now();
-    for index in 0..options.max_new_tokens {
+    for index in 0..max_new_tokens {
         generated_tokens.push(step.greedy_token);
         generated_logits.push(step.greedy_logit);
-        if index + 1 < options.max_new_tokens {
+        if index + 1 < max_new_tokens {
             let token_started = Instant::now();
-            step = ffi::decode_one(&target, &mut cache, step.greedy_token)
+            step = ffi::decode_one(target, &mut cache, step.greedy_token)
                 .map_err(|error| CliError::Runtime(format!("decode failed: {error}")))?;
             decode_token_latencies.push(token_started.elapsed());
             peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
@@ -749,8 +817,9 @@ fn parse_server_backend(value: &str) -> Result<ServerBackend, CliError> {
     match value {
         "stub" => Ok(ServerBackend::Stub),
         "real-helper" | "real_helper" => Ok(ServerBackend::RealHelper),
+        "persistent-native" | "persistent_native" => Ok(ServerBackend::PersistentNative),
         other => Err(CliError::Usage(format!(
-            "--backend must be stub or real-helper, got '{other}'"
+            "--backend must be stub, real-helper, or persistent-native, got '{other}'"
         ))),
     }
 }
@@ -812,7 +881,7 @@ fn usage() -> String {
 }
 
 fn serve_usage() -> String {
-    "usage: gemma4d serve [--bind 127.0.0.1:8080] [--backend stub|real-helper --model-path PATH] [--max-context-tokens N] [--memory-budget-mb N]"
+    "usage: gemma4d serve [--bind 127.0.0.1:8080] [--backend stub|real-helper|persistent-native --model-path PATH] [--max-context-tokens N] [--memory-budget-mb N]"
         .to_owned()
 }
 
