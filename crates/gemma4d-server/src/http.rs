@@ -218,6 +218,25 @@ struct PersistentNativeRequest {
     reply: mpsc::Sender<Result<GenerateSummary, String>>,
 }
 
+fn native_prefill_policy_warning(error: impl std::fmt::Display) -> String {
+    format!(
+        "native server prefill chunk policy warning: {error}; continuing without default policy"
+    )
+}
+
+fn mark_persistent_native_ready(
+    worker_state: &Arc<Mutex<PersistentNativeState>>,
+    model_load: Duration,
+    policy_warning: Option<String>,
+) {
+    let mut state = worker_state.lock().expect("persistent state lock");
+    state.status = "ready".to_owned();
+    state.model_loaded = true;
+    state.model_load_count = 1;
+    state.model_load_seconds = model_load.as_secs_f64();
+    state.last_error = policy_warning;
+}
+
 impl PersistentNativeBackend {
     fn start(model_path: PathBuf, max_context_tokens: NonZeroU32) -> Self {
         let (sender, receiver) = mpsc::channel::<PersistentNativeRequest>();
@@ -229,20 +248,15 @@ impl PersistentNativeBackend {
                     let policy_warning = resident
                         .apply_native_server_default_prefill_chunk_policy()
                         .err()
-                        .map(|error| {
-                            format!(
-                                "native server prefill chunk policy warning: {error}; continuing without default policy"
-                            )
-                        });
+                        .map(native_prefill_policy_warning);
                     if let Some(warning) = policy_warning.as_ref() {
                         eprintln!("{warning}");
                     }
-                    let mut state = worker_state.lock().expect("persistent state lock");
-                    state.status = "ready".to_owned();
-                    state.model_loaded = true;
-                    state.model_load_count = 1;
-                    state.model_load_seconds = resident.model_load().as_secs_f64();
-                    state.last_error = policy_warning;
+                    mark_persistent_native_ready(
+                        &worker_state,
+                        resident.model_load(),
+                        policy_warning,
+                    );
                     Some(resident)
                 }
                 Err(error) => {
@@ -1725,6 +1739,30 @@ mod tests {
         assert_eq!(response.status, 500);
         assert!(response.body.contains("native_backend_error"));
         assert!(response.body.contains("model path"));
+    }
+
+    #[test]
+    fn persistent_native_policy_warning_keeps_loaded_state_ready() {
+        let state = Arc::new(Mutex::new(PersistentNativeState::loading()));
+
+        mark_persistent_native_ready(
+            &state,
+            Duration::from_millis(1250),
+            Some(native_prefill_policy_warning("setter failed")),
+        );
+
+        let snapshot = state.lock().expect("persistent state lock").clone();
+        assert_eq!(snapshot.status, "ready");
+        assert!(snapshot.model_loaded);
+        assert_eq!(snapshot.model_load_count, 1);
+        assert_eq!(snapshot.errors_total, 0);
+        assert_eq!(snapshot.model_load_seconds, 1.25);
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some(
+                "native server prefill chunk policy warning: setter failed; continuing without default policy"
+            )
+        );
     }
 
     #[test]

@@ -65,6 +65,13 @@ behavior below the `4096`-token policy threshold. The larger-context policy
 interpretation is corroborated by isolated opt-in policy evidence from XR35
 (`code_review_rust_8k_001`) and XR40 (`benchmark_qa_16k_001`).
 
+Boundary probes were single-repeat exploratory checks and are superseded by the
+repeat-3 rows. `server-default-1k-boundary` showed candidate prefill
+`2506.956 -> 2769.866 ms` (`-10.486%`). `server-default-4095-boundary` observed
+`4099` server prefill tokens from chat wrapping, engaged the chunk policy, and
+showed prefill `10851.996 -> 12658.482 ms` (`-16.647%`) while peak MLX improved
+`9.217 -> 7.165 GB`.
+
 Per-run artifact directories:
 
 - `benchmarks/out/XR51-server-chunk-policy-default/server-default-1k-repeats3`

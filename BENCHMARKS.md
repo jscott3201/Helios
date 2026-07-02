@@ -16,6 +16,13 @@ The 1K row is persistence-only because the long-context chunk policy is inert
 below `4096` prompt tokens; isolated policy evidence for larger contexts remains
 the XR35 8K and XR40 16K opt-in runs.
 
+XR51 boundary probes were single-repeat exploratory checks and are superseded by
+the repeat-3 rows: `server-default-1k-boundary` showed candidate prefill
+`2506.956 -> 2769.866 ms` (`-10.486%`), while
+`server-default-4095-boundary` observed `4099` server prefill tokens from chat
+wrapping and showed prefill `10851.996 -> 12658.482 ms` (`-16.647%`) with peak
+MLX `9.217 -> 7.165 GB`.
+
 ### Prefill
 
 | Path | Workload | Baseline p50 ms | Candidate p50 ms | Delta | Peak MLX | Status | Evidence |

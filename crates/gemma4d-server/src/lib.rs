@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn native_prefill_default_policy_matches_native_false_values() {
-        for value in ["false", "FALSE", "off", "OFF"] {
+        for value in ["", "false", "FALSE", "off", "OFF"] {
             assert_eq!(
                 native_server_default_prefill_chunk_policy_from_env(
                     Some(OsStr::new(value)),
