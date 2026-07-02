@@ -49,6 +49,10 @@ Validated `config.json` fields:
 - `text_config.final_logit_softcapping = 30.0`
 - root quantization is affine `bits=4`, `group_size=64`, with per-layer MLP
   8-bit overrides.
+- The QAT target safetensors total `10987772430` bytes (`10.99 GB`) versus the
+  plain target's `6741039511` bytes (`6.74 GB`); XR50 footprint and latency
+  caveats are scoped to this mixed 4-bit plus 8-bit-MLP artifact, not QAT
+  generally.
 
 Artifact hashes:
 
@@ -114,6 +118,11 @@ The QAT target downloaded and loaded successfully, and QAT-target MTP exactness
 passed in completed low-N smoke probes, but XR50 did not produce defensible
 evidence for default adoption.
 
+All completed benchmark rows were cold-start smokes using `--trials 1`,
+`--warmups 0`, and `--max-new-tokens 2`. Treat their latency as
+JIT/compile/load dominated and not steady-state; unlike the P04 convention, these
+smokes do not discard the first four decode samples.
+
 Completed QAT runs:
 
 - `candidate-qat-target-block12-smoke`: `chat_short_1k_001`, block sizes `1`
@@ -131,12 +140,16 @@ Attempted but stopped paths:
 
 - A sandboxed smoke failed before benchmarking because MLX could not access the
   Mac Metal device.
+- The required fresh `baseline-plain-target` leg was not attempted. XR48 remains
+  only a stale comparator with different parameters: `3` trials, `1` warmup, and
+  `32` generated tokens versus XR50's `1` trial, `0` warmups, and `2` generated
+  tokens.
 - A broader 3-workload block-1/2 smoke and two 32-token selected-path QAT runs
-  were stopped before artifacts because QAT target reload/decode runtime was too
-  long and pushed heavy 16GB memory pressure.
+  were stopped before artifacts because this mixed 4-bit plus 8-bit-MLP target
+  reload/decode runtime was too long and pushed heavy 16GB memory pressure.
 
-XR50 does not promote the QAT target as the default target artifact. The
-evidence points back to verifier/runtime cost as the next MTP bottleneck. A
+XR50 does not promote this QAT target artifact as the default target artifact.
+The evidence points back to verifier/runtime cost as the next MTP bottleneck. A
 separate reduced QAT-target baseline goal would be required before making any
 target-default decision.
 
