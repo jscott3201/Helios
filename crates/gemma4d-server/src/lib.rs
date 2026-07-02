@@ -14,12 +14,15 @@ use std::{
 use gemma4d_adapters::{
     AdapterCompatibility, AdapterRegistry, AdapterSummary, ImportedAdapter, TrustedPathPolicy,
 };
-use gemma4d_ffi::{self as ffi, KvCache, KvPolicy, LoadConfig, Target};
+use gemma4d_ffi::{self as ffi, KvCache, KvPolicy, LoadConfig, PrefillChunkPolicy, Target};
 use http::{
     PERSISTENT_NATIVE_GATE_ENV, ServerBackend, ServerConfig, parse_bind_addr, serve_blocking,
 };
 
 pub const CRATE_NAME: &str = "gemma4d-server";
+pub(crate) const NATIVE_GRAPH_ENV: &str = "GEMMA4D_USE_NATIVE_GRAPH";
+pub(crate) const NATIVE_PREFILL_CHUNK_TOKENS_ENV: &str = "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS";
+pub(crate) const NATIVE_PREFILL_CHUNK_POLICY_ENV: &str = "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY";
 
 pub fn bootstrap_status() -> &'static str {
     "m11-openai-server"
@@ -82,6 +85,22 @@ impl ResidentTarget {
         self.model_load
     }
 
+    pub(crate) fn apply_native_server_default_prefill_chunk_policy(
+        &mut self,
+    ) -> Result<Option<PrefillChunkPolicy>, CliError> {
+        let Some(policy) = native_server_default_prefill_chunk_policy() else {
+            return Ok(None);
+        };
+        self.target
+            .set_prefill_chunk_policy(policy)
+            .map_err(|error| {
+                CliError::Runtime(format!(
+                    "failed to set native server prefill chunk policy: {error}"
+                ))
+            })?;
+        Ok(Some(policy))
+    }
+
     pub fn generate_prompt(
         &self,
         prompt: &str,
@@ -97,6 +116,34 @@ impl ResidentTarget {
             Duration::ZERO,
         )
     }
+}
+
+pub(crate) fn native_server_default_prefill_chunk_policy() -> Option<PrefillChunkPolicy> {
+    let native_graph = env::var_os(NATIVE_GRAPH_ENV);
+    native_server_default_prefill_chunk_policy_from_env(
+        native_graph.as_deref(),
+        env::var_os(NATIVE_PREFILL_CHUNK_TOKENS_ENV).is_some(),
+        env::var_os(NATIVE_PREFILL_CHUNK_POLICY_ENV).is_some(),
+    )
+}
+
+fn native_server_default_prefill_chunk_policy_from_env(
+    native_graph: Option<&std::ffi::OsStr>,
+    chunk_tokens_env_set: bool,
+    chunk_policy_env_set: bool,
+) -> Option<PrefillChunkPolicy> {
+    if !native_graph_env_enabled(native_graph) || chunk_tokens_env_set || chunk_policy_env_set {
+        return None;
+    }
+    Some(PrefillChunkPolicy::LongContext256)
+}
+
+fn native_graph_env_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let value = value.to_string_lossy();
+    !value.is_empty() && value != "0"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1013,6 +1060,7 @@ impl GenerateSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn reports_placeholder_status() {
@@ -1053,6 +1101,46 @@ mod tests {
             parse_serve_options(["--backend", "real-helper"]).expect_err("model path required");
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("--model-path"));
+    }
+
+    #[test]
+    fn native_prefill_default_policy_is_long_context_256_when_env_absent() {
+        assert_eq!(
+            native_server_default_prefill_chunk_policy_from_env(
+                Some(OsStr::new("1")),
+                false,
+                false
+            ),
+            Some(PrefillChunkPolicy::LongContext256)
+        );
+    }
+
+    #[test]
+    fn native_prefill_default_policy_does_not_override_explicit_env() {
+        assert_eq!(
+            native_server_default_prefill_chunk_policy_from_env(Some(OsStr::new("1")), true, false),
+            None
+        );
+        assert_eq!(
+            native_server_default_prefill_chunk_policy_from_env(Some(OsStr::new("1")), false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn native_prefill_default_policy_skips_helper_path() {
+        assert_eq!(
+            native_server_default_prefill_chunk_policy_from_env(None, false, false),
+            None
+        );
+        assert_eq!(
+            native_server_default_prefill_chunk_policy_from_env(
+                Some(OsStr::new("0")),
+                false,
+                false
+            ),
+            None
+        );
     }
 
     #[test]

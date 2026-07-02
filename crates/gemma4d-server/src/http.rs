@@ -225,14 +225,26 @@ impl PersistentNativeBackend {
         let worker_state = Arc::clone(&state);
         thread::spawn(move || {
             let resident = match ResidentTarget::load(model_path, max_context_tokens) {
-                Ok(resident) => {
-                    let mut state = worker_state.lock().expect("persistent state lock");
-                    state.status = "ready".to_owned();
-                    state.model_loaded = true;
-                    state.model_load_count = 1;
-                    state.model_load_seconds = resident.model_load().as_secs_f64();
-                    state.last_error = None;
-                    Some(resident)
+                Ok(mut resident) => {
+                    match resident.apply_native_server_default_prefill_chunk_policy() {
+                        Ok(_) => {
+                            let mut state = worker_state.lock().expect("persistent state lock");
+                            state.status = "ready".to_owned();
+                            state.model_loaded = true;
+                            state.model_load_count = 1;
+                            state.model_load_seconds = resident.model_load().as_secs_f64();
+                            state.last_error = None;
+                            Some(resident)
+                        }
+                        Err(error) => {
+                            let mut state = worker_state.lock().expect("persistent state lock");
+                            state.status = "error".to_owned();
+                            state.model_loaded = false;
+                            state.errors_total = state.errors_total.saturating_add(1);
+                            state.last_error = Some(error.to_string());
+                            None
+                        }
+                    }
                 }
                 Err(error) => {
                     let mut state = worker_state.lock().expect("persistent state lock");
@@ -1536,6 +1548,28 @@ mod tests {
         )
     }
 
+    fn http_request_with_retry(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> HttpResponse {
+        let mut last_error = None;
+        for _ in 0..20 {
+            match http_request(addr, method, path, body) {
+                Ok(response) => return response,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        panic!(
+            "{method} {path} failed after retries: {}",
+            last_error.unwrap_or_else(|| "unknown error".to_owned())
+        );
+    }
+
     #[test]
     fn default_bind_is_localhost() {
         assert!(ServerConfig::binds_localhost_by_default());
@@ -1736,17 +1770,16 @@ mod tests {
             serve_listener(listener, runtime, server_shutdown).expect("serve")
         });
 
-        let health = http_request(addr, "GET", "/health", None).expect("health");
+        let health = http_request_with_retry(addr, "GET", "/health", None);
         assert_eq!(health.status, 200);
         assert!(health.body.contains("\"status\":\"ok\""));
 
-        let stream = http_request(
+        let stream = http_request_with_retry(
             addr,
             "POST",
             "/v1/chat/completions",
             Some(&chat_body(true, None)),
-        )
-        .expect("stream");
+        );
         assert_eq!(stream.status, 200);
         assert!(stream.body.contains("data: [DONE]"));
 
