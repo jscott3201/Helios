@@ -143,7 +143,8 @@ fn native_graph_env_enabled(value: Option<&std::ffi::OsStr>) -> bool {
         return false;
     };
     let value = value.to_string_lossy();
-    !value.is_empty() && value != "0"
+    // Keep in sync with native/gemma4_mlx/src/runtime.cc:126-134.
+    !matches!(value.as_ref(), "" | "0" | "false" | "FALSE" | "off" | "OFF")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1141,6 +1142,21 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn native_prefill_default_policy_matches_native_false_values() {
+        for value in ["false", "FALSE", "off", "OFF"] {
+            assert_eq!(
+                native_server_default_prefill_chunk_policy_from_env(
+                    Some(OsStr::new(value)),
+                    false,
+                    false
+                ),
+                None,
+                "{value} should disable native graph policy"
+            );
+        }
     }
 
     #[test]

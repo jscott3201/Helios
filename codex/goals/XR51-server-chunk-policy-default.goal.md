@@ -27,10 +27,16 @@ native graph targets, with explicit env overrides preserved.
 - The selector returns `Some(PrefillChunkPolicy::LongContext256)` only when:
   - `GEMMA4D_USE_NATIVE_GRAPH` is enabled, and
   - neither explicit native prefill chunk env override is set.
+- Rust env parsing mirrors `native/gemma4_mlx/src/runtime.cc:126-134`: unset,
+  empty, `0`, `false`, `FALSE`, `off`, and `OFF` all disable the native graph
+  path.
 - Runtime precedence was checked in `native/gemma4_mlx/src/native_model.cc`:
   native env values are read during native model load, and the FFI setter would
   override them after load. XR51 therefore skips the setter when either explicit
   chunk env is present.
+- If the post-load policy setter fails after the resident target has loaded, the
+  persistent-native worker records/logs a warning and continues serving with the
+  loaded resident instead of converting the worker to a permanent error state.
 
 ## Acceptance Gates
 
@@ -38,7 +44,9 @@ native graph targets, with explicit env overrides preserved.
   baseline at 1K, 4K, 8K, and 16K.
 - Server A/B: prefill p50/p95 and peak MLX are captured for 1K, 4K, 8K, and
   16K using persistent-native default versus per-request unwired baseline.
-- Below-threshold 1K path has no p50/p95 or memory regression.
+- Below-threshold 1K path has no memory regression; its latency delta is
+  persistence-only because the native long-context chunk policy is inert below
+  `4096` prompt tokens.
 - 16K path recovers XR40-level memory and p50 improvements.
 - Stub and existing server fixtures remain green.
 - Explicit native chunk env overrides are not overridden by the new default.
@@ -50,6 +58,12 @@ Percentiles use the XR05 ceil-rank convention. All server A/B runs used:
 ```text
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_PERSISTENT_SERVER=1 cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- --model-path artifacts/models/gemma-4-12B-it-4bit --workloads benchmarks/workloads/real-contexts/workloads.jsonl --repeats 3 --max-new-tokens 1 --max-context-tokens 32768 --memory-budget-mb 14336
 ```
+
+The server A/B bundles persistent-native residency plus the default chunk policy.
+The 1K row is not chunk-policy speed evidence; it reflects resident server
+behavior below the `4096`-token policy threshold. The larger-context policy
+interpretation is corroborated by isolated opt-in policy evidence from XR35
+(`code_review_rust_8k_001`) and XR40 (`benchmark_qa_16k_001`).
 
 Per-run artifact directories:
 

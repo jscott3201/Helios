@@ -10,6 +10,12 @@ which code produced it, and what claims are allowed.
 These are quick-access numbers only. The detailed run rows and raw artifacts
 remain the authority for exact commands, seeds, model identity, and caveats.
 
+XR51 server-native rows compare the bundled persistent-native resident worker
+plus default long-context prefill policy against the unwired server baseline.
+The 1K row is persistence-only because the long-context chunk policy is inert
+below `4096` prompt tokens; isolated policy evidence for larger contexts remains
+the XR35 8K and XR40 16K opt-in runs.
+
 ### Prefill
 
 | Path | Workload | Baseline p50 ms | Candidate p50 ms | Delta | Peak MLX | Status | Evidence |
@@ -17,7 +23,7 @@ remain the authority for exact commands, seeds, model identity, and caveats.
 | Server native prefill default | `benchmark_qa_16k_001` | `87387.199` | `41711.194` | `+52.269%` | `21.874 -> 7.638 GB` | Accepted, server default | XR51 `server-default-16k-repeats3` |
 | Server native prefill default | `code_review_rust_8k_001` | `31285.354` | `22618.497` | `+27.703%` | `12.767 -> 7.402 GB` | Accepted, server default | XR51 `server-default-8k-repeats3` |
 | Server native prefill default | `code_review_rust_4k_001` | `11651.369` | `10152.938` | `+12.861%` | `9.216 -> 7.300 GB` | Accepted, server default | XR51 `server-default-4k-repeats3` |
-| Server native prefill default | `chat_short_1k_001` | `2814.225` | `2352.410` | `+16.410%` | `7.324 -> 7.324 GB` | Accepted, below-threshold no memory change | XR51 `server-default-1k-repeats3` |
+| Server native prefill default | `chat_short_1k_001` | `2814.225` | `2352.410` | `+16.410%` | `7.324 -> 7.324 GB` | Accepted, persistence-only; policy inert below 4096 | XR51 `server-default-1k-repeats3` |
 | Native prefill policy, env | `benchmark_qa_16k_001` | `86813.720` | `42244.280` | `+51.339%` | `21.868 -> 7.620 GB` | Accepted, opt-in | XR40 `benchmark-qa-16k-policy` |
 | Native prefill policy, env | `long_repo_pack_16k_001` | `87017.803` | `42390.024` | `+51.286%` | `21.868 -> 7.620 GB` | Accepted, opt-in | XR40 `long-repo-16k-policy` |
 | Native prefill policy, env | `code_review_rust_8k_001` | `30339.051` | `21993.044` | `+27.509%` | `12.763 -> 7.383 GB` | Accepted, opt-in | XR35 `holdout-8k-policy` |
@@ -1152,10 +1158,9 @@ XR14 interpretation:
   fields until the helper/native boundary exposes those measurements.
 - P02 real-helper server inference is opt-in. The default server backend remains
   the M11 stub, and P02 does not apply adapters or MTP on the real server path.
-- P02 server benchmark measurements include HTTP route overhead but still pay
-  model load per request. They should not be interpreted as persistent
-  server-session latency until a later goal keeps a loaded target inside the
-  server runtime.
+- P02 server benchmark measurements include HTTP route overhead and pay model
+  load per request. Use XR11 and later persistent-native server measurements for
+  resident server-session latency claims.
 - P03 confirms native graph parity only for the tokenizer-controlled probes in
   the P03 report. It does not justify switching defaults, server use, adapter
   use, MTP use, or unmeasured prompt/context shapes.
@@ -1170,6 +1175,14 @@ XR14 interpretation:
 - P04 long-context greedy-logit deltas are diagnostic because generated token
   IDs matched helper outputs. They should not be used as proof of broad
   numerical parity outside the measured probes.
+- XR51 server-native prefill default is scoped to persistent-native server
+  workers with `GEMMA4D_USE_NATIVE_GRAPH` enabled. It applies
+  `PrefillChunkPolicy::LongContext256` after resident load only when neither
+  `GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS` nor
+  `GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY` is set; explicit chunk envs win. Stub,
+  real-helper, generate CLI, and helper-backed paths are unchanged. The native
+  long-context chunk policy engages at `>=4096` prompt tokens, so XR51 1K rows
+  are persistence-only, not isolated chunk-policy speed evidence.
 - P05 proves real native MTP correctness only for the measured text-only greedy
   probes and block sizes `1` and `2`.
 - P05 does not justify enabling MTP by default: the measured assistant acceptance

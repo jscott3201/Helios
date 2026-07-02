@@ -226,25 +226,24 @@ impl PersistentNativeBackend {
         thread::spawn(move || {
             let resident = match ResidentTarget::load(model_path, max_context_tokens) {
                 Ok(mut resident) => {
-                    match resident.apply_native_server_default_prefill_chunk_policy() {
-                        Ok(_) => {
-                            let mut state = worker_state.lock().expect("persistent state lock");
-                            state.status = "ready".to_owned();
-                            state.model_loaded = true;
-                            state.model_load_count = 1;
-                            state.model_load_seconds = resident.model_load().as_secs_f64();
-                            state.last_error = None;
-                            Some(resident)
-                        }
-                        Err(error) => {
-                            let mut state = worker_state.lock().expect("persistent state lock");
-                            state.status = "error".to_owned();
-                            state.model_loaded = false;
-                            state.errors_total = state.errors_total.saturating_add(1);
-                            state.last_error = Some(error.to_string());
-                            None
-                        }
+                    let policy_warning = resident
+                        .apply_native_server_default_prefill_chunk_policy()
+                        .err()
+                        .map(|error| {
+                            format!(
+                                "native server prefill chunk policy warning: {error}; continuing without default policy"
+                            )
+                        });
+                    if let Some(warning) = policy_warning.as_ref() {
+                        eprintln!("{warning}");
                     }
+                    let mut state = worker_state.lock().expect("persistent state lock");
+                    state.status = "ready".to_owned();
+                    state.model_loaded = true;
+                    state.model_load_count = 1;
+                    state.model_load_seconds = resident.model_load().as_secs_f64();
+                    state.last_error = policy_warning;
+                    Some(resident)
                 }
                 Err(error) => {
                     let mut state = worker_state.lock().expect("persistent state lock");
