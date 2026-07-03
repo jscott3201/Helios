@@ -3481,7 +3481,10 @@ bool NativeMtpAssistantModel::draft_block(
                 *last_hidden.impl_,
                 current_hidden,
                 token_id,
-                static_cast<int>(first_position + step),
+                // HF SinglePositionMultiTokenCandidateGenerator computes
+                // position_ids once before its drafter loop; shared target KV
+                // effectively locks Gemma 4 MTP to this constant position.
+                static_cast<int>(first_position),
                 need_projected_hidden);
             out_tokens[produced++] = draft.token;
             if (defer_first_projection && draft.token != first_accept_token) {
