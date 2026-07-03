@@ -112,6 +112,55 @@ Sanity check: all measured `draft_tokens` arrays in XR54 are byte-identical to
 XR48 for matching workload/trial records. This means the reference-aligned
 position pin did not affect native drafter outputs in this runtime path.
 
+## XR54-R Review Rerun
+
+Claude flagged the original XR54 A/B as potentially stale-binary evidence. The
+review rerun started from a cleaned `target/` and rebuilt with
+`GEMMA4D_REQUIRE_MLX=1`. Provenance before measurement:
+
+- Source pin edit mtime: `native_model.cc` `2026-07-03 00:26:39`.
+- Fresh MLX build: `CMakeCache.txt` contains `GEMMA4D_REQUIRE_MLX:BOOL=ON`.
+- Native objects: `model_manifest.cc.o` `00:52:47`,
+  `native_model.cc.o` `00:52:48`, `runtime.cc.o` `00:52:48`.
+- Native archive: `libgemma4_mlx.a` `2026-07-03 00:52:48`.
+- Runner binary: `target/debug/examples/xr15_mtp_policy_variance_ab`
+  `2026-07-03 00:52:49`.
+
+The one-leg rerun wrote
+`benchmarks/out/XR54-mtp-position-pin/xr54-r-mtp-candidate-one-trial/` with
+build provenance in summary and records: git SHA
+`f2fb705706bc8196845b19d01170cb41e04f430f`, dirty-diff SHA-256
+`b4eae5c622bd802783ba2ca18b3b15f108b5fa615626a2283745849891451bd7`,
+dirty diff bytes `9177`, and runner link mtime `1783054369`.
+
+The fresh one-leg record for `mtp_candidate_1k_001` was exact and still drafted
+`[[236792, 236865], [2426, 236779], [236787, 107], [236825, 107],
+[236792, 7216], [107, 236792], [107], [2861], [107]]`, byte-identical to all
+three XR48 measured records. Acceptance stayed `7/15 = 0.467`. Therefore the
+XR54 refutation is real, not stale-binary fallout.
+
+The XR15 runner now stamps each evidence summary and record with git SHA,
+dirty-diff SHA-256, dirty-diff byte count, runner binary path, and runner binary
+link mtime; missing provenance aborts before measurement.
+
+## PyTorch Parity Contingency
+
+The contingency implementation added a dedicated native parity payload export:
+`gemma4_kv_snapshot_save_mtp_parity` saves the existing native snapshot tensors
+plus ordered standalone target token embeddings. The diagnostic harness
+`xr54_drafter_pytorch_parity` exported
+`benchmarks/out/XR54-mtp-position-pin/pytorch-parity/payload.safetensors` for
+the first `mtp_candidate_1k_001` draft round. Payload metadata includes
+`hidden.last.shape = 1x1x3840`, shared full/sliding KV, and
+`target.token_embeddings.shape = 1x2x3840` for token IDs `107,236792`.
+
+Native draft tokens from the diagnostic were `[236792, 236865]`, matching the
+XR54-R reference record. The actual vendored-Transformers PyTorch comparison is
+blocked in this local environment because the selected Python
+`/opt/homebrew/opt/mlx-lm/libexec/bin/python` has no `torch` module. The
+structured blocker is recorded in
+`benchmarks/out/XR54-mtp-position-pin/pytorch-parity/{summary.json,blockers.md,parity.json}`.
+
 ## Result
 
 XR54 is not promotable as an acceptance fix. The one-site change aligns Helios
@@ -120,10 +169,9 @@ exactness, but the evidence refutes the prediction that the position pin would
 repair `mtp_candidate_1k_001` slot-1 acceptance.
 
 XR55 must not start from this branch because its hypothesis depends on a fixed
-drafter. Required next work is the handoff contingency tracked as work item
-`019f2640-5809-77f3-b345-805f8184f1ab`: add a drafter-only PyTorch parity
-diagnostic that exports the standalone target token embedding and compares
-pinned versus incremented `position_ids` against native draft tokens.
+drafter. The drafter-only PyTorch parity diagnostic is implemented through
+payload export and a local reference script, but the comparison itself remains
+blocked until PyTorch is available for the vendored Transformers reference.
 
 ## Completion Rule
 

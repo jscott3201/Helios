@@ -174,6 +174,12 @@ Gemma4Status gemma4_kv_snapshot_export(const Gemma4KvCache* cache, Gemma4KvSnaps
 Gemma4Status gemma4_kv_snapshot_import(Gemma4KvCache* cache, const Gemma4KvSnapshot* snapshot);
 Gemma4Status gemma4_kv_snapshot_info(const Gemma4KvSnapshot* snapshot, Gemma4KvSnapshotInfo* out);
 Gemma4Status gemma4_kv_snapshot_save(const Gemma4KvSnapshot* snapshot, const char* payload_path);
+Gemma4Status gemma4_kv_snapshot_save_mtp_parity(
+    const Gemma4KvSnapshot* snapshot,
+    Gemma4Target* target,
+    const int32_t* token_ids,
+    size_t token_count,
+    const char* payload_path);
 Gemma4Status gemma4_kv_snapshot_save_compressed(
     const Gemma4KvSnapshot* snapshot,
     const char* payload_path,
