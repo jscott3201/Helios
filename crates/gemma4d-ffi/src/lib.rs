@@ -22,7 +22,9 @@ mod raw {
     pub const GEMMA4_ERR_MEMORY_GUARD: Gemma4Status = 5;
     pub const GEMMA4_ERR_CACHE: Gemma4Status = 6;
     pub const GEMMA4_ERR_ADAPTER: Gemma4Status = 7;
-    pub const GEMMA4_MTP_TRACE_MAX_POSITIONS: usize = 4;
+    pub const GEMMA4_MTP_TRACE_MAX_POSITIONS: usize = 16;
+    pub const GEMMA4_MTP_MAX_DRAFT_TOKENS: usize = GEMMA4_MTP_TRACE_MAX_POSITIONS - 1;
+    pub const GEMMA4_MTP_MAX_COMMITTED_TOKENS: usize = GEMMA4_MTP_TRACE_MAX_POSITIONS;
     pub const GEMMA4_MTP_TRACE_TOP_K: usize = 5;
     pub const GEMMA4_MTP_TRACE_MAX_RANK: usize = 4;
 
@@ -92,7 +94,6 @@ mod raw {
     }
 
     #[repr(C)]
-    #[derive(Default)]
     pub struct Gemma4MtpTraceInfo {
         pub position_count: u32,
         pub top_k: u32,
@@ -121,6 +122,38 @@ mod raw {
         pub sliding_attention_value_shape: [u64; GEMMA4_MTP_TRACE_MAX_RANK],
     }
 
+    impl Default for Gemma4MtpTraceInfo {
+        fn default() -> Self {
+            Self {
+                position_count: 0,
+                top_k: 0,
+                context_sequence_len: 0,
+                first_position: 0,
+                position_offsets: [0; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+                draft_tokens: [0; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+                target_tokens: [0; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+                target_logits: [0.0; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+                draft_logits: [0.0; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+                logit_margins: [0.0; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+                draft_in_top_k: [false; GEMMA4_MTP_TRACE_MAX_POSITIONS],
+                top_token_ids: [0; GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K],
+                top_logits: [0.0; GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K],
+                hidden_rank: 0,
+                hidden_shape: [0; GEMMA4_MTP_TRACE_MAX_RANK],
+                full_attention_layer: 0,
+                full_attention_key_rank: 0,
+                full_attention_key_shape: [0; GEMMA4_MTP_TRACE_MAX_RANK],
+                full_attention_value_rank: 0,
+                full_attention_value_shape: [0; GEMMA4_MTP_TRACE_MAX_RANK],
+                sliding_attention_layer: 0,
+                sliding_attention_key_rank: 0,
+                sliding_attention_key_shape: [0; GEMMA4_MTP_TRACE_MAX_RANK],
+                sliding_attention_value_rank: 0,
+                sliding_attention_value_shape: [0; GEMMA4_MTP_TRACE_MAX_RANK],
+            }
+        }
+    }
+
     #[repr(C)]
     #[derive(Default)]
     pub struct Gemma4StepResult {
@@ -135,7 +168,7 @@ mod raw {
         pub verify_repair_ms: f64,
         pub accepted_draft_count: u32,
         pub committed_count: u32,
-        pub committed_tokens: [i32; 4],
+        pub committed_tokens: [i32; GEMMA4_MTP_MAX_COMMITTED_TOKENS],
         pub native_last_hidden: *mut std::ffi::c_void,
         pub mtp_trace: Gemma4MtpTraceInfo,
     }
@@ -295,6 +328,8 @@ mod raw {
         ) -> Gemma4Status;
     }
 }
+
+pub const MTP_MAX_DRAFT_TOKENS: usize = raw::GEMMA4_MTP_MAX_DRAFT_TOKENS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -879,7 +914,7 @@ pub struct StepResult {
     pub verify_repair_ms: f64,
     pub accepted_draft_count: u32,
     pub committed_count: u32,
-    pub committed_tokens: [i32; 4],
+    pub committed_tokens: [i32; raw::GEMMA4_MTP_MAX_COMMITTED_TOKENS],
     pub native_last_hidden: Option<NativeLastHiddenView>,
     pub mtp_trace: MtpTraceInfo,
 }
@@ -1188,7 +1223,7 @@ mod tests {
     #[test]
     fn runtime_version_reports_smoke_backend() {
         let version = runtime_version().expect("runtime version should be available");
-        assert_eq!(version.abi_version, 1);
+        assert_eq!(version.abi_version, 2);
         assert_eq!(version.backend_name, "gemma4_mlx");
         assert!(version.backend_version.starts_with("m03-"));
     }

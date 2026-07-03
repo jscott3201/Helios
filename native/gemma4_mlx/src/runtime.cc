@@ -13,6 +13,7 @@
 #include <memory>
 #include <new>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -192,8 +193,14 @@ void record_mtp_target_step(
     size_t index,
     uint64_t context_sequence_len,
     const Gemma4StepResult& step) {
-    if (trace == nullptr || index >= GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+    if (trace == nullptr) {
         return;
+    }
+    if (index >= GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+        std::ostringstream message;
+        message << "native MTP trace target position " << index
+                << " exceeds trace capacity " << GEMMA4_MTP_TRACE_MAX_POSITIONS;
+        throw std::runtime_error(message.str());
     }
     trace->position_count = std::max<uint32_t>(trace->position_count, static_cast<uint32_t>(index + 1));
     trace->position_offsets[index] = (context_sequence_len == 0 ? 0 : context_sequence_len - 1) + index;
@@ -208,8 +215,14 @@ void record_mtp_draft_score(
     size_t index,
     int32_t draft_token,
     const Gemma4StepResult& target_step) {
-    if (trace == nullptr || index >= GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+    if (trace == nullptr) {
         return;
+    }
+    if (index >= GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+        std::ostringstream message;
+        message << "native MTP trace draft position " << index
+                << " exceeds trace capacity " << GEMMA4_MTP_TRACE_MAX_POSITIONS;
+        throw std::runtime_error(message.str());
     }
     trace->draft_tokens[index] = draft_token;
     if (draft_token == target_step.greedy_token) {
@@ -356,8 +369,9 @@ std::unordered_map<std::string, std::string> snapshot_metadata(const NativeKvSna
     metadata["last_step.active_kv_bytes"] = std::to_string(snapshot->last_step.active_kv_bytes);
     metadata["last_step.accepted_draft_count"] = std::to_string(snapshot->last_step.accepted_draft_count);
     metadata["last_step.committed_count"] = std::to_string(snapshot->last_step.committed_count);
-    metadata["last_step.committed_tokens"] =
-        join_i32_list(snapshot->last_step.committed_tokens, 4);
+    metadata["last_step.committed_tokens"] = join_i32_list(
+        snapshot->last_step.committed_tokens,
+        GEMMA4_MTP_MAX_COMMITTED_TOKENS);
     return metadata;
 }
 
@@ -393,10 +407,11 @@ void apply_snapshot_metadata(
     snapshot->last_step.sequence_len = metadata_u64(metadata, "last_step.sequence_len");
     snapshot->last_step.active_kv_bytes = metadata_u64(metadata, "last_step.active_kv_bytes");
     snapshot->last_step.accepted_draft_count = metadata_u32(metadata, "last_step.accepted_draft_count");
-    snapshot->last_step.committed_count =
-        std::min<uint32_t>(metadata_u32(metadata, "last_step.committed_count"), 4);
+    snapshot->last_step.committed_count = std::min<uint32_t>(
+        metadata_u32(metadata, "last_step.committed_count"),
+        GEMMA4_MTP_MAX_COMMITTED_TOKENS);
     const std::vector<int32_t> committed = parse_i32_list(required_metadata(metadata, "last_step.committed_tokens"));
-    for (size_t index = 0; index < committed.size() && index < 4; ++index) {
+    for (size_t index = 0; index < committed.size() && index < GEMMA4_MTP_MAX_COMMITTED_TOKENS; ++index) {
         snapshot->last_step.committed_tokens[index] = committed[index];
     }
 }
@@ -692,7 +707,7 @@ Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_runtime_version requires a non-null out pointer");
     }
 
-    out->abi_version = 1;
+    out->abi_version = 2;
     out->backend_name = "gemma4_mlx";
     out->backend_version = kBackendVersion;
     return ok();
@@ -1409,8 +1424,10 @@ Gemma4Status gemma4_decode_block(
     if (tokens == nullptr || token_count == 0) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_decode_block requires at least one token");
     }
-    if (token_count > 2) {
-        return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, "gemma4_decode_block currently supports token_count <= 2");
+    if (token_count > GEMMA4_MTP_MAX_DRAFT_TOKENS) {
+        std::ostringstream message;
+        message << "gemma4_decode_block supports token_count <= " << GEMMA4_MTP_MAX_DRAFT_TOKENS;
+        return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, message.str());
     }
     if (out_greedy_tokens == nullptr || out_greedy_logits == nullptr || inout_count == nullptr) {
         return fail(
@@ -1602,8 +1619,7 @@ Gemma4Status gemma4_mtp_draft_block(
 
     std::string native_error;
     const bool lazy_second_draft =
-        env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_LAZY_SECOND_DRAFT") && block_size == 2 &&
-        cache->has_last_step;
+        env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_LAZY_SECOND_DRAFT") && cache->has_last_step;
     if (!drafter->native_model->draft_block(
             *drafter->target_native_model,
             *cache->last_hidden,
@@ -1673,10 +1689,11 @@ Gemma4Status verify_tokens_impl(
                 GEMMA4_ERR_CACHE,
                 "gemma4_verify_tokens requires a native incremental KV state and last-step prediction");
         }
-        if (draft_count > 2 || draft_count + 1 > GEMMA4_MTP_TRACE_MAX_POSITIONS) {
-            return fail(
-                GEMMA4_ERR_UNSUPPORTED_CONFIG,
-                "native MTP verify currently supports draft_count <= 2");
+        if (draft_count > GEMMA4_MTP_MAX_DRAFT_TOKENS ||
+            draft_count + 1 > GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+            std::ostringstream message;
+            message << "native MTP verify supports draft_count <= " << GEMMA4_MTP_MAX_DRAFT_TOKENS;
+            return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, message.str());
         }
 
         std::string native_error;
@@ -1720,7 +1737,7 @@ Gemma4Status verify_tokens_impl(
             }
             verify_forward_ms += elapsed_ms(forward_started);
 
-            const size_t lookahead_index = draft_count;
+            const size_t lookahead_index = 1;
             fallback_step.peak_memory_gb =
                 std::max(fallback_step.peak_memory_gb, cache->last_step.peak_memory_gb);
             fallback_step.active_kv_bytes =
@@ -1746,9 +1763,11 @@ Gemma4Status verify_tokens_impl(
 
         // Experimental XR22 prototype: use one block target decode when the
         // first draft is already known accepted, and keep an exact prefix KV for
-        // fallback if the second draft is rejected.
+        // fallback if the next draft is rejected. For N>2, later partial
+        // accepts use serial repair rather than truncating post-block KV, which
+        // is not exact for sliding-window layers near the window boundary.
         if (terminal_commit_count == 0 &&
-            env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_ROLLBACK") && draft_count == 2 &&
+            env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_ROLLBACK") && draft_count >= 2 &&
             draft_tokens[0] == cache->last_step.greedy_token) {
             const bool serial_state_repair =
                 env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_SERIAL_STATE_REPAIR");
@@ -1790,23 +1809,38 @@ Gemma4Status verify_tokens_impl(
                 return fail(GEMMA4_ERR_RUNTIME, "native MTP block-prefix verify returned incomplete target logits");
             }
 
+            size_t accepted_prefix_count = 1;
+            for (size_t index = 1; index < draft_count; ++index) {
+                if (draft_tokens[index] != block_greedy_tokens[index - 1]) {
+                    break;
+                }
+                ++accepted_prefix_count;
+            }
+            const bool full_block_accepted = accepted_prefix_count == draft_count;
+
             const uint64_t context_sequence_len = cache->native_tokens.size();
             Gemma4MtpTraceInfo trace{};
             initialize_mtp_trace(&trace, context_sequence_len);
             record_mtp_target_step(&trace, 0, context_sequence_len, cache->last_step);
             record_mtp_draft_score(&trace, 0, draft_tokens[0], cache->last_step);
 
-            Gemma4StepResult second_target_step{};
-            second_target_step.greedy_token = block_greedy_tokens[0];
-            second_target_step.greedy_logit = block_greedy_logits[0];
-            second_target_step.sequence_len = context_sequence_len + 1;
-            second_target_step.active_kv_bytes = prefix_kv->active_bytes();
-            second_target_step.peak_memory_gb = std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
-            record_mtp_target_step(&trace, 1, context_sequence_len, second_target_step);
-            record_mtp_draft_score(&trace, 1, draft_tokens[1], second_target_step);
+            const size_t trace_draft_count = full_block_accepted
+                ? draft_count
+                : std::min(draft_count, accepted_prefix_count + 1);
+            for (size_t index = 1; index < trace_draft_count; ++index) {
+                Gemma4StepResult target_step{};
+                target_step.greedy_token = block_greedy_tokens[index - 1];
+                target_step.greedy_logit = block_greedy_logits[index - 1];
+                target_step.sequence_len = context_sequence_len + index;
+                target_step.active_kv_bytes = index == 1 ? prefix_kv->active_bytes() : block_step.active_kv_bytes;
+                target_step.peak_memory_gb =
+                    std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
+                record_mtp_target_step(&trace, index, context_sequence_len, target_step);
+                record_mtp_draft_score(&trace, index, draft_tokens[index], target_step);
+            }
 
             auto commit_serial_repaired_state =
-                [&](const int32_t* committed_tokens, size_t committed_count, uint32_t accepted_count) -> Gemma4Status {
+                [&](const std::vector<int32_t>& committed_tokens, uint32_t accepted_count) -> Gemma4Status {
                 const auto repair_started = std::chrono::steady_clock::now();
                 std::unique_ptr<gemma4d::NativeKvState> serial_kv = cache->native_kv_state->clone();
                 if (serial_kv == nullptr) {
@@ -1817,8 +1851,7 @@ Gemma4Status verify_tokens_impl(
                 Gemma4StepResult serial_step{};
                 std::unique_ptr<gemma4d::NativeHiddenState> serial_hidden;
                 float peak_memory_gb = std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
-                uint64_t active_kv_bytes =
-                    std::max(block_step.active_kv_bytes, cache->native_kv_state->active_bytes());
+                const size_t committed_count = committed_tokens.size();
                 for (size_t index = 0; index < committed_count; ++index) {
                     if (state_only_serial_repair && index + 1 < committed_count) {
                         Gemma4StepResult state_step{};
@@ -1830,7 +1863,6 @@ Gemma4Status verify_tokens_impl(
                             return fail(GEMMA4_ERR_RUNTIME, native_error);
                         }
                         peak_memory_gb = std::max(peak_memory_gb, state_step.peak_memory_gb);
-                        active_kv_bytes = std::max(active_kv_bytes, state_step.active_kv_bytes);
                         continue;
                     }
                     if (!target->native_model->decode_incremental(
@@ -1842,17 +1874,18 @@ Gemma4Status verify_tokens_impl(
                         return fail(GEMMA4_ERR_RUNTIME, native_error);
                     }
                     peak_memory_gb = std::max(peak_memory_gb, serial_step.peak_memory_gb);
-                    active_kv_bytes = std::max(active_kv_bytes, serial_step.active_kv_bytes);
                 }
                 verify_repair_ms += elapsed_ms(repair_started);
                 record_mtp_target_step(&trace, committed_count, context_sequence_len, serial_step);
                 record_mtp_hidden_shape(&trace, serial_hidden.get());
 
                 serial_step.peak_memory_gb = peak_memory_gb;
-                serial_step.active_kv_bytes = active_kv_bytes;
+                serial_step.active_kv_bytes = serial_kv->active_bytes();
                 serial_step.accepted_draft_count = accepted_count;
                 serial_step.committed_count = static_cast<uint32_t>(committed_count);
-                for (size_t index = 0; index < committed_count && index < 4; ++index) {
+                for (size_t index = 0;
+                     index < committed_count && index < GEMMA4_MTP_MAX_COMMITTED_TOKENS;
+                     ++index) {
                     serial_step.committed_tokens[index] = committed_tokens[index];
                 }
                 serial_step.mtp_trace = trace;
@@ -1871,30 +1904,111 @@ Gemma4Status verify_tokens_impl(
                 return ok();
             };
 
-            if (draft_tokens[1] == block_greedy_tokens[0]) {
-                const int32_t committed_tokens[2] = {draft_tokens[0], draft_tokens[1]};
+            auto commit_prefix_repaired_state =
+                [&](const std::vector<int32_t>& committed_tokens, uint32_t accepted_count) -> Gemma4Status {
+                if (accepted_count == 0 || accepted_count >= committed_tokens.size()) {
+                    return fail(
+                        GEMMA4_ERR_RUNTIME,
+                        "native MTP block-prefix repair requires accepted drafts followed by fallback token");
+                }
+                const size_t accepted_count_usize = static_cast<size_t>(accepted_count);
+                const int32_t fallback_token = committed_tokens.back();
+                const auto repair_started = std::chrono::steady_clock::now();
+                std::unique_ptr<gemma4d::NativeKvState> accepted_block_kv = cache->native_kv_state->clone();
+                if (accepted_block_kv == nullptr) {
+                    return fail(
+                        GEMMA4_ERR_RUNTIME,
+                        "native MTP block-prefix repair failed to clone target KV state");
+                }
+                std::unique_ptr<gemma4d::NativeKvState> accepted_prefix_kv(new gemma4d::NativeKvState());
+                Gemma4StepResult accepted_prefix_step{};
+                std::vector<int32_t> accepted_prefix_greedy_tokens;
+                std::vector<float> accepted_prefix_greedy_logits;
+                if (!target->native_model->decode_incremental_block_with_prefix(
+                        draft_tokens,
+                        accepted_count_usize,
+                        accepted_count_usize,
+                        accepted_block_kv.get(),
+                        accepted_prefix_kv.get(),
+                        &accepted_prefix_step,
+                        &accepted_prefix_greedy_tokens,
+                        &accepted_prefix_greedy_logits,
+                        &native_error,
+                        nullptr)) {
+                    return fail(GEMMA4_ERR_RUNTIME, native_error);
+                }
+
+                Gemma4StepResult fallback_step{};
+                std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
+                if (!target->native_model->decode_incremental(
+                        fallback_token,
+                        accepted_prefix_kv.get(),
+                        &fallback_step,
+                        &native_error,
+                        &fallback_hidden)) {
+                    return fail(GEMMA4_ERR_RUNTIME, native_error);
+                }
+                verify_repair_ms += elapsed_ms(repair_started);
+                fallback_step.peak_memory_gb = std::max(
+                    {fallback_step.peak_memory_gb,
+                     accepted_prefix_step.peak_memory_gb,
+                     block_step.peak_memory_gb,
+                     cache->last_step.peak_memory_gb});
+                fallback_step.active_kv_bytes = accepted_prefix_kv->active_bytes();
+                record_mtp_target_step(&trace, committed_tokens.size(), context_sequence_len, fallback_step);
+                record_mtp_hidden_shape(&trace, fallback_hidden.get());
+
+                fallback_step.accepted_draft_count = accepted_count;
+                fallback_step.committed_count = static_cast<uint32_t>(committed_tokens.size());
+                for (size_t index = 0;
+                     index < committed_tokens.size() && index < GEMMA4_MTP_MAX_COMMITTED_TOKENS;
+                     ++index) {
+                    fallback_step.committed_tokens[index] = committed_tokens[index];
+                }
+                fallback_step.mtp_trace = trace;
+                attach_verify_timings(&fallback_step);
+
+                for (int32_t token : committed_tokens) {
+                    cache->native_tokens.push_back(token);
+                }
+                cache->native_kv_state = std::move(accepted_prefix_kv);
+                cache->last_hidden = std::move(fallback_hidden);
+                fallback_step.native_last_hidden = cache->last_hidden.get();
+                *out = fallback_step;
+                out->native_last_hidden = cache->last_hidden.get();
+                remember_last_step(cache, out);
+                target->sequence_len = out->sequence_len;
+                return ok();
+            };
+
+            if (full_block_accepted) {
+                std::vector<int32_t> committed_tokens(draft_tokens, draft_tokens + draft_count);
                 if (serial_state_repair || partial_only_repair_full_accept) {
-                    return commit_serial_repaired_state(committed_tokens, 2, 2);
+                    return commit_serial_repaired_state(
+                        committed_tokens,
+                        static_cast<uint32_t>(draft_count));
                 }
 
                 Gemma4StepResult lookahead_step = block_step;
-                lookahead_step.greedy_token = block_greedy_tokens[1];
-                lookahead_step.greedy_logit = block_greedy_logits[1];
-                record_mtp_target_step(&trace, 2, context_sequence_len, lookahead_step);
+                lookahead_step.greedy_token = block_greedy_tokens[draft_count - 1];
+                lookahead_step.greedy_logit = block_greedy_logits[draft_count - 1];
+                record_mtp_target_step(&trace, draft_count, context_sequence_len, lookahead_step);
                 record_mtp_hidden_shape(&trace, block_hidden.get());
 
-                block_step.greedy_token = block_greedy_tokens[1];
-                block_step.greedy_logit = block_greedy_logits[1];
+                block_step.greedy_token = block_greedy_tokens[draft_count - 1];
+                block_step.greedy_logit = block_greedy_logits[draft_count - 1];
                 block_step.peak_memory_gb = std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
-                block_step.accepted_draft_count = 2;
-                block_step.committed_count = 2;
-                block_step.committed_tokens[0] = draft_tokens[0];
-                block_step.committed_tokens[1] = draft_tokens[1];
+                block_step.accepted_draft_count = static_cast<uint32_t>(draft_count);
+                block_step.committed_count = static_cast<uint32_t>(draft_count);
+                for (size_t index = 0; index < draft_count && index < GEMMA4_MTP_MAX_COMMITTED_TOKENS; ++index) {
+                    block_step.committed_tokens[index] = draft_tokens[index];
+                }
                 block_step.mtp_trace = trace;
                 attach_verify_timings(&block_step);
 
-                cache->native_tokens.push_back(draft_tokens[0]);
-                cache->native_tokens.push_back(draft_tokens[1]);
+                for (size_t index = 0; index < draft_count; ++index) {
+                    cache->native_tokens.push_back(draft_tokens[index]);
+                }
                 cache->native_kv_state = std::move(block_kv);
                 cache->last_hidden = std::move(block_hidden);
                 block_step.native_last_hidden = cache->last_hidden.get();
@@ -1905,10 +2019,22 @@ Gemma4Status verify_tokens_impl(
                 return ok();
             }
 
-            const int32_t fallback_token = block_greedy_tokens[0];
-            const int32_t committed_tokens[2] = {draft_tokens[0], fallback_token};
+            const int32_t fallback_token = block_greedy_tokens[accepted_prefix_count - 1];
+            std::vector<int32_t> committed_tokens;
+            committed_tokens.reserve(accepted_prefix_count + 1);
+            for (size_t index = 0; index < accepted_prefix_count; ++index) {
+                committed_tokens.push_back(draft_tokens[index]);
+            }
+            committed_tokens.push_back(fallback_token);
             if (serial_state_repair || partial_reject_serial_repair) {
-                return commit_serial_repaired_state(committed_tokens, 2, 1);
+                return commit_serial_repaired_state(
+                    committed_tokens,
+                    static_cast<uint32_t>(accepted_prefix_count));
+            }
+            if (accepted_prefix_count > 1) {
+                return commit_prefix_repaired_state(
+                    committed_tokens,
+                    static_cast<uint32_t>(accepted_prefix_count));
             }
 
             Gemma4StepResult fallback_step{};
@@ -1924,21 +2050,24 @@ Gemma4Status verify_tokens_impl(
             }
             verify_repair_ms += elapsed_ms(repair_started);
             fallback_step.peak_memory_gb =
-                std::max(fallback_step.peak_memory_gb, second_target_step.peak_memory_gb);
-            fallback_step.active_kv_bytes =
-                std::max(fallback_step.active_kv_bytes, prefix_kv->active_bytes());
-            record_mtp_target_step(&trace, 2, context_sequence_len, fallback_step);
+                std::max(fallback_step.peak_memory_gb, block_step.peak_memory_gb);
+            fallback_step.active_kv_bytes = prefix_kv->active_bytes();
+            record_mtp_target_step(&trace, committed_tokens.size(), context_sequence_len, fallback_step);
             record_mtp_hidden_shape(&trace, fallback_hidden.get());
 
-            fallback_step.accepted_draft_count = 1;
-            fallback_step.committed_count = 2;
-            fallback_step.committed_tokens[0] = draft_tokens[0];
-            fallback_step.committed_tokens[1] = fallback_token;
+            fallback_step.accepted_draft_count = static_cast<uint32_t>(accepted_prefix_count);
+            fallback_step.committed_count = static_cast<uint32_t>(committed_tokens.size());
+            for (size_t index = 0;
+                 index < committed_tokens.size() && index < GEMMA4_MTP_MAX_COMMITTED_TOKENS;
+                 ++index) {
+                fallback_step.committed_tokens[index] = committed_tokens[index];
+            }
             fallback_step.mtp_trace = trace;
             attach_verify_timings(&fallback_step);
 
-            cache->native_tokens.push_back(draft_tokens[0]);
-            cache->native_tokens.push_back(fallback_token);
+            for (int32_t token : committed_tokens) {
+                cache->native_tokens.push_back(token);
+            }
             cache->native_kv_state = std::move(prefix_kv);
             cache->last_hidden = std::move(fallback_hidden);
             fallback_step.native_last_hidden = cache->last_hidden.get();
@@ -2102,7 +2231,7 @@ Gemma4Status verify_tokens_impl(
         }
 
         if (!terminal_lookahead_skipped) {
-            const size_t lookahead_index = draft_count;
+            const size_t lookahead_index = committed_tail.size();
             record_mtp_target_step(&trace, lookahead_index, context_sequence_len, current_step);
             record_mtp_hidden_shape(&trace, staged_hidden.get());
         }
@@ -2121,7 +2250,9 @@ Gemma4Status verify_tokens_impl(
         out->active_kv_bytes = active_kv_bytes;
         out->accepted_draft_count = accepted_count;
         out->committed_count = static_cast<uint32_t>(committed_tail.size());
-        for (size_t index = 0; index < committed_tail.size() && index < 4; ++index) {
+        for (size_t index = 0;
+             index < committed_tail.size() && index < GEMMA4_MTP_MAX_COMMITTED_TOKENS;
+             ++index) {
             out->committed_tokens[index] = committed_tail[index];
         }
         out->mtp_trace = trace;
@@ -2155,7 +2286,13 @@ Gemma4Status gemma4_verify_tokens(
     const int32_t* draft_tokens,
     size_t draft_count,
     Gemma4StepResult* out) {
-    return verify_tokens_impl(target, cache, draft_tokens, draft_count, 0, out);
+    try {
+        return verify_tokens_impl(target, cache, draft_tokens, draft_count, 0, out);
+    } catch (const std::exception& ex) {
+        return fail(GEMMA4_ERR_RUNTIME, ex.what());
+    } catch (...) {
+        return fail(GEMMA4_ERR_RUNTIME, "gemma4_verify_tokens failed with an unknown exception");
+    }
 }
 
 Gemma4Status gemma4_verify_tokens_terminal_no_lookahead(
@@ -2165,5 +2302,13 @@ Gemma4Status gemma4_verify_tokens_terminal_no_lookahead(
     size_t draft_count,
     size_t terminal_commit_count,
     Gemma4StepResult* out) {
-    return verify_tokens_impl(target, cache, draft_tokens, draft_count, terminal_commit_count, out);
+    try {
+        return verify_tokens_impl(target, cache, draft_tokens, draft_count, terminal_commit_count, out);
+    } catch (const std::exception& ex) {
+        return fail(GEMMA4_ERR_RUNTIME, ex.what());
+    } catch (...) {
+        return fail(
+            GEMMA4_ERR_RUNTIME,
+            "gemma4_verify_tokens_terminal_no_lookahead failed with an unknown exception");
+    }
 }

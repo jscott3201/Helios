@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -18,6 +19,8 @@ pub struct BuildProvenance {
     pub dirty_diff_bytes: usize,
     pub runner_binary_path: String,
     pub runner_binary_link_mtime_unix_seconds: u64,
+    #[serde(default)]
+    pub gemma4d_env: BTreeMap<String, String>,
 }
 
 pub fn capture_build_provenance() -> Result<BuildProvenance, CliError> {
@@ -55,7 +58,20 @@ pub fn capture_build_provenance() -> Result<BuildProvenance, CliError> {
             runner_mtime,
             "runner binary link mtime",
         )?,
+        gemma4d_env: capture_gemma4d_env(env::vars()),
     })
+}
+
+fn capture_gemma4d_env<I, K, V>(vars: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    vars.into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .filter(|(key, _)| key.starts_with("GEMMA4D_"))
+        .collect()
 }
 
 fn git_toplevel() -> Result<PathBuf, CliError> {
@@ -147,7 +163,7 @@ fn system_time_unix_seconds(time: SystemTime, label: &str) -> Result<u64, CliErr
 
 #[cfg(test)]
 mod tests {
-    use super::assert_git_dirty_views_agree;
+    use super::{assert_git_dirty_views_agree, capture_gemma4d_env};
 
     #[test]
     fn dirty_views_accept_clean_tree() {
@@ -162,5 +178,18 @@ mod tests {
     #[test]
     fn dirty_views_reject_status_only_dirty_tree() {
         assert!(assert_git_dirty_views_agree("?? scratch.txt", b"").is_err());
+    }
+
+    #[test]
+    fn captures_only_gemma4d_env_vars() {
+        let env = capture_gemma4d_env([
+            ("PATH", "/bin"),
+            ("GEMMA4D_REQUIRE_MLX", "1"),
+            ("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_ROLLBACK", "1"),
+        ]);
+
+        assert_eq!(env.len(), 2);
+        assert_eq!(env.get("GEMMA4D_REQUIRE_MLX"), Some(&"1".to_owned()));
+        assert!(!env.contains_key("PATH"));
     }
 }

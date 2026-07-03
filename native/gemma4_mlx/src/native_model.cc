@@ -3189,8 +3189,11 @@ bool NativeTextModel::decode_incremental_block(
             *error = "native incremental block decode requires at least one token";
             return false;
         }
-        if (token_count > 2) {
-            *error = "native incremental block decode currently supports token_count <= 2";
+        if (token_count > GEMMA4_MTP_MAX_DRAFT_TOKENS) {
+            std::ostringstream message;
+            message << "native incremental block decode supports token_count <= "
+                    << GEMMA4_MTP_MAX_DRAFT_TOKENS;
+            *error = message.str();
             return false;
         }
         if (kv_state->impl_ == nullptr || kv_state->sequence_len() == 0) {
@@ -3289,8 +3292,11 @@ bool NativeTextModel::decode_incremental_block_with_prefix(
             *error = "native incremental block decode requires at least one token";
             return false;
         }
-        if (token_count > 2) {
-            *error = "native incremental block decode currently supports token_count <= 2";
+        if (token_count > GEMMA4_MTP_MAX_DRAFT_TOKENS) {
+            std::ostringstream message;
+            message << "native incremental block decode supports token_count <= "
+                    << GEMMA4_MTP_MAX_DRAFT_TOKENS;
+            *error = message.str();
             return false;
         }
         if (prefix_token_count == 0 || prefix_token_count > token_count) {
@@ -3485,8 +3491,10 @@ bool NativeMtpAssistantModel::draft_block(
         *error = "native MTP draft requires block_size > 0";
         return false;
     }
-    if (block_size > 2) {
-        *error = "native MTP draft currently supports block_size <= 2 for M06";
+    if (block_size > GEMMA4_MTP_MAX_DRAFT_TOKENS) {
+        std::ostringstream message;
+        message << "native MTP draft supports block_size <= " << GEMMA4_MTP_MAX_DRAFT_TOKENS;
+        *error = message.str();
         return false;
     }
     if (capacity < block_size) {
@@ -3534,9 +3542,9 @@ bool NativeMtpAssistantModel::draft_block(
         int32_t token_id = context_tokens.back();
         size_t produced = 0;
         const bool skip_final_projection = experimental_mtp_skip_final_projection_enabled();
-        const bool lazy_block2 = lazy_second_draft && block_size == 2;
+        const bool lazy_first_draft = lazy_second_draft;
         for (uint32_t step = 0; step < block_size; ++step) {
-            const bool defer_first_projection = lazy_block2 && step == 0;
+            const bool defer_first_projection = lazy_first_draft && step == 0;
             const bool need_projected_hidden =
                 (!skip_final_projection || step + 1 < block_size) && !defer_first_projection;
             NativeMtpDraftStep draft = assistant_draft_one(
