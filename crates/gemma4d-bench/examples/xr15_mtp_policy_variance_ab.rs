@@ -470,6 +470,9 @@ struct MtpRun {
     prefill_ms: f64,
     draft_ms: f64,
     verify_ms: f64,
+    verify_stage_ms: f64,
+    verify_forward_ms: f64,
+    verify_repair_ms: f64,
     fallback_decode_ms: f64,
     total_ms: f64,
     decode_phase_ms: f64,
@@ -502,6 +505,9 @@ struct MtpEvent {
     context_sequence_len: u64,
     sequence_len: u64,
     verify_ms: f64,
+    verify_stage_ms: f64,
+    verify_forward_ms: f64,
+    verify_repair_ms: f64,
     peak_memory_gb: f32,
     active_kv_bytes: u64,
     trace_position_count: u32,
@@ -680,6 +686,9 @@ fn run_mtp(
     let mut generated = Vec::with_capacity(workload.max_new_tokens);
     let mut draft_duration = Duration::ZERO;
     let mut verify_duration = Duration::ZERO;
+    let mut verify_stage_ms = 0.0_f64;
+    let mut verify_forward_ms = 0.0_f64;
+    let mut verify_repair_ms = 0.0_f64;
     let mut fallback_decode_duration = Duration::ZERO;
     let mut attempted_draft_tokens = 0_u64;
     let mut accepted_draft_tokens = 0_u64;
@@ -739,6 +748,9 @@ fn run_mtp(
         };
         let verify_elapsed = verify_started.elapsed();
         verify_duration += verify_elapsed;
+        verify_stage_ms += step.verify_stage_ms;
+        verify_forward_ms += step.verify_forward_ms;
+        verify_repair_ms += step.verify_repair_ms;
         peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
         active_kv_bytes = active_kv_bytes.max(step.active_kv_bytes);
         let committed = step.committed_tokens().to_vec();
@@ -780,6 +792,9 @@ fn run_mtp(
             context_sequence_len: step.mtp_trace.context_sequence_len,
             sequence_len: step.sequence_len,
             verify_ms: duration_ms(verify_elapsed),
+            verify_stage_ms: step.verify_stage_ms,
+            verify_forward_ms: step.verify_forward_ms,
+            verify_repair_ms: step.verify_repair_ms,
             peak_memory_gb: step.peak_memory_gb,
             active_kv_bytes: step.active_kv_bytes,
             trace_position_count: step.mtp_trace.position_count,
@@ -817,6 +832,9 @@ fn run_mtp(
         prefill_ms: duration_ms(prefill),
         draft_ms,
         verify_ms,
+        verify_stage_ms,
+        verify_forward_ms,
+        verify_repair_ms,
         fallback_decode_ms,
         total_ms: duration_ms(started.elapsed()),
         decode_phase_ms: draft_ms + verify_ms + fallback_decode_ms,
