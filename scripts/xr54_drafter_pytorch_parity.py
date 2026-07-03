@@ -17,6 +17,10 @@ import sys
 from pathlib import Path
 
 
+LOGIT_ATOL = 0.5
+MARGIN_ATOL = 0.25
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -162,7 +166,8 @@ def main() -> int:
         "matches_native_scores": {
             "pinned": scores_match(pinned, native_logits, native_margins),
             "incremented": scores_match(incremented, native_logits, native_margins),
-            "atol": 0.5,
+            "logit_atol": LOGIT_ATOL,
+            "margin_atol": MARGIN_ATOL,
         },
         "missing_state_keys": missing,
         "unexpected_state_keys": unexpected,
@@ -326,9 +331,8 @@ def scores_match(variant: dict[str, object], native_logits: list[float], native_
     logit_margins = [float(value) for value in variant.get("logit_margins", [])]
     if len(draft_logits) != len(native_logits) or len(logit_margins) != len(native_margins):
         return False
-    atol = 0.5
-    return all(abs(left - right) <= atol for left, right in zip(draft_logits, native_logits)) and all(
-        abs(left - right) <= atol for left, right in zip(logit_margins, native_margins)
+    return all(abs(left - right) <= LOGIT_ATOL for left, right in zip(draft_logits, native_logits)) and all(
+        abs(left - right) <= MARGIN_ATOL for left, right in zip(logit_margins, native_margins)
     )
 
 

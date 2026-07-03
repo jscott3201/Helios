@@ -22,6 +22,8 @@ struct NativeTopKEntry {
 
 using NativeTopKEntries = std::array<NativeTopKEntry, GEMMA4_MTP_TRACE_TOP_K>;
 
+void arm_xr57_target_logits_anchor();
+
 class NativeHiddenState {
 public:
     struct Impl;

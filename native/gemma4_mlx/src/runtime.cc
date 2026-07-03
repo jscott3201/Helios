@@ -202,6 +202,33 @@ void initialize_mtp_trace(Gemma4MtpTraceInfo* trace, uint64_t context_sequence_l
     }
 }
 
+void limit_mtp_trace_top_k(Gemma4MtpTraceInfo* trace, size_t populated_top_k) {
+    if (trace == nullptr) {
+        return;
+    }
+    const uint32_t clamped = static_cast<uint32_t>(std::max<size_t>(1, std::min<size_t>(
+        populated_top_k,
+        GEMMA4_MTP_TRACE_TOP_K)));
+    trace->top_k = trace->top_k == 0 ? clamped : std::min<uint32_t>(trace->top_k, clamped);
+}
+
+size_t valid_top_k_count(const gemma4d::NativeTopKEntries& entries) {
+    size_t count = 0;
+    while (count < GEMMA4_MTP_TRACE_TOP_K && entries[count].token_id >= 0) {
+        ++count;
+    }
+    return count;
+}
+
+size_t valid_trace_top_k_count(const Gemma4MtpTraceInfo& trace, size_t base, size_t advertised_top_k) {
+    size_t count = 0;
+    const size_t limit = std::min<size_t>(advertised_top_k, GEMMA4_MTP_TRACE_TOP_K);
+    while (count < limit && trace.top_token_ids[base + count] >= 0) {
+        ++count;
+    }
+    return count;
+}
+
 void record_mtp_target_step(
     Gemma4MtpTraceInfo* trace,
     size_t index,
@@ -223,7 +250,15 @@ void record_mtp_target_step(
     trace->target_logits[index] = step.greedy_logit;
     const size_t base = index * GEMMA4_MTP_TRACE_TOP_K;
     if (target_top_k != nullptr) {
-        for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+        const size_t populated_top_k = valid_top_k_count(*target_top_k);
+        if (populated_top_k == 0) {
+            limit_mtp_trace_top_k(trace, 1);
+            trace->top_token_ids[base] = step.greedy_token;
+            trace->top_logits[base] = step.greedy_logit;
+            return;
+        }
+        limit_mtp_trace_top_k(trace, populated_top_k);
+        for (size_t rank = 0; rank < populated_top_k; ++rank) {
             trace->top_token_ids[base + rank] = (*target_top_k)[rank].token_id;
             trace->top_logits[base + rank] = (*target_top_k)[rank].logit;
         }
@@ -246,17 +281,27 @@ void record_mtp_target_step(
             source_index = 0;
         }
         if (source_index == GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+            limit_mtp_trace_top_k(trace, 1);
             trace->top_token_ids[base] = step.greedy_token;
             trace->top_logits[base] = step.greedy_logit;
             return;
         }
         const size_t source_base = source_index * GEMMA4_MTP_TRACE_TOP_K;
-        for (size_t rank = 0; rank < source_top_k; ++rank) {
+        const size_t populated_top_k = valid_trace_top_k_count(step.mtp_trace, source_base, source_top_k);
+        if (populated_top_k == 0) {
+            limit_mtp_trace_top_k(trace, 1);
+            trace->top_token_ids[base] = step.greedy_token;
+            trace->top_logits[base] = step.greedy_logit;
+            return;
+        }
+        limit_mtp_trace_top_k(trace, populated_top_k);
+        for (size_t rank = 0; rank < populated_top_k; ++rank) {
             trace->top_token_ids[base + rank] = step.mtp_trace.top_token_ids[source_base + rank];
             trace->top_logits[base + rank] = step.mtp_trace.top_logits[source_base + rank];
         }
         return;
     }
+    limit_mtp_trace_top_k(trace, 1);
     trace->top_token_ids[base] = step.greedy_token;
     trace->top_logits[base] = step.greedy_logit;
 }
@@ -1647,6 +1692,11 @@ Gemma4Status gemma4_mtp_draft_block(
             GEMMA4_ERR_INVALID_ARGUMENT,
             "gemma4_mtp_draft_block requires score output buffers when real margins are enabled");
     }
+    if (!capture_scores && (out_logits != nullptr || out_logit_margins != nullptr)) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_mtp_draft_block score output buffers require GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1");
+    }
     if (block_size == 0) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires block_size > 0");
     }
@@ -1826,6 +1876,7 @@ Gemma4Status verify_tokens_impl(
             Gemma4StepResult fallback_step{};
             std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
             const auto forward_started = std::chrono::steady_clock::now();
+            gemma4d::arm_xr57_target_logits_anchor();
             if (!target->native_model->decode_incremental(
                     fallback_token,
                     cache->native_kv_state.get(),
@@ -1892,6 +1943,7 @@ Gemma4Status verify_tokens_impl(
             std::unique_ptr<gemma4d::NativeHiddenState> block_hidden;
             size_t retroactive_prefix_count = 0;
             const auto forward_started = std::chrono::steady_clock::now();
+            gemma4d::arm_xr57_target_logits_anchor();
             if (!target->native_model->decode_incremental_block_with_retroactive_prefix(
                     draft_tokens,
                     draft_count,
@@ -1978,6 +2030,7 @@ Gemma4Status verify_tokens_impl(
                         continue;
                     }
                     const auto forward_started = std::chrono::steady_clock::now();
+                    gemma4d::arm_xr57_target_logits_anchor();
                     if (!target->native_model->decode_incremental(
                             committed_tokens[index],
                             serial_kv.get(),
@@ -2038,6 +2091,7 @@ Gemma4Status verify_tokens_impl(
                 Gemma4StepResult fallback_step{};
                 std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
                 const auto fallback_started = std::chrono::steady_clock::now();
+                gemma4d::arm_xr57_target_logits_anchor();
                 if (!target->native_model->decode_incremental(
                         fallback_token,
                         prefix_kv.get(),
@@ -2150,6 +2204,7 @@ Gemma4Status verify_tokens_impl(
                     "native MTP block-prefix repair missing one-token accepted-prefix KV");
             }
             const auto fallback_started = std::chrono::steady_clock::now();
+            gemma4d::arm_xr57_target_logits_anchor();
             if (!target->native_model->decode_incremental(
                     fallback_token,
                     prefix_kv.get(),
@@ -2208,6 +2263,7 @@ Gemma4Status verify_tokens_impl(
             std::vector<gemma4d::NativeTopKEntries> block_target_top_k;
             std::unique_ptr<gemma4d::NativeHiddenState> block_hidden;
             const auto forward_started = std::chrono::steady_clock::now();
+            gemma4d::arm_xr57_target_logits_anchor();
             if (!target->native_model->decode_incremental_block(
                     draft_tokens,
                     draft_count,
@@ -2325,6 +2381,7 @@ Gemma4Status verify_tokens_impl(
             Gemma4StepResult next_step{};
             std::unique_ptr<gemma4d::NativeHiddenState> next_hidden;
             const auto forward_started = std::chrono::steady_clock::now();
+            gemma4d::arm_xr57_target_logits_anchor();
             if (!target->native_model->decode_incremental(
                     token_to_commit,
                     verify_kv,

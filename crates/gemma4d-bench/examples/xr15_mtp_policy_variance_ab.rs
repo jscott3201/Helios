@@ -836,6 +836,8 @@ fn run_mtp(
                 generated.push(*token);
             }
         }
+        let mut draft_in_target_top_k = step.mtp_trace.draft_in_top_k.clone();
+        draft_in_target_top_k.resize(draft.len(), false);
         events.push(MtpEvent {
             pass_index: target_verify_passes,
             block_size,
@@ -862,9 +864,9 @@ fn run_mtp(
             target_tokens: step.mtp_trace.target_tokens.clone(),
             target_top_token_ids: step.mtp_trace.top_token_ids.clone(),
             target_top_logits: step.mtp_trace.top_logits.clone(),
-            draft_logits: step.mtp_trace.draft_logits.clone(),
-            logit_margins: step.mtp_trace.logit_margins.clone(),
-            draft_in_target_top_k: step.mtp_trace.draft_in_top_k.clone(),
+            draft_logits: draft_scores.iter().map(|score| score.logit).collect(),
+            logit_margins: draft_scores.iter().map(|score| score.margin).collect(),
+            draft_in_target_top_k,
         });
 
         if let Some(zero_accept_run) = args.adaptive_zero_accept_run {

@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .into());
     }
+    ensure_real_margins_env()?;
     fs::create_dir_all(&args.out_dir)?;
 
     let payload_path = args.out_dir.join("payload.safetensors");
@@ -196,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         } else if !parity_matches_native(result) {
             blockers.push(
-                "PyTorch parity completed but pinned tokens or pinned score fields did not match native"
+                "PyTorch parity completed but pinned or incremented tokens, or pinned score fields, did not match native"
                     .to_owned(),
             );
         }
@@ -387,6 +388,36 @@ struct PythonRun {
     blocker: String,
 }
 
+fn ensure_real_margins_env() -> Result<(), CliError> {
+    const FLAG: &str = "GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS";
+    if !env_flag_enabled(FLAG) {
+        // SAFETY: this benchmark is still single-threaded at startup and sets
+        // the native capture flag before loading MLX/native state or spawning
+        // the Python parity process.
+        unsafe {
+            env::set_var(FLAG, "1");
+        }
+    }
+    if !env_flag_enabled(FLAG) {
+        return Err(CliError::Runtime(format!(
+            "{FLAG}=1 is required before XR54/XR57 score parity can request native score buffers"
+        )));
+    }
+    Ok(())
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let Ok(value) = env::var(name) else {
+        return false;
+    };
+    !value.is_empty()
+        && value != "0"
+        && value != "false"
+        && value != "FALSE"
+        && value != "off"
+        && value != "OFF"
+}
+
 fn run_python_parity(
     args: &Args,
     request_path: &Path,
@@ -572,15 +603,22 @@ fn assistant_config(args: &Args, token_count: usize) -> LoadConfig {
 }
 
 fn parity_matches_native(result: &serde_json::Value) -> bool {
-    let tokens_match = result
+    let pinned_tokens_match = result
         .get("matches_native")
         .and_then(|matches| matches.get("pinned")?.as_bool())
         .unwrap_or(false);
+    let incremented_tokens_match = result
+        .get("matches_native")
+        .and_then(|matches| matches.get("incremented")?.as_bool())
+        .unwrap_or(false);
+    // XR54 invariant: position rotation must not change argmax tokens. XR57
+    // score validation stays pinned-only because rotation perturbs BF16 score
+    // values even when argmax remains stable.
     let scores_match = result
         .get("matches_native_scores")
         .and_then(|matches| matches.get("pinned")?.as_bool())
         .unwrap_or(false);
-    tokens_match && scores_match
+    pinned_tokens_match && incremented_tokens_match && scores_match
 }
 
 fn render_report(summary: &serde_json::Value) -> String {
@@ -869,13 +907,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parity_match_guard_requires_pinned_position_mode() {
+    fn parity_match_guard_requires_both_token_modes_and_pinned_scores() {
         let ok = json!({
-            "matches_native": {"pinned": true, "incremented": false},
+            "matches_native": {"pinned": true, "incremented": true},
             "matches_native_scores": {"pinned": true, "incremented": false}
         });
-        let bad = json!({
+        let bad_pinned_tokens = json!({
             "matches_native": {"pinned": false, "incremented": true},
+            "matches_native_scores": {"pinned": true, "incremented": true}
+        });
+        let bad_incremented_tokens = json!({
+            "matches_native": {"pinned": true, "incremented": false},
             "matches_native_scores": {"pinned": true, "incremented": true}
         });
         let bad_scores = json!({
@@ -884,7 +926,8 @@ mod tests {
         });
 
         assert!(parity_matches_native(&ok));
-        assert!(!parity_matches_native(&bad));
+        assert!(!parity_matches_native(&bad_pinned_tokens));
+        assert!(!parity_matches_native(&bad_incremented_tokens));
         assert!(!parity_matches_native(&bad_scores));
     }
 }

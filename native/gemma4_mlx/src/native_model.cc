@@ -9,6 +9,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -125,6 +127,28 @@ bool is_assistant_tensor(const std::string& key) {
     return key.rfind("model.", 0) == 0 || key.rfind("pre_projection.", 0) == 0 ||
         key.rfind("post_projection.", 0) == 0;
 }
+
+bool experimental_mtp_real_margins_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+            std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+    }();
+    return enabled;
+}
+
+#ifdef GEMMA4D_MLX_AVAILABLE
+bool& xr57_target_logits_anchor_armed() {
+    static bool armed = false;
+    return armed;
+}
+
+bool& xr57_target_logits_anchor_saved() {
+    static bool saved = false;
+    return saved;
+}
+#endif
 
 #ifdef GEMMA4D_MLX_AVAILABLE
 
@@ -1647,23 +1671,13 @@ struct NativeMtpDraftStep {
     array projected_hidden;
 };
 
-NativeTopKEntries top_k_for_flat_logits(const array& flat_logits, size_t requested_k);
+NativeTopKEntries top_k_for_flat_logits(const array& flat_logits, size_t requested_k, bool allow_anchor = false);
 
 bool experimental_mtp_skip_final_projection_enabled() {
     const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_MTP_SKIP_FINAL_PROJECTION");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
         std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
         std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
-}
-
-bool experimental_mtp_real_margins_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
-            std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
-    }();
-    return enabled;
 }
 
 NativeMtpDraftStep assistant_draft_one(
@@ -1771,7 +1785,74 @@ NativeTopKEntries top_k_from_greedy(int32_t token_id, float logit) {
     return entries;
 }
 
-NativeTopKEntries top_k_for_flat_logits(const array& flat_logits, size_t requested_k) {
+void maybe_save_xr57_target_logits_anchor(
+    const array& flat_logits,
+    const NativeTopKEntries& trace_top_k,
+    size_t requested_k) {
+    if (!xr57_target_logits_anchor_armed() || xr57_target_logits_anchor_saved()) {
+        return;
+    }
+    const char* path = std::getenv("GEMMA4D_XR57_TARGET_LOGITS_ANCHOR_PATH");
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    const auto& shape = flat_logits.shape();
+    if (shape.size() != 1 || shape[0] <= 0) {
+        throw std::runtime_error("XR57 target-logits anchor expected flat logits");
+    }
+
+    const std::filesystem::path output_path(path);
+    if (output_path.has_parent_path()) {
+        std::filesystem::create_directories(output_path.parent_path());
+    }
+    array logits_f32 = to_float32(flat_logits);
+    mlx::core::eval(logits_f32);
+    const float* logits = logits_f32.data<float>();
+    const int vocab_size = shape[0];
+
+    std::ofstream out(output_path);
+    if (!out) {
+        throw std::runtime_error("failed to open XR57 target-logits anchor at " + output_path.string());
+    }
+    out << std::setprecision(9);
+    out << "{\n";
+    out << "  \"schema_version\": 1,\n";
+    out << "  \"source\": \"native_target_logits\",\n";
+    out << "  \"vocab_size\": " << vocab_size << ",\n";
+    out << "  \"requested_k\": " << requested_k << ",\n";
+    out << "  \"trace_top_token_ids\": [";
+    for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+        if (rank > 0) {
+            out << ", ";
+        }
+        out << trace_top_k[rank].token_id;
+    }
+    out << "],\n";
+    out << "  \"trace_top_logits\": [";
+    for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+        if (rank > 0) {
+            out << ", ";
+        }
+        out << trace_top_k[rank].logit;
+    }
+    out << "],\n";
+    out << "  \"logits\": [";
+    for (int index = 0; index < vocab_size; ++index) {
+        if (index > 0) {
+            out << ", ";
+        }
+        out << logits[index];
+    }
+    out << "]\n";
+    out << "}\n";
+    if (!out) {
+        throw std::runtime_error("failed to write XR57 target-logits anchor at " + output_path.string());
+    }
+    xr57_target_logits_anchor_saved() = true;
+    xr57_target_logits_anchor_armed() = false;
+}
+
+NativeTopKEntries top_k_for_flat_logits(const array& flat_logits, size_t requested_k, bool allow_anchor) {
     NativeTopKEntries result = empty_top_k_entries();
     const auto& shape = flat_logits.shape();
     if (shape.size() != 1) {
@@ -1810,6 +1891,9 @@ NativeTopKEntries top_k_for_flat_logits(const array& flat_logits, size_t request
     for (size_t index = 0; index < sorted.size(); ++index) {
         result[index] = sorted[index];
     }
+    if (allow_anchor) {
+        maybe_save_xr57_target_logits_anchor(flat_logits, result, requested_k);
+    }
     return result;
 }
 
@@ -1828,7 +1912,7 @@ std::vector<NativeTopKEntries> top_k_for_block_logits(const array& logits, size_
                 {0, static_cast<int>(index), 0},
                 {1, static_cast<int>(index + 1), vocab_size}),
             {vocab_size});
-        per_position.push_back(top_k_for_flat_logits(slot_logits, GEMMA4_MTP_TRACE_TOP_K));
+        per_position.push_back(top_k_for_flat_logits(slot_logits, GEMMA4_MTP_TRACE_TOP_K, true));
     }
     return per_position;
 }
@@ -2137,6 +2221,12 @@ array decode_encoded_tensor(
 #endif
 
 } // namespace
+
+void arm_xr57_target_logits_anchor() {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    xr57_target_logits_anchor_armed() = true;
+#endif
+}
 
 NativeHiddenState::NativeHiddenState(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
@@ -3080,7 +3170,7 @@ bool NativeTextModel::forward_greedy(
             greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
         const bool real_margins = experimental_mtp_real_margins_enabled();
         NativeTopKEntries target_top_k = real_margins
-            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K)
+            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K, true)
             : empty_top_k_entries();
         mlx::core::eval({greedy, max_logit});
         trace_parity_logits(tokens, logits);
@@ -3171,7 +3261,7 @@ bool NativeTextModel::prefill_incremental(
             greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
         const bool real_margins = experimental_mtp_real_margins_enabled();
         NativeTopKEntries target_top_k = real_margins
-            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K)
+            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K, true)
             : empty_top_k_entries();
         mlx::core::eval({greedy, max_logit});
         trace_parity_logits(tokens, logits);
@@ -3257,7 +3347,7 @@ bool NativeTextModel::decode_incremental(
             greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
         const bool real_margins = experimental_mtp_real_margins_enabled();
         NativeTopKEntries computed_top_k = real_margins
-            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K)
+            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K, true)
             : empty_top_k_entries();
         mlx::core::eval({greedy, max_logit});
 
@@ -3717,14 +3807,20 @@ bool NativeMtpAssistantModel::draft_block(
     std::string* error,
     bool lazy_second_draft,
     int32_t first_accept_token) const {
-    const bool capture_scores = experimental_mtp_real_margins_enabled();
     if (out_tokens == nullptr || inout_count == nullptr || error == nullptr) {
         return false;
     }
+    error->clear();
+    const bool capture_scores = experimental_mtp_real_margins_enabled();
     if (capture_scores && (out_logits == nullptr || out_logit_margins == nullptr)) {
+        *error = "native MTP draft requires score output buffers when real margins are enabled";
         return false;
     }
-    error->clear();
+    if (!capture_scores && (out_logits != nullptr || out_logit_margins != nullptr)) {
+        *error =
+            "native MTP draft score output buffers require GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1";
+        return false;
+    }
     const size_t capacity = *inout_count;
     *inout_count = 0;
 
