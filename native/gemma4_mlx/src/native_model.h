@@ -3,6 +3,7 @@
 #include "model_manifest.h"
 #include "gemma4_mlx.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -13,6 +14,13 @@
 namespace gemma4d {
 
 class NativeTextModel;
+
+struct NativeTopKEntry {
+    int32_t token_id = -1;
+    float logit = 0.0f;
+};
+
+using NativeTopKEntries = std::array<NativeTopKEntry, GEMMA4_MTP_TRACE_TOP_K>;
 
 class NativeHiddenState {
 public:
@@ -167,7 +175,8 @@ public:
         NativeKvState* kv_state,
         Gemma4StepResult* out,
         std::string* error,
-        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr,
+        NativeTopKEntries* target_top_k = nullptr) const;
 
     bool decode_incremental_state_only(
         int32_t token,
@@ -183,7 +192,8 @@ public:
         std::vector<int32_t>* greedy_tokens,
         std::vector<float>* greedy_logits,
         std::string* error,
-        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr,
+        std::vector<NativeTopKEntries>* target_top_k = nullptr) const;
 
     bool decode_incremental_block_with_retroactive_prefix(
         const int32_t* tokens,
@@ -195,7 +205,8 @@ public:
         std::vector<int32_t>* greedy_tokens,
         std::vector<float>* greedy_logits,
         std::string* error,
-        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr,
+        std::vector<NativeTopKEntries>* target_top_k = nullptr) const;
 
 private:
     std::unique_ptr<Impl> impl_;
@@ -232,6 +243,8 @@ public:
         const std::vector<int32_t>& context_tokens,
         uint32_t block_size,
         int32_t* out_tokens,
+        float* out_logits,
+        float* out_logit_margins,
         size_t* inout_count,
         std::string* error,
         bool lazy_second_draft = false,

@@ -14,7 +14,7 @@ use gemma4d_bench::{
 };
 use gemma4d_ffi::{
     Drafter, KvCache, KvPolicy, LoadConfig, MTP_MAX_DRAFT_TOKENS, Target, decode_one, draft_block,
-    prefill, verify_tokens, verify_tokens_terminal_no_lookahead,
+    draft_block_with_scores, prefill, verify_tokens, verify_tokens_terminal_no_lookahead,
 };
 use gemma4d_tokenizer::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         regression_gate_percent: args.regression_gate_percent,
         memory_cliff_gb: args.memory_cliff_gb,
         experimental_terminal_no_lookahead: args.experimental_terminal_no_lookahead,
+        mtp_real_margins_enabled: env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS"),
         adaptive_zero_accept_run: args.adaptive_zero_accept_run,
         adaptive_min_generated_tokens: args.adaptive_min_generated_tokens,
         low_n: args.trials < 3,
@@ -399,6 +400,7 @@ struct Summary {
     regression_gate_percent: f64,
     memory_cliff_gb: f64,
     experimental_terminal_no_lookahead: bool,
+    mtp_real_margins_enabled: bool,
     adaptive_zero_accept_run: Option<usize>,
     adaptive_min_generated_tokens: usize,
     low_n: bool,
@@ -525,6 +527,10 @@ struct MtpEvent {
     trace_top_k: u32,
     first_position: u64,
     target_tokens: Vec<i32>,
+    target_top_token_ids: Vec<Vec<i32>>,
+    target_top_logits: Vec<Vec<f32>>,
+    draft_logits: Vec<f32>,
+    logit_margins: Vec<f32>,
     draft_in_target_top_k: Vec<bool>,
 }
 
@@ -718,6 +724,7 @@ fn run_mtp(
     let mut peak_memory_gb = first.peak_memory_gb;
     let mut active_kv_bytes = first.active_kv_bytes;
     let mut events = Vec::new();
+    let real_margins_enabled = env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS");
 
     while generated.len() < workload.max_new_tokens {
         if auto_disabled {
@@ -740,11 +747,24 @@ fn run_mtp(
         let remaining = workload.max_new_tokens - generated.len();
         let current_block_size = block_size.min(remaining).max(1);
         let draft_started = Instant::now();
-        let draft = draft_block(
-            &drafter,
-            &mut cache,
-            NonZeroU32::new(current_block_size as u32).expect("block size is non-zero"),
-        )?;
+        let draft_block_size =
+            NonZeroU32::new(current_block_size as u32).expect("block size is non-zero");
+        let draft_scores = if real_margins_enabled {
+            draft_block_with_scores(&drafter, &mut cache, draft_block_size)?
+        } else {
+            draft_block(&drafter, &mut cache, draft_block_size)?
+                .into_iter()
+                .map(|token| gemma4d_ffi::DraftToken {
+                    token,
+                    logit: 0.0,
+                    margin: 0.0,
+                })
+                .collect()
+        };
+        let draft = draft_scores
+            .iter()
+            .map(|score| score.token)
+            .collect::<Vec<_>>();
         draft_duration += draft_started.elapsed();
         if draft.is_empty() {
             return Err("native MTP drafter returned no tokens".into());
@@ -840,6 +860,10 @@ fn run_mtp(
             trace_top_k: step.mtp_trace.top_k,
             first_position: step.mtp_trace.first_position,
             target_tokens: step.mtp_trace.target_tokens.clone(),
+            target_top_token_ids: step.mtp_trace.top_token_ids.clone(),
+            target_top_logits: step.mtp_trace.top_logits.clone(),
+            draft_logits: step.mtp_trace.draft_logits.clone(),
+            logit_margins: step.mtp_trace.logit_margins.clone(),
             draft_in_target_top_k: step.mtp_trace.draft_in_top_k.clone(),
         });
 
@@ -1465,6 +1489,20 @@ fn startup_blockers(args: &Args, source_replay: &Option<SourceReplaySummary>) ->
     blockers
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => {
+            !value.is_empty()
+                && value != "0"
+                && value != "false"
+                && value != "FALSE"
+                && value != "off"
+                && value != "OFF"
+        }
+        Err(_) => false,
+    }
+}
+
 fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<(), CliError> {
     let mut file = File::create(path)
         .map_err(|error| CliError::Runtime(format!("failed to create records.jsonl: {error}")))?;
@@ -1519,6 +1557,10 @@ fn render_report(summary: &Summary) -> String {
     out.push_str(&format!(
         "| Terminal no-lookahead | `{}` |\n",
         summary.experimental_terminal_no_lookahead
+    ));
+    out.push_str(&format!(
+        "| Real MTP margins/top-k | `{}` |\n",
+        summary.mtp_real_margins_enabled
     ));
     out.push_str(&format!(
         "| Adaptive zero-accept run | `{}` |\n",
@@ -1627,6 +1669,7 @@ fn measurement_notes() -> Vec<String> {
         "baseline is native non-MTP greedy decode with GEMMA4D_REQUIRE_MLX=1 and GEMMA4D_USE_NATIVE_GRAPH=1".to_owned(),
         "candidate MTP decode phase is draft_ms + verify_ms + fallback_decode_ms; model load and prefill are recorded but excluded from policy speed decisions".to_owned(),
         "terminal no-lookahead mode only calls the experimental verifier on a final draft block whose returned draft count can satisfy the remaining generation budget".to_owned(),
+        "real per-slot target top-5, drafter logits, and drafter margins are captured only when GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS is truthy; the default path records target top-1 and zero draft score fields to preserve the XR57 performance guard".to_owned(),
         "adaptive zero-accept fallback is disabled unless --adaptive-zero-accept-run is passed; when active it uses native decode_one for the remaining tail after the gate fires".to_owned(),
         "warmup records remain in records.jsonl and summary.json but policy summaries use measured records only".to_owned(),
         "each evidence summary and record stamps git SHA, dirty-diff SHA-256, dirty-diff byte count, runner binary path, and runner binary link mtime; missing provenance aborts before measurement".to_owned(),

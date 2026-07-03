@@ -80,6 +80,12 @@ struct NativeKvCache {
     std::unique_ptr<gemma4d::NativeHiddenState> last_hidden;
     bool has_last_step;
     Gemma4StepResult last_step;
+    struct PendingMtpDraftScore {
+        int32_t token = 0;
+        float logit = 0.0f;
+        float margin = 0.0f;
+    };
+    std::vector<PendingMtpDraftScore> pending_mtp_draft_scores;
 };
 
 struct NativeKvSnapshot {
@@ -140,6 +146,11 @@ bool env_flag_enabled(const char* name) {
         std::strcmp(value, "OFF") != 0;
 }
 
+bool mtp_real_margins_enabled() {
+    static const bool enabled = env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS");
+    return enabled;
+}
+
 void clear_step_result(Gemma4StepResult* out) {
     if (out != nullptr) {
         std::memset(out, 0, sizeof(Gemma4StepResult));
@@ -179,7 +190,7 @@ void initialize_mtp_trace(Gemma4MtpTraceInfo* trace, uint64_t context_sequence_l
     std::memset(trace, 0, sizeof(Gemma4MtpTraceInfo));
     trace->context_sequence_len = context_sequence_len;
     trace->first_position = context_sequence_len == 0 ? 0 : context_sequence_len - 1;
-    trace->top_k = 1;
+    trace->top_k = mtp_real_margins_enabled() ? GEMMA4_MTP_TRACE_TOP_K : 1;
     trace->full_attention_layer = 47;
     trace->sliding_attention_layer = 46;
     for (size_t index = 0; index < GEMMA4_MTP_TRACE_MAX_POSITIONS; ++index) {
@@ -195,7 +206,8 @@ void record_mtp_target_step(
     Gemma4MtpTraceInfo* trace,
     size_t index,
     uint64_t context_sequence_len,
-    const Gemma4StepResult& step) {
+    const Gemma4StepResult& step,
+    const gemma4d::NativeTopKEntries* target_top_k = nullptr) {
     if (trace == nullptr) {
         return;
     }
@@ -209,15 +221,51 @@ void record_mtp_target_step(
     trace->position_offsets[index] = (context_sequence_len == 0 ? 0 : context_sequence_len - 1) + index;
     trace->target_tokens[index] = step.greedy_token;
     trace->target_logits[index] = step.greedy_logit;
-    trace->top_token_ids[index * GEMMA4_MTP_TRACE_TOP_K] = step.greedy_token;
-    trace->top_logits[index * GEMMA4_MTP_TRACE_TOP_K] = step.greedy_logit;
+    const size_t base = index * GEMMA4_MTP_TRACE_TOP_K;
+    if (target_top_k != nullptr) {
+        for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+            trace->top_token_ids[base + rank] = (*target_top_k)[rank].token_id;
+            trace->top_logits[base + rank] = (*target_top_k)[rank].logit;
+        }
+        return;
+    }
+    if (step.mtp_trace.top_k > 0 && step.mtp_trace.position_count > 0) {
+        const size_t source_top_k = std::min<size_t>(step.mtp_trace.top_k, GEMMA4_MTP_TRACE_TOP_K);
+        const uint64_t expected_offset = step.sequence_len == 0 ? 0 : step.sequence_len - 1;
+        size_t source_index = GEMMA4_MTP_TRACE_MAX_POSITIONS;
+        for (size_t position = 0;
+             position < std::min<size_t>(step.mtp_trace.position_count, GEMMA4_MTP_TRACE_MAX_POSITIONS);
+             ++position) {
+            if (step.mtp_trace.position_offsets[position] == expected_offset &&
+                step.mtp_trace.target_tokens[position] == step.greedy_token) {
+                source_index = position;
+                break;
+            }
+        }
+        if (source_index == GEMMA4_MTP_TRACE_MAX_POSITIONS && step.mtp_trace.position_count == 1) {
+            source_index = 0;
+        }
+        if (source_index == GEMMA4_MTP_TRACE_MAX_POSITIONS) {
+            trace->top_token_ids[base] = step.greedy_token;
+            trace->top_logits[base] = step.greedy_logit;
+            return;
+        }
+        const size_t source_base = source_index * GEMMA4_MTP_TRACE_TOP_K;
+        for (size_t rank = 0; rank < source_top_k; ++rank) {
+            trace->top_token_ids[base + rank] = step.mtp_trace.top_token_ids[source_base + rank];
+            trace->top_logits[base + rank] = step.mtp_trace.top_logits[source_base + rank];
+        }
+        return;
+    }
+    trace->top_token_ids[base] = step.greedy_token;
+    trace->top_logits[base] = step.greedy_logit;
 }
 
 void record_mtp_draft_score(
     Gemma4MtpTraceInfo* trace,
     size_t index,
     int32_t draft_token,
-    const Gemma4StepResult& target_step) {
+    const NativeKvCache::PendingMtpDraftScore* draft_score) {
     if (trace == nullptr) {
         return;
     }
@@ -228,14 +276,17 @@ void record_mtp_draft_score(
         throw std::runtime_error(message.str());
     }
     trace->draft_tokens[index] = draft_token;
-    if (draft_token == target_step.greedy_token) {
-        trace->draft_logits[index] = target_step.greedy_logit;
-        trace->logit_margins[index] = 0.0f;
-        trace->draft_in_top_k[index] = true;
-    } else {
-        trace->draft_logits[index] = 0.0f;
-        trace->logit_margins[index] = target_step.greedy_logit;
-        trace->draft_in_top_k[index] = false;
+    if (draft_score != nullptr && draft_score->token == draft_token) {
+        trace->draft_logits[index] = draft_score->logit;
+        trace->logit_margins[index] = draft_score->margin;
+    }
+    const size_t base = index * GEMMA4_MTP_TRACE_TOP_K;
+    const size_t top_k = std::min<size_t>(trace->top_k, GEMMA4_MTP_TRACE_TOP_K);
+    for (size_t rank = 0; rank < top_k; ++rank) {
+        if (trace->top_token_ids[base + rank] == draft_token) {
+            trace->draft_in_top_k[index] = true;
+            break;
+        }
     }
 }
 
@@ -710,7 +761,7 @@ Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_runtime_version requires a non-null out pointer");
     }
 
-    out->abi_version = 3;
+    out->abi_version = 4;
     out->backend_name = "gemma4_mlx";
     out->backend_version = kBackendVersion;
     return ok();
@@ -1035,6 +1086,7 @@ Gemma4Status gemma4_kv_reset(Gemma4KvCache* cache) {
     cache->last_hidden.reset();
     cache->has_last_step = false;
     clear_step_result(&cache->last_step);
+    cache->pending_mtp_draft_scores.clear();
     return ok();
 }
 
@@ -1120,6 +1172,7 @@ Gemma4Status gemma4_kv_snapshot_import(Gemma4KvCache* cache, const Gemma4KvSnaps
     cache->has_last_step = snapshot->has_last_step;
     cache->last_step = snapshot->last_step;
     cache->last_step.native_last_hidden = cache->last_hidden.get();
+    cache->pending_mtp_draft_scores.clear();
     return ok();
 }
 
@@ -1334,6 +1387,7 @@ Gemma4Status gemma4_prefill(
         if (target->native_model == nullptr) {
             return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 model state is missing");
         }
+        cache->pending_mtp_draft_scores.clear();
         cache->native_tokens.assign(tokens, tokens + token_count);
         std::string native_error;
         if (!target->native_model->prefill_incremental(
@@ -1383,6 +1437,7 @@ Gemma4Status gemma4_decode_one(
         if (cache->native_kv_state == nullptr) {
             return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 incremental decode requires a prior prefill");
         }
+        cache->pending_mtp_draft_scores.clear();
         cache->native_tokens.push_back(token);
         std::string native_error;
         if (!target->native_model->decode_incremental(
@@ -1457,6 +1512,7 @@ Gemma4Status gemma4_decode_block(
         return fail(GEMMA4_ERR_RUNTIME, "native Gemma 4 block decode requires a prior prefill");
     }
 
+    cache->pending_mtp_draft_scores.clear();
     std::string native_error;
     std::vector<int32_t> greedy_tokens;
     std::vector<float> greedy_logits;
@@ -1573,6 +1629,8 @@ Gemma4Status gemma4_mtp_draft_block(
     Gemma4KvCache* cache,
     uint32_t block_size,
     int32_t* out_tokens,
+    float* out_logits,
+    float* out_logit_margins,
     size_t* inout_count) {
     if (drafter == nullptr || drafter->magic != kDrafterMagic) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires a valid drafter handle");
@@ -1580,8 +1638,14 @@ Gemma4Status gemma4_mtp_draft_block(
     if (cache == nullptr || cache->magic != kKvCacheMagic) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires a valid cache handle");
     }
+    const bool capture_scores = mtp_real_margins_enabled();
     if (out_tokens == nullptr || inout_count == nullptr) {
-        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires token output buffers");
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires token output buffer and count");
+    }
+    if (capture_scores && (out_logits == nullptr || out_logit_margins == nullptr)) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_mtp_draft_block requires score output buffers when real margins are enabled");
     }
     if (block_size == 0) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block requires block_size > 0");
@@ -1589,6 +1653,7 @@ Gemma4Status gemma4_mtp_draft_block(
     if (*inout_count < block_size) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_mtp_draft_block output buffer is smaller than block_size");
     }
+    cache->pending_mtp_draft_scores.clear();
     if (!drafter->model_loaded) {
         *inout_count = 0;
         return fail(
@@ -1629,12 +1694,26 @@ Gemma4Status gemma4_mtp_draft_block(
             cache->native_tokens,
             block_size,
             out_tokens,
+            out_logits,
+            out_logit_margins,
             inout_count,
             &native_error,
             lazy_second_draft,
             cache->last_step.greedy_token)) {
         *inout_count = 0;
+        cache->pending_mtp_draft_scores.clear();
         return fail(GEMMA4_ERR_RUNTIME, native_error);
+    }
+    cache->pending_mtp_draft_scores.clear();
+    if (out_logits != nullptr && out_logit_margins != nullptr) {
+        cache->pending_mtp_draft_scores.reserve(*inout_count);
+        for (size_t index = 0; index < *inout_count; ++index) {
+            cache->pending_mtp_draft_scores.push_back(NativeKvCache::PendingMtpDraftScore{
+                out_tokens[index],
+                out_logits[index],
+                out_logit_margins[index],
+            });
+        }
     }
     return ok();
 }
@@ -1699,6 +1778,17 @@ Gemma4Status verify_tokens_impl(
             return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, message.str());
         }
 
+        std::vector<NativeKvCache::PendingMtpDraftScore> draft_scores =
+            std::move(cache->pending_mtp_draft_scores);
+        cache->pending_mtp_draft_scores.clear();
+        auto draft_score_for =
+            [&](size_t index, int32_t token) -> const NativeKvCache::PendingMtpDraftScore* {
+            if (index >= draft_scores.size() || draft_scores[index].token != token) {
+                return nullptr;
+            }
+            return &draft_scores[index];
+        };
+
         std::string native_error;
         double verify_stage_ms = 0.0;
         double verify_forward_ms = 0.0;
@@ -1730,7 +1820,7 @@ Gemma4Status verify_tokens_impl(
             Gemma4MtpTraceInfo trace{};
             initialize_mtp_trace(&trace, context_sequence_len);
             record_mtp_target_step(&trace, 0, context_sequence_len, cache->last_step);
-            record_mtp_draft_score(&trace, 0, draft_tokens[0], cache->last_step);
+            record_mtp_draft_score(&trace, 0, draft_tokens[0], draft_score_for(0, draft_tokens[0]));
 
             const int32_t fallback_token = cache->last_step.greedy_token;
             Gemma4StepResult fallback_step{};
@@ -1798,6 +1888,7 @@ Gemma4Status verify_tokens_impl(
             Gemma4StepResult block_step{};
             std::vector<int32_t> block_greedy_tokens;
             std::vector<float> block_greedy_logits;
+            std::vector<gemma4d::NativeTopKEntries> block_target_top_k;
             std::unique_ptr<gemma4d::NativeHiddenState> block_hidden;
             size_t retroactive_prefix_count = 0;
             const auto forward_started = std::chrono::steady_clock::now();
@@ -1811,11 +1902,13 @@ Gemma4Status verify_tokens_impl(
                     &block_greedy_tokens,
                     &block_greedy_logits,
                     &native_error,
-                    &block_hidden)) {
+                    &block_hidden,
+                    &block_target_top_k)) {
                 return fail(GEMMA4_ERR_RUNTIME, native_error);
             }
             verify_forward_ms += elapsed_ms(forward_started);
-            if (block_greedy_tokens.size() < draft_count || block_greedy_logits.size() < draft_count) {
+            if (block_greedy_tokens.size() < draft_count || block_greedy_logits.size() < draft_count ||
+                block_target_top_k.size() < draft_count) {
                 return fail(GEMMA4_ERR_RUNTIME, "native MTP block-prefix verify returned incomplete target logits");
             }
 
@@ -1837,7 +1930,7 @@ Gemma4Status verify_tokens_impl(
             Gemma4MtpTraceInfo trace{};
             initialize_mtp_trace(&trace, context_sequence_len);
             record_mtp_target_step(&trace, 0, context_sequence_len, cache->last_step);
-            record_mtp_draft_score(&trace, 0, draft_tokens[0], cache->last_step);
+            record_mtp_draft_score(&trace, 0, draft_tokens[0], draft_score_for(0, draft_tokens[0]));
 
             const size_t trace_draft_count = full_block_accepted
                 ? draft_count
@@ -1850,8 +1943,8 @@ Gemma4Status verify_tokens_impl(
                 target_step.active_kv_bytes = index == 1 ? prefix_kv->active_bytes() : block_step.active_kv_bytes;
                 target_step.peak_memory_gb =
                     std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
-                record_mtp_target_step(&trace, index, context_sequence_len, target_step);
-                record_mtp_draft_score(&trace, index, draft_tokens[index], target_step);
+                record_mtp_target_step(&trace, index, context_sequence_len, target_step, &block_target_top_k[index - 1]);
+                record_mtp_draft_score(&trace, index, draft_tokens[index], draft_score_for(index, draft_tokens[index]));
             }
 
             auto commit_serial_repaired_state =
@@ -1997,7 +2090,12 @@ Gemma4Status verify_tokens_impl(
                 Gemma4StepResult lookahead_step = block_step;
                 lookahead_step.greedy_token = block_greedy_tokens[draft_count - 1];
                 lookahead_step.greedy_logit = block_greedy_logits[draft_count - 1];
-                record_mtp_target_step(&trace, draft_count, context_sequence_len, lookahead_step);
+                record_mtp_target_step(
+                    &trace,
+                    draft_count,
+                    context_sequence_len,
+                    lookahead_step,
+                    &block_target_top_k[draft_count - 1]);
                 record_mtp_hidden_shape(&trace, block_hidden.get());
 
                 block_step.greedy_token = block_greedy_tokens[draft_count - 1];
@@ -2107,6 +2205,7 @@ Gemma4Status verify_tokens_impl(
             Gemma4StepResult block_step{};
             std::vector<int32_t> block_greedy_tokens;
             std::vector<float> block_greedy_logits;
+            std::vector<gemma4d::NativeTopKEntries> block_target_top_k;
             std::unique_ptr<gemma4d::NativeHiddenState> block_hidden;
             const auto forward_started = std::chrono::steady_clock::now();
             if (!target->native_model->decode_incremental_block(
@@ -2117,11 +2216,13 @@ Gemma4Status verify_tokens_impl(
                     &block_greedy_tokens,
                     &block_greedy_logits,
                     &native_error,
-                    &block_hidden)) {
+                    &block_hidden,
+                    &block_target_top_k)) {
                 return fail(GEMMA4_ERR_RUNTIME, native_error);
             }
             verify_forward_ms += elapsed_ms(forward_started);
-            if (block_greedy_tokens.size() < draft_count || block_greedy_logits.size() < draft_count) {
+            if (block_greedy_tokens.size() < draft_count || block_greedy_logits.size() < draft_count ||
+                block_target_top_k.size() < draft_count) {
                 return fail(GEMMA4_ERR_RUNTIME, "native MTP batch verify returned incomplete target logits");
             }
 
@@ -2132,20 +2233,20 @@ Gemma4Status verify_tokens_impl(
                 initialize_mtp_trace(&trace, context_sequence_len);
 
                 record_mtp_target_step(&trace, 0, context_sequence_len, cache->last_step);
-                record_mtp_draft_score(&trace, 0, draft_tokens[0], cache->last_step);
+                record_mtp_draft_score(&trace, 0, draft_tokens[0], draft_score_for(0, draft_tokens[0]));
 
                 Gemma4StepResult second_target_step{};
                 second_target_step.greedy_token = block_greedy_tokens[0];
                 second_target_step.greedy_logit = block_greedy_logits[0];
                 second_target_step.sequence_len = context_sequence_len + 1;
                 second_target_step.active_kv_bytes = block_kv->active_bytes();
-                record_mtp_target_step(&trace, 1, context_sequence_len, second_target_step);
-                record_mtp_draft_score(&trace, 1, draft_tokens[1], second_target_step);
+                record_mtp_target_step(&trace, 1, context_sequence_len, second_target_step, &block_target_top_k[0]);
+                record_mtp_draft_score(&trace, 1, draft_tokens[1], draft_score_for(1, draft_tokens[1]));
 
                 Gemma4StepResult lookahead_step = block_step;
                 lookahead_step.greedy_token = block_greedy_tokens[1];
                 lookahead_step.greedy_logit = block_greedy_logits[1];
-                record_mtp_target_step(&trace, 2, context_sequence_len, lookahead_step);
+                record_mtp_target_step(&trace, 2, context_sequence_len, lookahead_step, &block_target_top_k[1]);
                 record_mtp_hidden_shape(&trace, block_hidden.get());
 
                 block_step.greedy_token = block_greedy_tokens[1];
@@ -2206,7 +2307,7 @@ Gemma4Status verify_tokens_impl(
 
         for (size_t index = 0; index < draft_count; ++index) {
             record_mtp_target_step(&trace, index, context_sequence_len, current_step);
-            record_mtp_draft_score(&trace, index, draft_tokens[index], current_step);
+            record_mtp_draft_score(&trace, index, draft_tokens[index], draft_score_for(index, draft_tokens[index]));
 
             const bool accepted = draft_tokens[index] == current_step.greedy_token;
             const int32_t token_to_commit = accepted ? draft_tokens[index] : current_step.greedy_token;

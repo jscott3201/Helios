@@ -1542,6 +1542,14 @@ int64_t target_embedding_vocab_size(const NativeTextModel::Impl& impl) {
     return static_cast<int64_t>(shape[0]);
 }
 
+int64_t assistant_embedding_vocab_size(const NativeMtpAssistantModel::Impl& impl) {
+    const auto& shape = tensor_or_throw(impl, "model.embed_tokens.weight").shape();
+    if (shape.empty()) {
+        throw std::runtime_error("assistant embedding weight has no vocab dimension");
+    }
+    return static_cast<int64_t>(shape[0]);
+}
+
 array assistant_logits(const NativeMtpAssistantModel::Impl& impl, const array& h) {
     const QuantizationSpec embed_quantization = quantization_for(impl, "model.embed_tokens");
     array logits = mlx::core::quantized_matmul(
@@ -1554,7 +1562,7 @@ array assistant_logits(const NativeMtpAssistantModel::Impl& impl, const array& h
         static_cast<int>(embed_quantization.bits),
         "affine");
     logits = model_dtype(logits);
-    return mlx::core::reshape(logits, {262144});
+    return mlx::core::reshape(logits, {static_cast<int>(assistant_embedding_vocab_size(impl))});
 }
 
 bool assistant_layer_full_attention(uint32_t layer_idx) {
@@ -1634,14 +1642,28 @@ array assistant_layer_forward(
 
 struct NativeMtpDraftStep {
     int32_t token = 0;
+    float logit = 0.0f;
+    float margin = 0.0f;
     array projected_hidden;
 };
+
+NativeTopKEntries top_k_for_flat_logits(const array& flat_logits, size_t requested_k);
 
 bool experimental_mtp_skip_final_projection_enabled() {
     const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_MTP_SKIP_FINAL_PROJECTION");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
         std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
         std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
+bool experimental_mtp_real_margins_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+            std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+    }();
+    return enabled;
 }
 
 NativeMtpDraftStep assistant_draft_one(
@@ -1666,14 +1688,21 @@ NativeMtpDraftStep assistant_draft_one(
 
     array logits = assistant_logits(assistant, h);
     array greedy = mlx::core::argmax(logits);
+    float top_logit = 0.0f;
+    float margin = 0.0f;
+    if (experimental_mtp_real_margins_enabled()) {
+        NativeTopKEntries draft_top_k = top_k_for_flat_logits(logits, 2);
+        top_logit = draft_top_k[0].logit;
+        margin = top_logit - draft_top_k[1].logit;
+    }
     if (!need_projected_hidden) {
         mlx::core::eval(greedy);
-        return NativeMtpDraftStep{greedy.item<int>(), std::move(h)};
+        return NativeMtpDraftStep{greedy.item<int>(), top_logit, margin, std::move(h)};
     }
     array projected = quantized_linear(assistant, h, "post_projection");
     mlx::core::eval({greedy, projected});
 
-    return NativeMtpDraftStep{greedy.item<int>(), std::move(projected)};
+    return NativeMtpDraftStep{greedy.item<int>(), top_logit, margin, std::move(projected)};
 }
 
 bool trace_parity_logits_enabled() {
@@ -1725,6 +1754,114 @@ array greedy_logit_for_vector_logits(const array& logits, const array& greedy, b
         return to_float32(mlx::core::take(logits, greedy, 0));
     }
     return to_float32(mlx::core::max(logits));
+}
+
+NativeTopKEntries empty_top_k_entries() {
+    NativeTopKEntries entries{};
+    for (auto& entry : entries) {
+        entry.token_id = -1;
+        entry.logit = 0.0f;
+    }
+    return entries;
+}
+
+NativeTopKEntries top_k_from_greedy(int32_t token_id, float logit) {
+    NativeTopKEntries entries = empty_top_k_entries();
+    entries[0] = NativeTopKEntry{token_id, logit};
+    return entries;
+}
+
+NativeTopKEntries top_k_for_flat_logits(const array& flat_logits, size_t requested_k) {
+    NativeTopKEntries result = empty_top_k_entries();
+    const auto& shape = flat_logits.shape();
+    if (shape.size() != 1) {
+        throw std::runtime_error("native top-k trace expects flat logits");
+    }
+    const int vocab_size = shape[0];
+    if (vocab_size <= 0) {
+        throw std::runtime_error("native top-k trace received empty logits");
+    }
+    const size_t k = std::min<size_t>(requested_k, GEMMA4_MTP_TRACE_TOP_K);
+    if (k == 0 || k > static_cast<size_t>(vocab_size)) {
+        throw std::runtime_error("native top-k trace requested an invalid k");
+    }
+
+    const int partition_start = vocab_size - static_cast<int>(k);
+    array partition = mlx::core::argpartition(flat_logits, partition_start);
+    array top_ids = mlx::core::astype(
+        mlx::core::slice(partition, {partition_start}, {vocab_size}),
+        mlx::core::int32);
+    array top_logits = to_float32(mlx::core::take(flat_logits, top_ids, 0));
+    mlx::core::eval({top_ids, top_logits});
+
+    const int* id_data = top_ids.data<int>();
+    const float* logit_data = top_logits.data<float>();
+    std::vector<NativeTopKEntry> sorted;
+    sorted.reserve(k);
+    for (size_t index = 0; index < k; ++index) {
+        sorted.push_back(NativeTopKEntry{id_data[index], logit_data[index]});
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const NativeTopKEntry& left, const NativeTopKEntry& right) {
+        if (left.logit == right.logit) {
+            return left.token_id < right.token_id;
+        }
+        return left.logit > right.logit;
+    });
+    for (size_t index = 0; index < sorted.size(); ++index) {
+        result[index] = sorted[index];
+    }
+    return result;
+}
+
+std::vector<NativeTopKEntries> top_k_for_block_logits(const array& logits, size_t token_count) {
+    const auto& shape = logits.shape();
+    if (shape.size() != 3 || shape[0] != 1 || shape[1] < static_cast<int>(token_count)) {
+        throw std::runtime_error("native block top-k trace received unexpected logits shape");
+    }
+    const int vocab_size = shape[2];
+    std::vector<NativeTopKEntries> per_position;
+    per_position.reserve(token_count);
+    for (size_t index = 0; index < token_count; ++index) {
+        array slot_logits = mlx::core::reshape(
+            mlx::core::slice(
+                logits,
+                {0, static_cast<int>(index), 0},
+                {1, static_cast<int>(index + 1), vocab_size}),
+            {vocab_size});
+        per_position.push_back(top_k_for_flat_logits(slot_logits, GEMMA4_MTP_TRACE_TOP_K));
+    }
+    return per_position;
+}
+
+void initialize_single_target_trace(Gemma4MtpTraceInfo* trace, uint64_t sequence_len, uint32_t top_k) {
+    std::memset(trace, 0, sizeof(Gemma4MtpTraceInfo));
+    trace->context_sequence_len = sequence_len;
+    trace->first_position = sequence_len == 0 ? 0 : sequence_len - 1;
+    trace->position_count = 1;
+    trace->top_k = std::min<uint32_t>(top_k, GEMMA4_MTP_TRACE_TOP_K);
+    trace->full_attention_layer = 47;
+    trace->sliding_attention_layer = 46;
+    for (size_t index = 0; index < GEMMA4_MTP_TRACE_MAX_POSITIONS; ++index) {
+        trace->draft_tokens[index] = -1;
+        trace->target_tokens[index] = -1;
+        for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+            trace->top_token_ids[index * GEMMA4_MTP_TRACE_TOP_K + rank] = -1;
+        }
+    }
+}
+
+void populate_single_target_trace(Gemma4StepResult* out, const NativeTopKEntries& top_k, uint32_t top_k_count) {
+    if (out == nullptr) {
+        return;
+    }
+    initialize_single_target_trace(&out->mtp_trace, out->sequence_len, top_k_count);
+    out->mtp_trace.position_offsets[0] = out->sequence_len == 0 ? 0 : out->sequence_len - 1;
+    out->mtp_trace.target_tokens[0] = out->greedy_token;
+    out->mtp_trace.target_logits[0] = out->greedy_logit;
+    for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
+        out->mtp_trace.top_token_ids[rank] = top_k[rank].token_id;
+        out->mtp_trace.top_logits[rank] = top_k[rank].logit;
+    }
 }
 
 void trace_parity_logits(const std::vector<int32_t>& tokens, const array& logits) {
@@ -2941,6 +3078,10 @@ bool NativeTextModel::forward_greedy(
         array greedy = mlx::core::argmax(logits);
         array max_logit =
             greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
+        const bool real_margins = experimental_mtp_real_margins_enabled();
+        NativeTopKEntries target_top_k = real_margins
+            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K)
+            : empty_top_k_entries();
         mlx::core::eval({greedy, max_logit});
         trace_parity_logits(tokens, logits);
 
@@ -2964,6 +3105,10 @@ bool NativeTextModel::forward_greedy(
         out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
         out->peak_rss_mb = 0.0f;
         out->native_last_hidden = hidden.get();
+        if (!real_margins) {
+            target_top_k = top_k_from_greedy(out->greedy_token, out->greedy_logit);
+        }
+        populate_single_target_trace(out, target_top_k, real_margins ? GEMMA4_MTP_TRACE_TOP_K : 1);
         if (last_hidden != nullptr) {
             *last_hidden = std::move(hidden);
         }
@@ -3024,6 +3169,10 @@ bool NativeTextModel::prefill_incremental(
         array greedy = mlx::core::argmax(logits);
         array max_logit =
             greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
+        const bool real_margins = experimental_mtp_real_margins_enabled();
+        NativeTopKEntries target_top_k = real_margins
+            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K)
+            : empty_top_k_entries();
         mlx::core::eval({greedy, max_logit});
         trace_parity_logits(tokens, logits);
 
@@ -3048,6 +3197,10 @@ bool NativeTextModel::prefill_incremental(
         out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
         out->peak_rss_mb = 0.0f;
         out->native_last_hidden = hidden.get();
+        if (!real_margins) {
+            target_top_k = top_k_from_greedy(out->greedy_token, out->greedy_logit);
+        }
+        populate_single_target_trace(out, target_top_k, real_margins ? GEMMA4_MTP_TRACE_TOP_K : 1);
         *kv_state = std::move(state);
         if (last_hidden != nullptr) {
             *last_hidden = std::move(hidden);
@@ -3068,7 +3221,8 @@ bool NativeTextModel::decode_incremental(
     NativeKvState* kv_state,
     Gemma4StepResult* out,
     std::string* error,
-    std::unique_ptr<NativeHiddenState>* last_hidden) const {
+    std::unique_ptr<NativeHiddenState>* last_hidden,
+    NativeTopKEntries* target_top_k) const {
     if (out == nullptr || error == nullptr || kv_state == nullptr) {
         return false;
     }
@@ -3101,6 +3255,10 @@ bool NativeTextModel::decode_incremental(
         array greedy = mlx::core::argmax(logits);
         array max_logit =
             greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
+        const bool real_margins = experimental_mtp_real_margins_enabled();
+        NativeTopKEntries computed_top_k = real_margins
+            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K)
+            : empty_top_k_entries();
         mlx::core::eval({greedy, max_logit});
 
         std::unique_ptr<NativeHiddenState> hidden;
@@ -3124,6 +3282,13 @@ bool NativeTextModel::decode_incremental(
         out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
         out->peak_rss_mb = 0.0f;
         out->native_last_hidden = hidden.get();
+        if (!real_margins) {
+            computed_top_k = top_k_from_greedy(out->greedy_token, out->greedy_logit);
+        }
+        populate_single_target_trace(out, computed_top_k, real_margins ? GEMMA4_MTP_TRACE_TOP_K : 1);
+        if (target_top_k != nullptr) {
+            *target_top_k = computed_top_k;
+        }
         if (last_hidden != nullptr) {
             *last_hidden = std::move(hidden);
         }
@@ -3191,7 +3356,8 @@ bool NativeTextModel::decode_incremental_block(
     std::vector<int32_t>* greedy_tokens,
     std::vector<float>* greedy_logits,
     std::string* error,
-    std::unique_ptr<NativeHiddenState>* last_hidden) const {
+    std::unique_ptr<NativeHiddenState>* last_hidden,
+    std::vector<NativeTopKEntries>* target_top_k) const {
     if (out == nullptr || greedy_tokens == nullptr || greedy_logits == nullptr || error == nullptr || kv_state == nullptr) {
         return false;
     }
@@ -3235,6 +3401,11 @@ bool NativeTextModel::decode_incremental_block(
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits, -1);
         array max_logits = to_float32(mlx::core::max(logits, -1));
+        const bool real_margins = experimental_mtp_real_margins_enabled();
+        std::vector<NativeTopKEntries> computed_top_k;
+        if (real_margins) {
+            computed_top_k = top_k_for_block_logits(logits, token_count);
+        }
         mlx::core::eval({greedy, max_logits, forward.last_hidden});
 
         const int* token_data = greedy.data<int>();
@@ -3244,6 +3415,12 @@ bool NativeTextModel::decode_incremental_block(
         for (size_t index = 0; index < token_count; ++index) {
             greedy_tokens->push_back(token_data[index]);
             greedy_logits->push_back(logit_data[index]);
+        }
+        if (!real_margins) {
+            computed_top_k.reserve(token_count);
+            for (size_t index = 0; index < token_count; ++index) {
+                computed_top_k.push_back(top_k_from_greedy((*greedy_tokens)[index], (*greedy_logits)[index]));
+            }
         }
 
         std::unique_ptr<NativeHiddenState> hidden;
@@ -3267,6 +3444,9 @@ bool NativeTextModel::decode_incremental_block(
         out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
         out->peak_rss_mb = 0.0f;
         out->native_last_hidden = hidden.get();
+        if (target_top_k != nullptr) {
+            *target_top_k = std::move(computed_top_k);
+        }
         if (last_hidden != nullptr) {
             *last_hidden = std::move(hidden);
         }
@@ -3291,7 +3471,8 @@ bool NativeTextModel::decode_incremental_block_with_retroactive_prefix(
     std::vector<int32_t>* greedy_tokens,
     std::vector<float>* greedy_logits,
     std::string* error,
-    std::unique_ptr<NativeHiddenState>* last_hidden) const {
+    std::unique_ptr<NativeHiddenState>* last_hidden,
+    std::vector<NativeTopKEntries>* target_top_k) const {
     if (out == nullptr || greedy_tokens == nullptr || greedy_logits == nullptr || error == nullptr ||
         kv_state == nullptr || prefix_kv_state == nullptr || out_accepted_prefix_count == nullptr) {
         return false;
@@ -3348,6 +3529,11 @@ bool NativeTextModel::decode_incremental_block_with_retroactive_prefix(
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits, -1);
         array max_logits = to_float32(mlx::core::max(logits, -1));
+        const bool real_margins = experimental_mtp_real_margins_enabled();
+        std::vector<NativeTopKEntries> computed_top_k;
+        if (real_margins) {
+            computed_top_k = top_k_for_block_logits(logits, token_count);
+        }
         mlx::core::eval({greedy, max_logits, forward.last_hidden});
 
         const int* token_data = greedy.data<int>();
@@ -3357,6 +3543,12 @@ bool NativeTextModel::decode_incremental_block_with_retroactive_prefix(
         for (size_t index = 0; index < token_count; ++index) {
             greedy_tokens->push_back(token_data[index]);
             greedy_logits->push_back(logit_data[index]);
+        }
+        if (!real_margins) {
+            computed_top_k.reserve(token_count);
+            for (size_t index = 0; index < token_count; ++index) {
+                computed_top_k.push_back(top_k_from_greedy((*greedy_tokens)[index], (*greedy_logits)[index]));
+            }
         }
 
         size_t accepted_prefix_count = 1;
@@ -3395,6 +3587,9 @@ bool NativeTextModel::decode_incremental_block_with_retroactive_prefix(
         out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
         out->peak_rss_mb = 0.0f;
         out->native_last_hidden = hidden.get();
+        if (target_top_k != nullptr) {
+            *target_top_k = std::move(computed_top_k);
+        }
         if (last_hidden != nullptr) {
             *last_hidden = std::move(hidden);
         }
@@ -3516,11 +3711,17 @@ bool NativeMtpAssistantModel::draft_block(
     const std::vector<int32_t>& context_tokens,
     uint32_t block_size,
     int32_t* out_tokens,
+    float* out_logits,
+    float* out_logit_margins,
     size_t* inout_count,
     std::string* error,
     bool lazy_second_draft,
     int32_t first_accept_token) const {
+    const bool capture_scores = experimental_mtp_real_margins_enabled();
     if (out_tokens == nullptr || inout_count == nullptr || error == nullptr) {
+        return false;
+    }
+    if (capture_scores && (out_logits == nullptr || out_logit_margins == nullptr)) {
         return false;
     }
     error->clear();
@@ -3556,6 +3757,8 @@ bool NativeMtpAssistantModel::draft_block(
     (void)context_tokens;
     (void)block_size;
     (void)out_tokens;
+    (void)out_logits;
+    (void)out_logit_margins;
     *error = "native Gemma 4 MTP assistant was requested, but gemma4_mlx was not built with MLX";
     return false;
 #else
@@ -3581,6 +3784,10 @@ bool NativeMtpAssistantModel::draft_block(
         array current_hidden = last_hidden.impl_->hidden;
         int32_t token_id = context_tokens.back();
         size_t produced = 0;
+        std::array<float, GEMMA4_MTP_MAX_DRAFT_TOKENS> scratch_logits{};
+        std::array<float, GEMMA4_MTP_MAX_DRAFT_TOKENS> scratch_margins{};
+        float* logits_out = out_logits == nullptr ? scratch_logits.data() : out_logits;
+        float* margins_out = out_logit_margins == nullptr ? scratch_margins.data() : out_logit_margins;
         const bool skip_final_projection = experimental_mtp_skip_final_projection_enabled();
         const bool lazy_first_draft = lazy_second_draft;
         for (uint32_t step = 0; step < block_size; ++step) {
@@ -3599,6 +3806,8 @@ bool NativeMtpAssistantModel::draft_block(
                 static_cast<int>(first_position),
                 need_projected_hidden);
             out_tokens[produced++] = draft.token;
+            logits_out[produced - 1] = draft.logit;
+            margins_out[produced - 1] = draft.margin;
             if (defer_first_projection && draft.token != first_accept_token) {
                 break;
             }

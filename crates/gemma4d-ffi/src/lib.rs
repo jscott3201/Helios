@@ -312,6 +312,8 @@ mod raw {
             cache: *mut Gemma4KvCache,
             block_size: u32,
             out_tokens: *mut i32,
+            out_logits: *mut f32,
+            out_logit_margins: *mut f32,
             inout_count: *mut usize,
         ) -> Gemma4Status;
         pub fn gemma4_verify_tokens(
@@ -333,6 +335,13 @@ mod raw {
 }
 
 pub const MTP_MAX_DRAFT_TOKENS: usize = raw::GEMMA4_MTP_MAX_DRAFT_TOKENS;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftToken {
+    pub token: i32,
+    pub logit: f32,
+    pub margin: f32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -1093,18 +1102,57 @@ pub fn draft_block(
 ) -> Result<Vec<i32>> {
     let mut tokens = vec![0; usize::try_from(block_size.get()).expect("u32 fits usize")];
     let mut count = tokens.len();
-    // SAFETY: handles come from safe wrappers; `tokens` is writable and `count` starts at capacity.
+    // SAFETY: handles come from safe wrappers; score buffers are null to request the token-only
+    // default path, and `count` starts at output capacity.
     check(unsafe {
         raw::gemma4_mtp_draft_block(
             drafter.ptr.as_ptr(),
             cache.ptr.as_ptr(),
             block_size.get(),
             tokens.as_mut_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
             &mut count,
         )
     })?;
     tokens.truncate(count);
     Ok(tokens)
+}
+
+pub fn draft_block_with_scores(
+    drafter: &Drafter<'_>,
+    cache: &mut KvCache,
+    block_size: NonZeroU32,
+) -> Result<Vec<DraftToken>> {
+    let mut tokens = vec![0; usize::try_from(block_size.get()).expect("u32 fits usize")];
+    let mut logits = vec![0.0; tokens.len()];
+    let mut margins = vec![0.0; tokens.len()];
+    let mut count = tokens.len();
+    // SAFETY: handles come from safe wrappers; output buffers share capacity and `count` starts at capacity.
+    check(unsafe {
+        raw::gemma4_mtp_draft_block(
+            drafter.ptr.as_ptr(),
+            cache.ptr.as_ptr(),
+            block_size.get(),
+            tokens.as_mut_ptr(),
+            logits.as_mut_ptr(),
+            margins.as_mut_ptr(),
+            &mut count,
+        )
+    })?;
+    tokens.truncate(count);
+    logits.truncate(count);
+    margins.truncate(count);
+    Ok(tokens
+        .into_iter()
+        .zip(logits)
+        .zip(margins)
+        .map(|((token, logit), margin)| DraftToken {
+            token,
+            logit,
+            margin,
+        })
+        .collect())
 }
 
 pub fn verify_tokens(
@@ -1232,9 +1280,15 @@ mod tests {
     #[test]
     fn runtime_version_reports_smoke_backend() {
         let version = runtime_version().expect("runtime version should be available");
-        assert_eq!(version.abi_version, 3);
+        assert_eq!(version.abi_version, 4);
         assert_eq!(version.backend_name, "gemma4_mlx");
         assert!(version.backend_version.starts_with("m03-"));
+    }
+
+    #[test]
+    fn mtp_trace_raw_layout_stays_pinned() {
+        assert_eq!(std::mem::size_of::<raw::Gemma4MtpTraceInfo>(), 1328);
+        assert_eq!(std::mem::align_of::<raw::Gemma4MtpTraceInfo>(), 8);
     }
 
     #[test]
@@ -1566,6 +1620,8 @@ mod tests {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
+                ptr::null_mut(),
+                ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             )
