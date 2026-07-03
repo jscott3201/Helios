@@ -17,6 +17,11 @@ DEFAULT_EXPECTED_WORKLOADS = (
     "mtp_candidate_1k_001",
 )
 GUARDED_POLICY = "net_latency_guarded_5pct"
+REPAIR_SUBTIMER_KEYS = (
+    "repair_clone_ms",
+    "repair_forward_ms",
+    "repair_fallback_ms",
+)
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -77,6 +82,12 @@ def percent(numerator: float, denominator: float) -> float:
 
 def fmt_float(value: float, digits: int = 3) -> str:
     return f"{value:.{digits}f}"
+
+
+def fmt_repair_subtimer(row: dict[str, Any], key: str) -> str:
+    if not row["repair_subtimers_captured"]:
+        return "not captured (pre-ABI-v3)"
+    return fmt_float(float(row[key]), 1)
 
 
 def required_float(
@@ -151,7 +162,7 @@ def exactness_failures(records: list[dict[str, Any]]) -> list[str]:
     return failures
 
 
-def provenance_failures(records: list[dict[str, Any]]) -> list[str]:
+def provenance_failures(records: list[dict[str, Any]], require_gemma4d_env: bool) -> list[str]:
     failures: list[str] = []
     for record in records:
         provenance = record.get("build_provenance") or {}
@@ -164,6 +175,8 @@ def provenance_failures(records: list[dict[str, Any]]) -> list[str]:
             failures.append(f"{key}: missing build_provenance.runner_binary_path")
         if provenance.get("runner_binary_link_mtime_unix_seconds") in (None, 0):
             failures.append(f"{key}: missing build_provenance.runner_binary_link_mtime_unix_seconds")
+        if require_gemma4d_env and not provenance.get("gemma4d_env"):
+            failures.append(f"{key}: missing build_provenance.gemma4d_env")
     return failures
 
 
@@ -254,6 +267,30 @@ def aggregate_blocks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         verify_ms = sum(float(record["mtp"]["verify_ms"]) for record in block_records)
         verify_forward_ms = sum(float(record["mtp"]["verify_forward_ms"]) for record in block_records)
         verify_repair_ms = sum(float(record["mtp"]["verify_repair_ms"]) for record in block_records)
+        repair_subtimer_presence = [
+            all(key in record["mtp"] for key in REPAIR_SUBTIMER_KEYS)
+            for record in block_records
+        ]
+        repair_subtimers_captured = all(repair_subtimer_presence)
+        if any(repair_subtimer_presence) and not repair_subtimers_captured:
+            raise SystemExit(
+                f"block {block_size}: repair sub-timer fields are present on only some measured records"
+            )
+        repair_clone_ms = (
+            sum(float(record["mtp"]["repair_clone_ms"]) for record in block_records)
+            if repair_subtimers_captured
+            else None
+        )
+        repair_forward_ms = (
+            sum(float(record["mtp"]["repair_forward_ms"]) for record in block_records)
+            if repair_subtimers_captured
+            else None
+        )
+        repair_fallback_ms = (
+            sum(float(record["mtp"]["repair_fallback_ms"]) for record in block_records)
+            if repair_subtimers_captured
+            else None
+        )
         attempted = sum(int(record["mtp"]["attempted_draft_tokens"]) for record in block_records)
         accepted = sum(int(record["mtp"]["accepted_draft_tokens"]) for record in block_records)
         verify_passes = sum(int(record["mtp"]["target_verify_passes"]) for record in block_records)
@@ -313,6 +350,10 @@ def aggregate_blocks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "verify_ms": verify_ms,
                 "verify_forward_ms": verify_forward_ms,
                 "verify_repair_ms": verify_repair_ms,
+                "repair_clone_ms": repair_clone_ms,
+                "repair_forward_ms": repair_forward_ms,
+                "repair_fallback_ms": repair_fallback_ms,
+                "repair_subtimers_captured": repair_subtimers_captured,
                 "draft_step_verify_units": safe_ratio(draft_ms_per_attempt, verify_ms_per_pass),
                 "peak_mlx_gb": peak_mlx_gb,
                 "baseline_peak_gb": baseline_peak_gb,
@@ -382,7 +423,7 @@ def render_markdown(
     else:
         env_line = "not captured; env stamping postdates these XR55 legs"
     lines = [
-        "# XR55 N-Block MTP Evidence",
+        "# N-Block MTP Evidence",
         "",
         f"- Candidate records: `{candidate_path}`",
         f"- Candidate summary: `{candidate_summary_path}`",
@@ -396,14 +437,15 @@ def render_markdown(
         "",
         "## Block Sweep",
         "",
-        "| N | measured | exact | speedup % | acceptance | tokens/verify | accepted/verify | draft ms | verify ms | verify forward ms | verify repair ms | draft-step verify units | peak MLX GB | full-N events |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| N | measured | exact | speedup % | acceptance | tokens/verify | accepted/verify | draft ms | verify ms | verify forward ms | verify repair ms | repair clone ms | repair forward ms | repair fallback ms | draft-step verify units | peak MLX GB | full-N events |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in block_rows:
         lines.append(
             "| {block_size} | {records} | {exact_records} | {speedup} | {acceptance} | "
             "{tokens_per_verify} | {accepted_per_verify} | {draft_ms} | {verify_ms} | "
-            "{verify_forward_ms} | {verify_repair_ms} | {draft_units} | {peak_mlx} | {full_len_events} |".format(
+            "{verify_forward_ms} | {verify_repair_ms} | {repair_clone_ms} | {repair_forward_ms} | "
+            "{repair_fallback_ms} | {draft_units} | {peak_mlx} | {full_len_events} |".format(
                 block_size=row["block_size"],
                 records=row["records"],
                 exact_records=row["exact_records"],
@@ -415,6 +457,9 @@ def render_markdown(
                 verify_ms=fmt_float(row["verify_ms"], 1),
                 verify_forward_ms=fmt_float(row["verify_forward_ms"], 1),
                 verify_repair_ms=fmt_float(row["verify_repair_ms"], 1),
+                repair_clone_ms=fmt_repair_subtimer(row, "repair_clone_ms"),
+                repair_forward_ms=fmt_repair_subtimer(row, "repair_forward_ms"),
+                repair_fallback_ms=fmt_repair_subtimer(row, "repair_fallback_ms"),
                 draft_units=fmt_float(row["draft_step_verify_units"], 3),
                 peak_mlx=fmt_float(row["peak_mlx_gb"], 3),
                 full_len_events=row["full_len_events"],
@@ -516,6 +561,7 @@ def main() -> None:
     parser.add_argument("--expected-workload-ids", default=",".join(DEFAULT_EXPECTED_WORKLOADS))
     parser.add_argument("--min-measured-trials", type=int, default=3)
     parser.add_argument("--memory-cliff-gb", type=float)
+    parser.add_argument("--require-gemma4d-env", action="store_true")
     parser.add_argument("--out-md", required=True, type=Path)
     parser.add_argument("--out-json", type=Path)
     args = parser.parse_args()
@@ -547,7 +593,7 @@ def main() -> None:
         )
     )
     exactness_issues = exactness_failures(candidate_records)
-    provenance_issues = provenance_failures(candidate_records)
+    provenance_issues = provenance_failures(candidate_records, args.require_gemma4d_env)
     memory_issues = memory_failures(candidate_records, memory_cliff_gb)
     trace_issues = trace_failures(candidate_records)
     full_block_issues = full_block_event_failures(candidate_records, max(expected_blocks))
@@ -566,6 +612,7 @@ def main() -> None:
         "expected_workloads": expected_workloads,
         "min_measured_trials": args.min_measured_trials,
         "memory_cliff_gb": memory_cliff_gb,
+        "require_gemma4d_env": args.require_gemma4d_env,
         "blocks": block_rows,
         "block_issues": block_issues,
         "workload_trial_issues": workload_trial_issues,

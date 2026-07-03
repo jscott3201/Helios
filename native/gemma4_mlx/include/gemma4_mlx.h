@@ -118,6 +118,9 @@ typedef struct Gemma4StepResult {
     double verify_stage_ms;
     double verify_forward_ms;
     double verify_repair_ms;
+    double repair_clone_ms;
+    double repair_forward_ms;
+    double repair_fallback_ms;
     uint32_t accepted_draft_count;
     uint32_t committed_count;
     int32_t committed_tokens[GEMMA4_MTP_MAX_COMMITTED_TOKENS];

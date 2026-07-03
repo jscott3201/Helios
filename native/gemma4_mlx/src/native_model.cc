@@ -376,6 +376,22 @@ struct SharedKvArrays {
     std::optional<array> sliding_attention_value;
 };
 
+struct BlockPrefixSourceLayer {
+    bool full_attention = false;
+    int n_kv_heads = 0;
+    int head_dim = 0;
+    int previous_key_len = 0;
+    int attention_key_len = 0;
+    std::optional<array> attention_keys;
+    std::optional<array> attention_values;
+};
+
+struct BlockPrefixSources {
+    uint64_t previous_sequence_len = 0;
+    size_t token_count = 0;
+    std::vector<BlockPrefixSourceLayer> layers;
+};
+
 enum class PrefillKvEvalMode {
     PerLayer,
     EndOfPrefill,
@@ -829,8 +845,7 @@ array target_attention_decode_block_forward(
     int block_len,
     NativeKvState::Impl::Layer* target_kv,
     SharedKvArrays* shared_kv,
-    NativeKvState::Impl::Layer* prefix_kv = nullptr,
-    int prefix_token_count = 0) {
+    BlockPrefixSourceLayer* prefix_source = nullptr) {
     if (target_kv == nullptr || !target_kv->key.has_value() || !target_kv->value.has_value()) {
         throw std::runtime_error("native incremental block decode requires materialized per-layer KV state");
     }
@@ -885,6 +900,15 @@ array target_attention_decode_block_forward(
         throw std::runtime_error("native incremental block decode produced malformed KV key shape");
     }
     const int attention_key_len = attention_key_shape[2];
+    if (prefix_source != nullptr) {
+        prefix_source->full_attention = full_attention;
+        prefix_source->n_kv_heads = n_kv_heads;
+        prefix_source->head_dim = head_dim;
+        prefix_source->previous_key_len = previous_key_len;
+        prefix_source->attention_key_len = attention_key_len;
+        prefix_source->attention_keys = attention_keys;
+        prefix_source->attention_values = attention_values;
+    }
     if (!full_attention && attention_key_len > kSlidingWindowSize) {
         stored_keys = mlx::core::slice(
             attention_keys,
@@ -894,26 +918,6 @@ array target_attention_decode_block_forward(
             attention_values,
             {0, 0, attention_key_len - kSlidingWindowSize, 0},
             {1, n_kv_heads, attention_key_len, head_dim});
-    }
-    if (prefix_kv != nullptr && prefix_token_count > 0) {
-        const int prefix_key_len = previous_key_len + prefix_token_count;
-        if (prefix_key_len <= 0 || prefix_key_len > attention_key_len) {
-            throw std::runtime_error("native incremental block prefix KV length is invalid");
-        }
-        const int prefix_start =
-            (!full_attention && prefix_key_len > kSlidingWindowSize) ? prefix_key_len - kSlidingWindowSize : 0;
-        prefix_kv->full_attention = full_attention;
-        prefix_kv->key = mlx::core::slice(
-            attention_keys,
-            {0, 0, prefix_start, 0},
-            {1, n_kv_heads, prefix_key_len, head_dim});
-        prefix_kv->value = mlx::core::slice(
-            attention_values,
-            {0, 0, prefix_start, 0},
-            {1, n_kv_heads, prefix_key_len, head_dim});
-        if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
-            mlx::core::eval({*prefix_kv->key, *prefix_kv->value});
-        }
     }
     target_kv->full_attention = full_attention;
     target_kv->key = stored_keys;
@@ -987,8 +991,7 @@ array target_layer_decode_block_forward(
     int block_len,
     NativeKvState::Impl::Layer* target_kv,
     SharedKvArrays* shared_kv,
-    NativeKvState::Impl::Layer* prefix_kv = nullptr,
-    int prefix_token_count = 0) {
+    BlockPrefixSourceLayer* prefix_source = nullptr) {
     const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
     const array residual = x;
 
@@ -1004,8 +1007,7 @@ array target_layer_decode_block_forward(
         block_len,
         target_kv,
         shared_kv,
-        prefix_kv,
-        prefix_token_count);
+        prefix_source);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
@@ -1171,15 +1173,14 @@ struct NativeForwardArrays {
     array logits;
     array last_hidden;
     SharedKvArrays shared_kv;
+    BlockPrefixSources prefix_sources;
 };
 
 NativeHiddenArrays decode_block_hidden(
     const NativeTextModel::Impl& impl,
     const int32_t* tokens,
     size_t token_count,
-    NativeKvState::Impl* target_kv,
-    NativeKvState::Impl* prefix_kv = nullptr,
-    size_t prefix_token_count = 0) {
+    NativeKvState::Impl* target_kv) {
     if (target_kv == nullptr || target_kv->sequence_len == 0 || target_kv->layers.size() != kTargetLayerCount) {
         throw std::runtime_error("native incremental block decode requires a populated target KV cache");
     }
@@ -1192,30 +1193,15 @@ NativeHiddenArrays decode_block_hidden(
     if (target_kv->sequence_len + token_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("native incremental block decode position exceeds MLX shape limits");
     }
-    if (prefix_kv != nullptr && (prefix_token_count == 0 || prefix_token_count > token_count)) {
-        throw std::runtime_error("native incremental block decode prefix token count is invalid");
-    }
 
     const uint64_t previous_sequence_len = target_kv->sequence_len;
     const int block_len = static_cast<int>(token_count);
-    const int prefix_len = static_cast<int>(prefix_token_count);
     std::vector<int32_t> ids(tokens, tokens + token_count);
     array token_ids(ids.begin(), {1, block_len}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
-    if (prefix_kv != nullptr) {
-        prefix_kv->layers.clear();
-        prefix_kv->layers.reserve(kTargetLayerCount);
-        prefix_kv->sequence_len = 0;
-        prefix_kv->active_bytes = 0;
-    }
 
     for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
-        NativeKvState::Impl::Layer* prefix_layer = nullptr;
-        if (prefix_kv != nullptr) {
-            prefix_kv->layers.emplace_back();
-            prefix_layer = &prefix_kv->layers.back();
-        }
         h = target_layer_decode_block_forward(
             impl,
             h,
@@ -1223,9 +1209,7 @@ NativeHiddenArrays decode_block_hidden(
             previous_sequence_len,
             block_len,
             &target_kv->layers[layer],
-            &shared_kv,
-            prefix_layer,
-            prefix_len);
+            &shared_kv);
     }
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -1234,11 +1218,6 @@ NativeHiddenArrays decode_block_hidden(
     eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
     target_kv->sequence_len = previous_sequence_len + token_count;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
-    if (prefix_kv != nullptr) {
-        eval_deferred_decode_kv(prefix_kv, decode_kv_eval_mode());
-        prefix_kv->sequence_len = previous_sequence_len + prefix_token_count;
-        prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
-    }
     return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
 }
 
@@ -1432,8 +1411,7 @@ NativeForwardArrays decode_block_logits(
     const int32_t* tokens,
     size_t token_count,
     NativeKvState::Impl* target_kv,
-    NativeKvState::Impl* prefix_kv = nullptr,
-    size_t prefix_token_count = 0) {
+    BlockPrefixSources* prefix_sources = nullptr) {
     if (target_kv == nullptr || target_kv->sequence_len == 0 || target_kv->layers.size() != kTargetLayerCount) {
         throw std::runtime_error("native incremental block decode requires a populated target KV cache");
     }
@@ -1446,29 +1424,25 @@ NativeForwardArrays decode_block_logits(
     if (target_kv->sequence_len + token_count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("native incremental block decode position exceeds MLX shape limits");
     }
-    if (prefix_kv != nullptr && (prefix_token_count == 0 || prefix_token_count > token_count)) {
-        throw std::runtime_error("native incremental block decode prefix token count is invalid");
-    }
 
     const uint64_t previous_sequence_len = target_kv->sequence_len;
     const int block_len = static_cast<int>(token_count);
-    const int prefix_len = static_cast<int>(prefix_token_count);
     std::vector<int32_t> ids(tokens, tokens + token_count);
     array token_ids(ids.begin(), {1, block_len}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
-    if (prefix_kv != nullptr) {
-        prefix_kv->layers.clear();
-        prefix_kv->layers.reserve(kTargetLayerCount);
-        prefix_kv->sequence_len = 0;
-        prefix_kv->active_bytes = 0;
+    if (prefix_sources != nullptr) {
+        prefix_sources->previous_sequence_len = previous_sequence_len;
+        prefix_sources->token_count = token_count;
+        prefix_sources->layers.clear();
+        prefix_sources->layers.reserve(kTargetLayerCount);
     }
 
     for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
-        NativeKvState::Impl::Layer* prefix_layer = nullptr;
-        if (prefix_kv != nullptr) {
-            prefix_kv->layers.emplace_back();
-            prefix_layer = &prefix_kv->layers.back();
+        BlockPrefixSourceLayer* prefix_source_layer = nullptr;
+        if (prefix_sources != nullptr) {
+            prefix_sources->layers.emplace_back();
+            prefix_source_layer = &prefix_sources->layers.back();
         }
         h = target_layer_decode_block_forward(
             impl,
@@ -1478,8 +1452,7 @@ NativeForwardArrays decode_block_logits(
             block_len,
             &target_kv->layers[layer],
             &shared_kv,
-            prefix_layer,
-            prefix_len);
+            prefix_source_layer);
     }
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -1491,12 +1464,68 @@ NativeForwardArrays decode_block_logits(
     eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
     target_kv->sequence_len = previous_sequence_len + token_count;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
-    if (prefix_kv != nullptr) {
-        eval_deferred_decode_kv(prefix_kv, decode_kv_eval_mode());
-        prefix_kv->sequence_len = previous_sequence_len + prefix_token_count;
-        prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
+    BlockPrefixSources captured_sources;
+    if (prefix_sources != nullptr) {
+        captured_sources = std::move(*prefix_sources);
     }
-    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(shared_kv)};
+    return NativeForwardArrays{
+        std::move(logits),
+        std::move(last_hidden),
+        std::move(shared_kv),
+        std::move(captured_sources)};
+}
+
+void materialize_block_prefix_kv(
+    const BlockPrefixSources& sources,
+    size_t prefix_token_count,
+    NativeKvState::Impl* prefix_kv) {
+    if (prefix_kv == nullptr) {
+        throw std::runtime_error("native incremental block prefix materialization requires output KV state");
+    }
+    if (prefix_token_count == 0 || prefix_token_count > sources.token_count) {
+        throw std::runtime_error("native incremental block prefix materialization count is invalid");
+    }
+    if (sources.layers.size() != kTargetLayerCount) {
+        throw std::runtime_error("native incremental block prefix materialization has incomplete layer sources");
+    }
+
+    prefix_kv->layers.clear();
+    prefix_kv->layers.reserve(kTargetLayerCount);
+    const DecodeKvEvalMode mode = decode_kv_eval_mode();
+    for (const BlockPrefixSourceLayer& source : sources.layers) {
+        if (!source.attention_keys.has_value() || !source.attention_values.has_value()) {
+            throw std::runtime_error("native incremental block prefix materialization has missing source tensors");
+        }
+        if (prefix_token_count > static_cast<size_t>(std::numeric_limits<int>::max() - source.previous_key_len)) {
+            throw std::runtime_error("native incremental block prefix materialization length exceeds MLX limits");
+        }
+        const int prefix_key_len = source.previous_key_len + static_cast<int>(prefix_token_count);
+        if (prefix_key_len <= 0 || prefix_key_len > source.attention_key_len) {
+            throw std::runtime_error("native incremental block prefix materialization KV length is invalid");
+        }
+        const int prefix_start = (!source.full_attention && prefix_key_len > kSlidingWindowSize)
+            ? prefix_key_len - kSlidingWindowSize
+            : 0;
+
+        prefix_kv->layers.emplace_back();
+        NativeKvState::Impl::Layer& layer = prefix_kv->layers.back();
+        layer.full_attention = source.full_attention;
+        layer.key = mlx::core::slice(
+            *source.attention_keys,
+            {0, 0, prefix_start, 0},
+            {1, source.n_kv_heads, prefix_key_len, source.head_dim});
+        layer.value = mlx::core::slice(
+            *source.attention_values,
+            {0, 0, prefix_start, 0},
+            {1, source.n_kv_heads, prefix_key_len, source.head_dim});
+        if (eval_decode_kv_when_stored(mode, source.full_attention)) {
+            mlx::core::eval({*layer.key, *layer.value});
+        }
+    }
+
+    eval_deferred_decode_kv(prefix_kv, mode);
+    prefix_kv->sequence_len = sources.previous_sequence_len + prefix_token_count;
+    prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
 }
 
 array target_token_embedding(const NativeTextModel::Impl& impl, int32_t token_id) {
@@ -3252,22 +3281,23 @@ bool NativeTextModel::decode_incremental_block(
 #endif
 }
 
-bool NativeTextModel::decode_incremental_block_with_prefix(
+bool NativeTextModel::decode_incremental_block_with_retroactive_prefix(
     const int32_t* tokens,
     size_t token_count,
-    size_t prefix_token_count,
     NativeKvState* kv_state,
     NativeKvState* prefix_kv_state,
+    size_t* out_accepted_prefix_count,
     Gemma4StepResult* out,
     std::vector<int32_t>* greedy_tokens,
     std::vector<float>* greedy_logits,
     std::string* error,
     std::unique_ptr<NativeHiddenState>* last_hidden) const {
     if (out == nullptr || greedy_tokens == nullptr || greedy_logits == nullptr || error == nullptr ||
-        kv_state == nullptr || prefix_kv_state == nullptr) {
+        kv_state == nullptr || prefix_kv_state == nullptr || out_accepted_prefix_count == nullptr) {
         return false;
     }
     *out = Gemma4StepResult{};
+    *out_accepted_prefix_count = 0;
     greedy_tokens->clear();
     greedy_logits->clear();
     error->clear();
@@ -3279,7 +3309,6 @@ bool NativeTextModel::decode_incremental_block_with_prefix(
 #ifndef GEMMA4D_MLX_AVAILABLE
     (void)tokens;
     (void)token_count;
-    (void)prefix_token_count;
     *error = "native Gemma 4 graph was requested, but gemma4_mlx was not built with MLX";
     return false;
 #else
@@ -3299,10 +3328,6 @@ bool NativeTextModel::decode_incremental_block_with_prefix(
             *error = message.str();
             return false;
         }
-        if (prefix_token_count == 0 || prefix_token_count > token_count) {
-            *error = "native incremental block decode prefix token count is invalid";
-            return false;
-        }
         if (kv_state->impl_ == nullptr || kv_state->sequence_len() == 0) {
             *error = "native incremental block decode requires a prior native prefill";
             return false;
@@ -3313,13 +3338,13 @@ bool NativeTextModel::decode_incremental_block_with_prefix(
         }
 
         mlx::core::reset_peak_memory();
+        BlockPrefixSources prefix_sources;
         NativeForwardArrays forward = decode_block_logits(
             *impl_,
             tokens,
             token_count,
             kv_state->impl_.get(),
-            prefix_kv_state->impl_.get(),
-            prefix_token_count);
+            &prefix_sources);
         array logits = std::move(forward.logits);
         array greedy = mlx::core::argmax(logits, -1);
         array max_logits = to_float32(mlx::core::max(logits, -1));
@@ -3332,6 +3357,21 @@ bool NativeTextModel::decode_incremental_block_with_prefix(
         for (size_t index = 0; index < token_count; ++index) {
             greedy_tokens->push_back(token_data[index]);
             greedy_logits->push_back(logit_data[index]);
+        }
+
+        size_t accepted_prefix_count = 1;
+        for (size_t index = 1; index < token_count; ++index) {
+            if (tokens[index] != (*greedy_tokens)[index - 1]) {
+                break;
+            }
+            ++accepted_prefix_count;
+        }
+        *out_accepted_prefix_count = accepted_prefix_count;
+        if (accepted_prefix_count < token_count) {
+            materialize_block_prefix_kv(
+                forward.prefix_sources,
+                accepted_prefix_count,
+                prefix_kv_state->impl_.get());
         }
 
         std::unique_ptr<NativeHiddenState> hidden;

@@ -166,6 +166,9 @@ mod raw {
         pub verify_stage_ms: f64,
         pub verify_forward_ms: f64,
         pub verify_repair_ms: f64,
+        pub repair_clone_ms: f64,
+        pub repair_forward_ms: f64,
+        pub repair_fallback_ms: f64,
         pub accepted_draft_count: u32,
         pub committed_count: u32,
         pub committed_tokens: [i32; GEMMA4_MTP_MAX_COMMITTED_TOKENS],
@@ -912,6 +915,9 @@ pub struct StepResult {
     pub verify_stage_ms: f64,
     pub verify_forward_ms: f64,
     pub verify_repair_ms: f64,
+    pub repair_clone_ms: f64,
+    pub repair_forward_ms: f64,
+    pub repair_fallback_ms: f64,
     pub accepted_draft_count: u32,
     pub committed_count: u32,
     pub committed_tokens: [i32; raw::GEMMA4_MTP_MAX_COMMITTED_TOKENS],
@@ -938,6 +944,9 @@ impl From<raw::Gemma4StepResult> for StepResult {
             verify_stage_ms: value.verify_stage_ms,
             verify_forward_ms: value.verify_forward_ms,
             verify_repair_ms: value.verify_repair_ms,
+            repair_clone_ms: value.repair_clone_ms,
+            repair_forward_ms: value.repair_forward_ms,
+            repair_fallback_ms: value.repair_fallback_ms,
             accepted_draft_count: value.accepted_draft_count,
             committed_count: value
                 .committed_count
@@ -1223,7 +1232,7 @@ mod tests {
     #[test]
     fn runtime_version_reports_smoke_backend() {
         let version = runtime_version().expect("runtime version should be available");
-        assert_eq!(version.abi_version, 2);
+        assert_eq!(version.abi_version, 3);
         assert_eq!(version.backend_name, "gemma4_mlx");
         assert!(version.backend_version.starts_with("m03-"));
     }

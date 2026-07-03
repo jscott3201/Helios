@@ -478,6 +478,9 @@ struct MtpRun {
     verify_stage_ms: f64,
     verify_forward_ms: f64,
     verify_repair_ms: f64,
+    repair_clone_ms: f64,
+    repair_forward_ms: f64,
+    repair_fallback_ms: f64,
     fallback_decode_ms: f64,
     total_ms: f64,
     decode_phase_ms: f64,
@@ -513,6 +516,9 @@ struct MtpEvent {
     verify_stage_ms: f64,
     verify_forward_ms: f64,
     verify_repair_ms: f64,
+    repair_clone_ms: f64,
+    repair_forward_ms: f64,
+    repair_fallback_ms: f64,
     peak_memory_gb: f32,
     active_kv_bytes: u64,
     trace_position_count: u32,
@@ -694,6 +700,9 @@ fn run_mtp(
     let mut verify_stage_ms = 0.0_f64;
     let mut verify_forward_ms = 0.0_f64;
     let mut verify_repair_ms = 0.0_f64;
+    let mut repair_clone_ms = 0.0_f64;
+    let mut repair_forward_ms = 0.0_f64;
+    let mut repair_fallback_ms = 0.0_f64;
     let mut fallback_decode_duration = Duration::ZERO;
     let mut attempted_draft_tokens = 0_u64;
     let mut accepted_draft_tokens = 0_u64;
@@ -756,6 +765,9 @@ fn run_mtp(
         verify_stage_ms += step.verify_stage_ms;
         verify_forward_ms += step.verify_forward_ms;
         verify_repair_ms += step.verify_repair_ms;
+        repair_clone_ms += step.repair_clone_ms;
+        repair_forward_ms += step.repair_forward_ms;
+        repair_fallback_ms += step.repair_fallback_ms;
         peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
         active_kv_bytes = active_kv_bytes.max(step.active_kv_bytes);
         let committed = step.committed_tokens().to_vec();
@@ -819,6 +831,9 @@ fn run_mtp(
             verify_stage_ms: step.verify_stage_ms,
             verify_forward_ms: step.verify_forward_ms,
             verify_repair_ms: step.verify_repair_ms,
+            repair_clone_ms: step.repair_clone_ms,
+            repair_forward_ms: step.repair_forward_ms,
+            repair_fallback_ms: step.repair_fallback_ms,
             peak_memory_gb: step.peak_memory_gb,
             active_kv_bytes: step.active_kv_bytes,
             trace_position_count: step.mtp_trace.position_count,
@@ -859,6 +874,9 @@ fn run_mtp(
         verify_stage_ms,
         verify_forward_ms,
         verify_repair_ms,
+        repair_clone_ms,
+        repair_forward_ms,
+        repair_fallback_ms,
         fallback_decode_ms,
         total_ms: duration_ms(started.elapsed()),
         decode_phase_ms: draft_ms + verify_ms + fallback_decode_ms,
@@ -1535,11 +1553,11 @@ fn render_report(summary: &Summary) -> String {
     out.push('\n');
 
     out.push_str("## Records\n\n");
-    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Fallback decode ms | Speedup % | Accepted/Attempted | Terminal skips | Auto disabled | Peak GB | Status |\n");
-    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|---:|---|\n");
+    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Fallback decode ms | Repair clone ms | Repair forward ms | Repair fallback ms | Speedup % | Accepted/Attempted | Terminal skips | Auto disabled | Peak GB | Status |\n");
+    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|\n");
     for record in &summary.records {
         out.push_str(&format!(
-            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {:.3} | {}/{} | {} | `{}` | {:.3} | `{}` |\n",
+            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {}/{} | {} | `{}` | {:.3} | `{}` |\n",
             record.workload_id,
             record.trial_kind,
             record.trial_index,
@@ -1548,6 +1566,9 @@ fn render_report(summary: &Summary) -> String {
             record.baseline.decode_ms,
             record.mtp.decode_phase_ms,
             record.mtp.fallback_decode_ms,
+            record.mtp.repair_clone_ms,
+            record.mtp.repair_forward_ms,
+            record.mtp.repair_fallback_ms,
             speedup_percent(record.baseline.decode_ms, record.mtp.decode_phase_ms),
             record.mtp.accepted_draft_tokens,
             record.mtp.attempted_draft_tokens,
