@@ -15,9 +15,7 @@ use gemma4d_adapters::{
     AdapterCompatibility, AdapterRegistry, AdapterSummary, ImportedAdapter, TrustedPathPolicy,
 };
 use gemma4d_ffi::{self as ffi, KvCache, KvPolicy, LoadConfig, PrefillChunkPolicy, Target};
-use http::{
-    PERSISTENT_NATIVE_GATE_ENV, ServerBackend, ServerConfig, parse_bind_addr, serve_blocking,
-};
+use http::{ServerBackend, ServerConfig, parse_bind_addr, serve_blocking};
 
 pub const CRATE_NAME: &str = "gemma4d-server";
 pub(crate) const NATIVE_GRAPH_ENV: &str = "GEMMA4D_USE_NATIVE_GRAPH";
@@ -274,6 +272,7 @@ where
     let mut args = args.into_iter().map(Into::into).peekable();
     let mut bind_addr = ServerConfig::default().bind_addr;
     let mut backend = ServerConfig::default().backend;
+    let mut backend_explicit = false;
     let mut model_path = None;
     let mut max_context_tokens = ServerConfig::default().max_context_tokens;
     let mut memory_budget_mb = ServerConfig::default().memory_budget_bytes / (1024 * 1024);
@@ -287,12 +286,15 @@ where
             "--backend" => {
                 let value = required_value(&mut args, "--backend")?;
                 backend = parse_server_backend(&value)?;
+                backend_explicit = true;
             }
             "--real-helper" => {
                 backend = ServerBackend::RealHelper;
+                backend_explicit = true;
             }
             "--persistent-native" => {
                 backend = ServerBackend::PersistentNative;
+                backend_explicit = true;
             }
             "--model-path" => {
                 model_path = Some(PathBuf::from(required_value(&mut args, "--model-path")?));
@@ -325,12 +327,11 @@ where
         }
     }
 
+    if model_path.is_some() && !backend_explicit {
+        backend = ServerBackend::PersistentNative;
+    }
+
     match backend {
-        ServerBackend::Stub if model_path.is_some() => {
-            return Err(CliError::Usage(
-                "--model-path requires --backend real-helper or persistent-native".to_owned(),
-            ));
-        }
         ServerBackend::RealHelper | ServerBackend::PersistentNative if model_path.is_none() => {
             return Err(CliError::Usage(format!(
                 "serve --backend {} requires --model-path",
@@ -338,14 +339,6 @@ where
             )));
         }
         _ => {}
-    }
-
-    if backend == ServerBackend::PersistentNative
-        && env::var(PERSISTENT_NATIVE_GATE_ENV).ok().as_deref() != Some("1")
-    {
-        return Err(CliError::Usage(format!(
-            "serve --backend persistent-native requires {PERSISTENT_NATIVE_GATE_ENV}=1"
-        )));
     }
 
     Ok(ServeOptions {
@@ -357,12 +350,20 @@ where
     })
 }
 
-pub fn serve(options: ServeOptions) -> Result<(), CliError> {
+pub fn config_from_serve_options(options: ServeOptions) -> ServerConfig {
     let mut config = ServerConfig::localhost_default().with_bind_addr(options.bind_addr);
     config.backend = options.backend;
-    config.model_path = options.model_path;
+    config.model_path = options.model_path.clone();
     config.max_context_tokens = options.max_context_tokens;
     config.memory_budget_bytes = options.memory_budget_mb.saturating_mul(1024 * 1024);
+    if matches!(options.backend, ServerBackend::PersistentNative) && options.model_path.is_some() {
+        config.admission_prefill_chunked = native_server_default_prefill_chunk_policy().is_some();
+    }
+    config
+}
+
+pub fn serve(options: ServeOptions) -> Result<(), CliError> {
+    let config = config_from_serve_options(options);
     serve_blocking(config)
         .map_err(|error| CliError::Runtime(format!("OpenAI-compatible server failed: {error}")))
 }
@@ -929,7 +930,7 @@ fn usage() -> String {
 }
 
 fn serve_usage() -> String {
-    "usage: gemma4d serve [--bind 127.0.0.1:8080] [--backend stub|real-helper|persistent-native --model-path PATH] [--max-context-tokens N] [--memory-budget-mb N]"
+    "usage: gemma4d serve [--bind 127.0.0.1:8080] [--model-path PATH] [--backend stub|real-helper|persistent-native] [--max-context-tokens N] [--memory-budget-mb N]"
         .to_owned()
 }
 
@@ -1097,11 +1098,53 @@ mod tests {
     }
 
     #[test]
+    fn serve_parse_model_path_defaults_to_persistent_native() {
+        let options =
+            parse_serve_options(["--model-path", "/tmp/gemma4d-model"]).expect("serve options");
+
+        assert_eq!(options.backend, ServerBackend::PersistentNative);
+        assert_eq!(
+            options.model_path,
+            Some(PathBuf::from("/tmp/gemma4d-model"))
+        );
+    }
+
+    #[test]
+    fn serve_parse_explicit_stub_keeps_model_path_opt_out() {
+        let options =
+            parse_serve_options(["--backend", "stub", "--model-path", "/tmp/gemma4d-model"])
+                .expect("serve options");
+
+        assert_eq!(options.backend, ServerBackend::Stub);
+        assert_eq!(
+            options.model_path,
+            Some(PathBuf::from("/tmp/gemma4d-model"))
+        );
+    }
+
+    #[test]
     fn serve_parse_requires_model_path_for_real_helper() {
         let err =
             parse_serve_options(["--backend", "real-helper"]).expect_err("model path required");
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("--model-path"));
+    }
+
+    #[test]
+    fn serve_parse_requires_model_path_for_persistent_native_without_gate() {
+        let err = parse_serve_options(["--backend", "persistent-native"])
+            .expect_err("model path required");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--model-path"));
+
+        let options = parse_serve_options([
+            "--backend",
+            "persistent-native",
+            "--model-path",
+            "/tmp/gemma4d-model",
+        ])
+        .expect("persistent native no longer requires an env gate");
+        assert_eq!(options.backend, ServerBackend::PersistentNative);
     }
 
     #[test]

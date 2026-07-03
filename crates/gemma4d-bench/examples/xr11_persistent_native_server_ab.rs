@@ -14,9 +14,10 @@ use std::{
 };
 
 use gemma4d_bench::manifest;
-use gemma4d_server::http::{
-    PERSISTENT_NATIVE_GATE_ENV, ServerBackend, ServerConfig, ServerRuntime, http_request,
-    serve_listener,
+use gemma4d_server::{
+    config_from_serve_options,
+    http::{ServerBackend, ServerConfig, ServerRuntime, http_request, serve_listener},
+    parse_serve_options,
 };
 use gemma4d_tokenizer::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ const GOAL: &str = "XR11-persistent-native-server-ab";
 const DEFAULT_OUT_DIR: &str = "benchmarks/out/XR11-persistent-native-server-ab";
 const DEFAULT_MODEL: &str = "artifacts/models/gemma-4-12B-it-4bit";
 const DEFAULT_WORKLOADS: &str = "benchmarks/workloads/real-contexts/workloads.jsonl";
-const MODE: &str = "server_real_helper_vs_persistent_native_real_contexts";
+const MODE: &str = "server_real_helper_vs_default_persistent_native_real_contexts";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse()?;
@@ -179,10 +180,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         records: records.clone(),
         measurement_notes: vec![
             "Baseline uses ServerBackend::RealHelper over a localhost TcpListener and pays target load inside each HTTP request.",
-            "Candidate uses ServerBackend::PersistentNative over a localhost TcpListener; a worker thread owns one ResidentTarget and creates fresh KV per request.",
+            "Candidate is built from parse_serve_options with --model-path and no --backend flag; XR53 defaults that path to ServerBackend::PersistentNative.",
+            "The persistent-native worker owns one ResidentTarget and creates fresh KV per request.",
             "The benchmark compares response text and generated token ids from gemma4d_metrics.generated_token_ids.",
             "Tokenizer and detokenizer helper costs remain in request handling for both backends; XR11 only evaluates target-load residency.",
-            "The persistent server CLI path is gated by GEMMA4D_EXPERIMENTAL_PERSISTENT_SERVER=1.",
         ],
     };
 
@@ -570,11 +571,7 @@ fn start_server(
     let addr = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
-    let mut config = ServerConfig::localhost_default().with_bind_addr(addr);
-    config.backend = backend;
-    config.model_path = Some(args.model_path.clone());
-    config.max_context_tokens = args.max_context_tokens;
-    config.memory_budget_bytes = args.memory_budget_mb.saturating_mul(1024 * 1024);
+    let config = server_config_from_args(args, backend, addr)?;
     let runtime = ServerRuntime::new(config);
     let handle = thread::spawn(move || serve_listener(listener, runtime, server_shutdown));
     wait_for_health(addr)?;
@@ -583,6 +580,36 @@ fn start_server(
         shutdown,
         handle: Some(handle),
     })
+}
+
+fn server_config_from_args(
+    args: &Args,
+    backend: ServerBackend,
+    addr: std::net::SocketAddr,
+) -> Result<ServerConfig, Box<dyn std::error::Error>> {
+    let mut serve_args = vec![
+        "--bind".to_owned(),
+        addr.to_string(),
+        "--model-path".to_owned(),
+        args.model_path.display().to_string(),
+        "--max-context-tokens".to_owned(),
+        args.max_context_tokens.to_string(),
+        "--memory-budget-mb".to_owned(),
+        args.memory_budget_mb.to_string(),
+    ];
+    if backend == ServerBackend::RealHelper {
+        serve_args.extend(["--backend".to_owned(), "real-helper".to_owned()]);
+    }
+    let config = config_from_serve_options(parse_serve_options(serve_args)?);
+    if config.backend != backend {
+        return Err(format!(
+            "parsed server backend mismatch: expected {}, got {}",
+            backend.as_str(),
+            config.backend.as_str()
+        )
+        .into());
+    }
+    Ok(config)
 }
 
 fn wait_for_health(addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
@@ -1055,8 +1082,9 @@ fn capture_relevant_environment() -> BTreeMap<String, Option<String>> {
     [
         "GEMMA4D_REQUIRE_MLX",
         "GEMMA4D_USE_NATIVE_GRAPH",
+        "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS",
+        "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY",
         "GEMMA4D_MLX_LM_PYTHON",
-        PERSISTENT_NATIVE_GATE_ENV,
     ]
     .into_iter()
     .map(|key| (key.to_owned(), env::var(key).ok()))

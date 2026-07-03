@@ -44,9 +44,26 @@ Add an explicit experimental backend named `persistent-native`:
 - Performance claims must come from XR11 artifacts under
   `benchmarks/out/XR11-persistent-native-server-ab/`.
 
+## Amendment: XR53 default model-path serving
+
+Date: 2026-07-03
+
+XR53 promotes the accepted PersistentNative path out of the experimental CLI
+gate for model-backed serving:
+
+- `gemma4d serve --model-path PATH` now defaults to `persistent-native` when no
+  backend flag is explicit.
+- Zero-arg/no-model-path serving and explicit `--backend stub` remain the M11
+  stub behavior.
+- Explicit `--backend real-helper --model-path PATH` remains available as a
+  helper-backed opt-out.
+- Admission memory estimates now use measured XR51/P04 native memory constants
+  rather than the original stub-era `(prompt + max_tokens) * 4096` estimate.
+
 ## Evidence
 
 - `crates/gemma4d-server/src/lib.rs`
 - `crates/gemma4d-server/src/http.rs`
 - `crates/gemma4d-bench/examples/xr11_persistent_native_server_ab.rs`
 - `codex/goals/XR11-persistent-native-server-ab.goal.md`
+- `codex/goals/XR53-server-default-backend-estimator.goal.md`
