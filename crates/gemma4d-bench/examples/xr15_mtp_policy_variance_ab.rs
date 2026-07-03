@@ -13,8 +13,8 @@ use gemma4d_bench::{
     BuildProvenance, CliError, capture_build_provenance, manifest, workload_corpus::WorkloadRecord,
 };
 use gemma4d_ffi::{
-    Drafter, KvCache, KvPolicy, LoadConfig, Target, decode_one, draft_block, prefill,
-    verify_tokens, verify_tokens_terminal_no_lookahead,
+    Drafter, KvCache, KvPolicy, LoadConfig, MTP_MAX_DRAFT_TOKENS, Target, decode_one, draft_block,
+    prefill, verify_tokens, verify_tokens_terminal_no_lookahead,
 };
 use gemma4d_tokenizer::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -340,10 +340,14 @@ impl Args {
                 "--block-sizes must not be empty".to_owned(),
             ));
         }
-        if out.block_sizes.iter().any(|block_size| *block_size > 2) {
-            return Err(CliError::Usage(
-                "XR15 executable block sizes must be <= 2".to_owned(),
-            ));
+        if out
+            .block_sizes
+            .iter()
+            .any(|block_size| *block_size > MTP_MAX_DRAFT_TOKENS)
+        {
+            return Err(CliError::Usage(format!(
+                "XR15 executable block sizes must be <= {MTP_MAX_DRAFT_TOKENS}"
+            )));
         }
         Ok(out)
     }
@@ -775,6 +779,25 @@ fn run_mtp(
             && step.native_last_hidden.is_none();
         if terminal_skip_applied {
             terminal_no_lookahead_count += 1;
+        }
+        let accepted_usize = usize::try_from(step.accepted_draft_count).unwrap_or(usize::MAX);
+        let expected_trace_positions = if terminal_skip_applied {
+            accepted_usize.min(draft.len())
+        } else if accepted_usize >= draft.len() {
+            draft.len() + 1
+        } else {
+            accepted_usize + 2
+        };
+        if usize::try_from(step.mtp_trace.position_count).unwrap_or(0) < expected_trace_positions {
+            return Err(format!(
+                "native MTP trace incomplete: block_size={} draft_len={} accepted={} expected_at_least={} got={}",
+                block_size,
+                draft.len(),
+                step.accepted_draft_count,
+                expected_trace_positions,
+                step.mtp_trace.position_count
+            )
+            .into());
         }
         for token in &committed {
             if generated.len() < workload.max_new_tokens {

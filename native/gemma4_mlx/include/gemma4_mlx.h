@@ -74,7 +74,9 @@ typedef struct Gemma4KvPolicy {
     bool allow_active_compressed_decode;
 } Gemma4KvPolicy;
 
-#define GEMMA4_MTP_TRACE_MAX_POSITIONS 4
+#define GEMMA4_MTP_TRACE_MAX_POSITIONS 16
+#define GEMMA4_MTP_MAX_DRAFT_TOKENS (GEMMA4_MTP_TRACE_MAX_POSITIONS - 1)
+#define GEMMA4_MTP_MAX_COMMITTED_TOKENS GEMMA4_MTP_TRACE_MAX_POSITIONS
 #define GEMMA4_MTP_TRACE_TOP_K 5
 #define GEMMA4_MTP_TRACE_MAX_RANK 4
 
@@ -118,7 +120,7 @@ typedef struct Gemma4StepResult {
     double verify_repair_ms;
     uint32_t accepted_draft_count;
     uint32_t committed_count;
-    int32_t committed_tokens[4];
+    int32_t committed_tokens[GEMMA4_MTP_MAX_COMMITTED_TOKENS];
     /* Opaque view owned by the KV cache; valid until cache reset/free or next cache-advancing call. */
     void* native_last_hidden;
     /* Trace-only diagnostics populated by gemma4_verify_tokens; zeroed for ordinary prefill/decode. */
