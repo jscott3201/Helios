@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{
     env, fs,
     fs::File,
@@ -11,7 +13,9 @@ use std::{
 use gemma4d_bench::{
     CliError, capture_build_provenance, manifest, workload_corpus::WorkloadRecord,
 };
-use gemma4d_ffi::{Drafter, KvCache, KvPolicy, LoadConfig, Target, draft_block, prefill};
+use gemma4d_ffi::{
+    Drafter, KvCache, KvPolicy, LoadConfig, Target, draft_block_with_scores, prefill,
+};
 use gemma4d_tokenizer::sha256_hex;
 use serde_json::json;
 
@@ -40,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .into());
     }
+    ensure_real_margins_env()?;
     fs::create_dir_all(&args.out_dir)?;
 
     let payload_path = args.out_dir.join("payload.safetensors");
@@ -82,11 +87,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cache = KvCache::create(&KvPolicy::default())?;
     let prefill_step = prefill(&target, &mut cache, &token_ids)?;
     let drafter = Drafter::load(&assistant_config(&args, token_ids.len()), &target)?;
-    let native_draft_tokens = draft_block(
+    let native_draft = draft_block_with_scores(
         &drafter,
         &mut cache,
         NonZeroU32::new(args.block_size).expect("block size is non-zero"),
     )?;
+    let native_draft_tokens = native_draft
+        .iter()
+        .map(|draft| draft.token)
+        .collect::<Vec<_>>();
+    let native_draft_logits = native_draft
+        .iter()
+        .map(|draft| draft.logit)
+        .collect::<Vec<_>>();
+    let native_logit_margins = native_draft
+        .iter()
+        .map(|draft| draft.margin)
+        .collect::<Vec<_>>();
 
     let last_context_token = *token_ids
         .last()
@@ -126,6 +143,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "parity_token_ids": parity_token_ids,
         "block_size": args.block_size,
         "native_draft_tokens": native_draft_tokens,
+        "native_draft_logits": native_draft_logits,
+        "native_logit_margins": native_logit_margins,
         "reference_records_path": args.reference_records_path.display().to_string(),
         "reference_draft_tokens": reference_draft_tokens,
         "native_matches_reference": native_matches_reference,
@@ -137,9 +156,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&stderr_path, &python.stderr)?;
 
     let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
     if !native_matches_reference {
-        blockers.push(
-            "native draft tokens did not match the supplied XR54-R reference record".to_owned(),
+        warnings.push(
+            "native draft tokens did not match the supplied XR54-R reference record; XR57 score validation uses the fresh native block".to_owned(),
         );
     }
     let parity_result = match fs::read_to_string(&parity_path) {
@@ -177,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         } else if !parity_matches_native(result) {
             blockers.push(
-                "PyTorch parity completed but pinned or incremented tokens did not match native"
+                "PyTorch parity completed but pinned or incremented tokens, or pinned score fields, did not match native"
                     .to_owned(),
             );
         }
@@ -190,6 +210,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     blockers.sort();
     blockers.dedup();
+    warnings.sort();
+    warnings.dedup();
 
     let decision = if blockers.is_empty() {
         "completed"
@@ -239,6 +261,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "last_context_token": last_context_token,
         "parity_token_ids": request["parity_token_ids"],
         "native_draft_tokens": request["native_draft_tokens"],
+        "native_draft_logits": request["native_draft_logits"],
+        "native_logit_margins": request["native_logit_margins"],
         "reference_draft_tokens": request["reference_draft_tokens"],
         "native_matches_reference": native_matches_reference,
         "python_command": python.command,
@@ -246,6 +270,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "python_exit_status": python.exit_status,
         "python_status_success": python.status_success,
         "parity_result": parity_result,
+        "warnings": warnings,
         "blockers": blockers,
     });
     fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
@@ -361,6 +386,36 @@ struct PythonRun {
     stdout: String,
     stderr: String,
     blocker: String,
+}
+
+fn ensure_real_margins_env() -> Result<(), CliError> {
+    const FLAG: &str = "GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS";
+    if !env_flag_enabled(FLAG) {
+        // SAFETY: this benchmark is still single-threaded at startup and sets
+        // the native capture flag before loading MLX/native state or spawning
+        // the Python parity process.
+        unsafe {
+            env::set_var(FLAG, "1");
+        }
+    }
+    if !env_flag_enabled(FLAG) {
+        return Err(CliError::Runtime(format!(
+            "{FLAG}=1 is required before XR54/XR57 score parity can request native score buffers"
+        )));
+    }
+    Ok(())
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let Ok(value) = env::var(name) else {
+        return false;
+    };
+    !value.is_empty()
+        && value != "0"
+        && value != "false"
+        && value != "FALSE"
+        && value != "off"
+        && value != "OFF"
 }
 
 fn run_python_parity(
@@ -548,12 +603,22 @@ fn assistant_config(args: &Args, token_count: usize) -> LoadConfig {
 }
 
 fn parity_matches_native(result: &serde_json::Value) -> bool {
-    result
+    let pinned_tokens_match = result
         .get("matches_native")
-        .and_then(|matches| {
-            Some(matches.get("pinned")?.as_bool()? && matches.get("incremented")?.as_bool()?)
-        })
-        .unwrap_or(false)
+        .and_then(|matches| matches.get("pinned")?.as_bool())
+        .unwrap_or(false);
+    let incremented_tokens_match = result
+        .get("matches_native")
+        .and_then(|matches| matches.get("incremented")?.as_bool())
+        .unwrap_or(false);
+    // XR54 invariant: position rotation must not change argmax tokens. XR57
+    // score validation stays pinned-only because rotation perturbs BF16 score
+    // values even when argmax remains stable.
+    let scores_match = result
+        .get("matches_native_scores")
+        .and_then(|matches| matches.get("pinned")?.as_bool())
+        .unwrap_or(false);
+    pinned_tokens_match && incremented_tokens_match && scores_match
 }
 
 fn render_report(summary: &serde_json::Value) -> String {
@@ -607,6 +672,19 @@ fn render_report(summary: &serde_json::Value) -> String {
             }
         }
     }
+    if let Some(warnings) = summary
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+    {
+        out.push_str("\n## Warnings\n\n");
+        if warnings.is_empty() {
+            out.push_str("No warnings recorded.\n");
+        } else {
+            for warning in warnings {
+                out.push_str(&format!("- {}\n", value_to_inline(warning)));
+            }
+        }
+    }
     out
 }
 
@@ -616,8 +694,20 @@ fn render_blockers(summary: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let warnings = summary
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     if blockers.is_empty() {
-        "No hard blockers recorded.\n".to_owned()
+        let mut out = String::from("No hard blockers recorded.\n");
+        if !warnings.is_empty() {
+            out.push_str("\nWarnings:\n");
+            for warning in warnings {
+                out.push_str(&format!("- {}\n", value_to_inline(&warning)));
+            }
+        }
+        out
     } else {
         let mut out = String::new();
         for blocker in blockers {
@@ -817,12 +907,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parity_match_guard_requires_both_position_modes() {
-        let ok = json!({"matches_native": {"pinned": true, "incremented": true}});
-        let bad = json!({"matches_native": {"pinned": true, "incremented": false}});
+    fn parity_match_guard_requires_both_token_modes_and_pinned_scores() {
+        let ok = json!({
+            "matches_native": {"pinned": true, "incremented": true},
+            "matches_native_scores": {"pinned": true, "incremented": false}
+        });
+        let bad_pinned_tokens = json!({
+            "matches_native": {"pinned": false, "incremented": true},
+            "matches_native_scores": {"pinned": true, "incremented": true}
+        });
+        let bad_incremented_tokens = json!({
+            "matches_native": {"pinned": true, "incremented": false},
+            "matches_native_scores": {"pinned": true, "incremented": true}
+        });
+        let bad_scores = json!({
+            "matches_native": {"pinned": true, "incremented": true},
+            "matches_native_scores": {"pinned": false, "incremented": true}
+        });
 
         assert!(parity_matches_native(&ok));
-        assert!(!parity_matches_native(&bad));
+        assert!(!parity_matches_native(&bad_pinned_tokens));
+        assert!(!parity_matches_native(&bad_incremented_tokens));
+        assert!(!parity_matches_native(&bad_scores));
     }
 }
 

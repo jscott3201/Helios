@@ -17,6 +17,10 @@ import sys
 from pathlib import Path
 
 
+LOGIT_ATOL = 0.5
+MARGIN_ATOL = 0.25
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -116,6 +120,8 @@ def main() -> int:
         }
         last_hidden = payload["hidden.last"].to(device=args.device, dtype=model_dtype)
         native_tokens = [int(token) for token in request["native_draft_tokens"]]
+        native_logits = [float(value) for value in request.get("native_draft_logits", [])]
+        native_margins = [float(value) for value in request.get("native_logit_margins", [])]
         first_position = int(request["first_position"])
         block_size = int(request["block_size"])
         last_context_token = int(request["last_context_token"])
@@ -156,6 +162,12 @@ def main() -> int:
         "matches_native": {
             "pinned": pinned["draft_tokens"] == native_tokens,
             "incremented": incremented["draft_tokens"] == native_tokens,
+        },
+        "matches_native_scores": {
+            "pinned": scores_match(pinned, native_logits, native_margins),
+            "incremented": scores_match(incremented, native_logits, native_margins),
+            "logit_atol": LOGIT_ATOL,
+            "margin_atol": MARGIN_ATOL,
         },
         "missing_state_keys": missing,
         "unexpected_state_keys": unexpected,
@@ -277,6 +289,8 @@ def run_variant(
     current_hidden = last_hidden
     token_id = last_token_id
     draft_tokens: list[int] = []
+    draft_logits: list[float] = []
+    logit_margins: list[float] = []
     positions: list[int] = []
     for step in range(block_size):
         if token_id not in token_embeddings:
@@ -292,14 +306,34 @@ def run_variant(
                 shared_kv_states=shared_kv_states,
                 use_cache=False,
             )
-        token_id = int(outputs.logits.argmax(dim=-1).item())
+        flat_logits = outputs.logits.float().reshape(-1)
+        top2 = torch.topk(flat_logits, k=2)
+        token_id = int(top2.indices[0].item())
         draft_tokens.append(token_id)
+        top1_logit = float(top2.values[0].item())
+        top2_logit = float(top2.values[1].item())
+        draft_logits.append(top1_logit)
+        logit_margins.append(top1_logit - top2_logit)
         current_hidden = outputs.last_hidden_state
     return {
         "position_mode": "incremented" if increment_positions else "pinned",
         "positions": positions,
         "draft_tokens": draft_tokens,
+        "draft_logits": draft_logits,
+        "logit_margins": logit_margins,
     }
+
+
+def scores_match(variant: dict[str, object], native_logits: list[float], native_margins: list[float]) -> bool:
+    if not native_logits or not native_margins:
+        return False
+    draft_logits = [float(value) for value in variant.get("draft_logits", [])]
+    logit_margins = [float(value) for value in variant.get("logit_margins", [])]
+    if len(draft_logits) != len(native_logits) or len(logit_margins) != len(native_margins):
+        return False
+    return all(abs(left - right) <= LOGIT_ATOL for left, right in zip(draft_logits, native_logits)) and all(
+        abs(left - right) <= MARGIN_ATOL for left, right in zip(logit_margins, native_margins)
+    )
 
 
 if __name__ == "__main__":

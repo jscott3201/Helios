@@ -126,7 +126,7 @@ typedef struct Gemma4StepResult {
     int32_t committed_tokens[GEMMA4_MTP_MAX_COMMITTED_TOKENS];
     /* Opaque view owned by the KV cache; valid until cache reset/free or next cache-advancing call. */
     void* native_last_hidden;
-    /* Trace-only diagnostics populated by gemma4_verify_tokens; zeroed for ordinary prefill/decode. */
+    /* Trace diagnostics populated by MTP verification; native prefill/decode may carry one target top-k step. */
     Gemma4MtpTraceInfo mtp_trace;
 } Gemma4StepResult;
 
@@ -226,6 +226,8 @@ Gemma4Status gemma4_mtp_draft_block(
     Gemma4KvCache* cache,
     uint32_t block_size,
     int32_t* out_tokens,
+    float* out_logits,
+    float* out_logit_margins,
     size_t* inout_count);
 Gemma4Status gemma4_verify_tokens(
     Gemma4Target* target,
