@@ -12,6 +12,8 @@
 
 namespace gemma4d {
 
+class NativeTextModel;
+
 class NativeHiddenState {
 public:
     struct Impl;
@@ -58,7 +60,9 @@ public:
         const std::filesystem::path& payload_path,
         const NativeHiddenState* last_hidden,
         const std::unordered_map<std::string, std::string>& metadata,
-        std::string* error) const;
+        std::string* error,
+        const NativeTextModel* token_embedding_model = nullptr,
+        const std::vector<int32_t>* token_embedding_token_ids = nullptr) const;
     bool save_compressed_safetensors(
         const std::filesystem::path& payload_path,
         const NativeHiddenState* last_hidden,
@@ -196,6 +200,7 @@ public:
 private:
     std::unique_ptr<Impl> impl_;
 
+    friend class NativeKvState;
     friend class NativeLoraAdapter;
     friend class NativeMtpAssistantModel;
 };

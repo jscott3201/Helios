@@ -223,6 +223,13 @@ mod raw {
             snapshot: *const Gemma4KvSnapshot,
             payload_path: *const c_char,
         ) -> Gemma4Status;
+        pub fn gemma4_kv_snapshot_save_mtp_parity(
+            snapshot: *const Gemma4KvSnapshot,
+            target: *mut Gemma4Target,
+            token_ids: *const i32,
+            token_count: usize,
+            payload_path: *const c_char,
+        ) -> Gemma4Status;
         pub fn gemma4_kv_snapshot_save_compressed(
             snapshot: *const Gemma4KvSnapshot,
             payload_path: *const c_char,
@@ -758,6 +765,31 @@ impl KvSnapshot {
         let path = CString::new(path.as_ref().to_string_lossy().as_ref())?;
         // SAFETY: `self.ptr` is an owned snapshot handle and `path` is a live C string.
         check(unsafe { raw::gemma4_kv_snapshot_save(self.ptr.as_ptr(), path.as_ptr()) })
+    }
+
+    pub fn save_mtp_parity_to_path(
+        &self,
+        target: &Target,
+        token_ids: &[i32],
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        let path = CString::new(path.as_ref().to_string_lossy().as_ref())?;
+        let token_ptr = if token_ids.is_empty() {
+            ptr::null()
+        } else {
+            token_ids.as_ptr()
+        };
+        // SAFETY: handles come from safe wrappers, `path` is a live C string, and the
+        // native layer validates that the target is a loaded native graph.
+        check(unsafe {
+            raw::gemma4_kv_snapshot_save_mtp_parity(
+                self.ptr.as_ptr(),
+                target.ptr.as_ptr(),
+                token_ptr,
+                token_ids.len(),
+                path.as_ptr(),
+            )
+        })
     }
 
     pub fn save_compressed_to_path(

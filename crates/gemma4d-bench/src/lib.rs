@@ -1,8 +1,11 @@
 #![doc = "Reference-parity benchmark harness and report generation."]
 
+pub mod build_provenance;
 pub mod manifest;
 pub mod workload_corpus;
 pub mod xr_ab;
+
+pub use build_provenance::{BuildProvenance, capture_build_provenance};
 
 use std::{
     fs::{self, File},

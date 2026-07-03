@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use gemma4d_bench::{CliError, manifest, workload_corpus::WorkloadRecord};
+use gemma4d_bench::{
+    BuildProvenance, CliError, capture_build_provenance, manifest, workload_corpus::WorkloadRecord,
+};
 use gemma4d_ffi::{
     Drafter, KvCache, KvPolicy, LoadConfig, Target, decode_one, draft_block, prefill,
     verify_tokens, verify_tokens_terminal_no_lookahead,
@@ -51,10 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let decision_path = args.out_dir.join("decision.md");
 
     let run_id = run_id();
-    let git_sha =
-        command_stdout("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
-    let git_status_short =
-        command_stdout("git", &["status", "--short"]).unwrap_or_else(|| "unknown".to_owned());
+    let build_provenance = capture_build_provenance()?;
     let command = command_line();
     let model_identity =
         manifest::capture_artifact_identity(&args.model_path, "GEMMA4D_MODEL_REVISION");
@@ -85,8 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     records.push(run_mtp_record(
                         &args,
                         &run_id,
-                        &git_sha,
-                        &git_status_short,
+                        &build_provenance,
                         &encoded,
                         trial_index,
                         trial_kind,
@@ -119,8 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_id,
         generated_at_unix_seconds: unix_now(),
         command,
-        git_sha,
-        git_status_short,
+        git_sha: build_provenance.git_sha.clone(),
+        git_status_short: build_provenance.git_status_short.clone(),
+        build_provenance,
         model_identity,
         assistant_identity,
         tokenizer_backend,
@@ -370,6 +369,7 @@ struct Summary {
     command: String,
     git_sha: String,
     git_status_short: String,
+    build_provenance: BuildProvenance,
     model_identity: manifest::ArtifactIdentity,
     assistant_identity: manifest::ArtifactIdentity,
     tokenizer_backend: String,
@@ -427,6 +427,7 @@ struct Record {
     run_id: String,
     git_sha: String,
     git_status_short: String,
+    build_provenance: BuildProvenance,
     workload_id: String,
     family: String,
     prompt_path: String,
@@ -561,8 +562,7 @@ struct SourceReplaySummary {
 fn run_mtp_record(
     args: &Args,
     run_id: &str,
-    git_sha: &str,
-    git_status_short: &str,
+    build_provenance: &BuildProvenance,
     workload: &EncodedWorkload,
     trial_index: usize,
     trial_kind: &str,
@@ -591,8 +591,9 @@ fn run_mtp_record(
         schema_version: 1,
         goal: GOAL.to_owned(),
         run_id: run_id.to_owned(),
-        git_sha: git_sha.to_owned(),
-        git_status_short: git_status_short.to_owned(),
+        git_sha: build_provenance.git_sha.clone(),
+        git_status_short: build_provenance.git_status_short.clone(),
+        build_provenance: build_provenance.clone(),
         workload_id: workload.record.workload_id.clone(),
         family: workload.record.family.clone(),
         prompt_path: workload.record.prompt_path.clone(),
@@ -1435,6 +1436,20 @@ fn render_report(summary: &Summary) -> String {
     out.push_str(&format!("| Run ID | `{}` |\n", summary.run_id));
     out.push_str(&format!("| Git SHA | `{}` |\n", summary.git_sha));
     out.push_str(&format!(
+        "| Dirty diff SHA-256 | `{}` |\n",
+        summary.build_provenance.dirty_diff_sha256
+    ));
+    out.push_str(&format!(
+        "| Runner binary link mtime | `{}` |\n",
+        summary
+            .build_provenance
+            .runner_binary_link_mtime_unix_seconds
+    ));
+    out.push_str(&format!(
+        "| Runner binary | `{}` |\n",
+        summary.build_provenance.runner_binary_path
+    ));
+    out.push_str(&format!(
         "| Source replay | `{}` (`{}`) |\n",
         summary.source_replay_run_id, summary.source_replay_decision
     ));
@@ -1561,6 +1576,7 @@ fn measurement_notes() -> Vec<String> {
         "terminal no-lookahead mode only calls the experimental verifier on a final draft block whose returned draft count can satisfy the remaining generation budget".to_owned(),
         "adaptive zero-accept fallback is disabled unless --adaptive-zero-accept-run is passed; when active it uses native decode_one for the remaining tail after the gate fires".to_owned(),
         "warmup records remain in records.jsonl and summary.json but policy summaries use measured records only".to_owned(),
+        "each evidence summary and record stamps git SHA, dirty-diff SHA-256, dirty-diff byte count, runner binary path, and runner binary link mtime; missing provenance aborts before measurement".to_owned(),
         "the net-latency guard requires exact MTP output, at least 5% decode-phase speedup, and peak MLX memory under the configured gate".to_owned(),
     ]
 }

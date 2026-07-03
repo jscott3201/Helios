@@ -1144,6 +1144,51 @@ Gemma4Status gemma4_kv_snapshot_save(const Gemma4KvSnapshot* snapshot, const cha
     return ok();
 }
 
+Gemma4Status gemma4_kv_snapshot_save_mtp_parity(
+    const Gemma4KvSnapshot* snapshot,
+    Gemma4Target* target,
+    const int32_t* token_ids,
+    size_t token_count,
+    const char* payload_path) {
+    if (snapshot == nullptr || snapshot->magic != kKvSnapshotMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_save_mtp_parity requires a valid snapshot handle");
+    }
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_save_mtp_parity requires a valid target handle");
+    }
+    if (is_empty(payload_path)) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_save_mtp_parity requires a non-empty payload path");
+    }
+    if (token_ids == nullptr || token_count == 0) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_snapshot_save_mtp_parity requires token ids");
+    }
+    if (snapshot->native_kv_state == nullptr || snapshot->native_tokens.empty() || !snapshot->has_last_step) {
+        return fail(GEMMA4_ERR_CACHE, "gemma4_kv_snapshot_save_mtp_parity requires a populated native snapshot");
+    }
+    if (!target->use_native_graph || target->native_model == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_kv_snapshot_save_mtp_parity requires a loaded native target graph");
+    }
+
+    auto metadata = snapshot_metadata(snapshot);
+    metadata["diagnostic"] = "xr54_mtp_drafter_pytorch_parity";
+    metadata["diagnostic.target_token_count"] = std::to_string(token_count);
+    std::vector<int32_t> token_id_list(token_ids, token_ids + token_count);
+
+    std::string native_error;
+    if (!snapshot->native_kv_state->save_safetensors(
+            payload_path,
+            snapshot->last_hidden.get(),
+            metadata,
+            &native_error,
+            target->native_model.get(),
+            &token_id_list)) {
+        return fail(GEMMA4_ERR_RUNTIME, native_error);
+    }
+    return ok();
+}
+
 Gemma4Status gemma4_kv_snapshot_save_compressed(
     const Gemma4KvSnapshot* snapshot,
     const char* payload_path,
