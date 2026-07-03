@@ -19,7 +19,11 @@ const DEFAULT_OUT_DIR: &str = "benchmarks/out/XR54-mtp-position-pin/pytorch-pari
 const DEFAULT_WORKLOADS: &str = "benchmarks/workloads/real-contexts/workloads.jsonl";
 const DEFAULT_MODEL: &str = "artifacts/models/gemma-4-12B-it-4bit";
 const DEFAULT_ASSISTANT_MODEL: &str = "artifacts/models/gemma-4-12B-it-qat-assistant-4bit";
-const DEFAULT_PYTHON: &str = "/opt/homebrew/opt/mlx-lm/libexec/bin/python";
+const DEFAULT_PYTORCH_ASSISTANT_MODEL: &str =
+    "artifacts/models/gemma-4-12B-it-qat-assistant-dense-f32";
+const DEFAULT_PYTHON: &str = "/Users/justin/venvs/xr54-parity/bin/python";
+const DEFAULT_PYTHONPATH: &str =
+    "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/lib/python3.14/site-packages";
 const DEFAULT_SCRIPT: &str = "scripts/xr54_drafter_pytorch_parity.py";
 const DEFAULT_REFERENCE_RECORDS: &str =
     "benchmarks/out/XR54-mtp-position-pin/xr54-r-mtp-candidate-one-trial/records.jsonl";
@@ -48,9 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         manifest::capture_artifact_identity(&args.model_path, "GEMMA4D_MODEL_REVISION");
     let assistant_identity =
         manifest::capture_artifact_identity(&args.assistant_model_path, "GEMMA4D_MTP_REVISION");
+    let pytorch_assistant_identity = manifest::capture_artifact_identity(
+        &args.pytorch_assistant_model_path,
+        "GEMMA4D_MTP_PYTORCH_REVISION",
+    );
 
     let workload = load_workload(&args.workloads_path, &args.workload_id)?;
-    let mut tokenizer = TokenizerHelper::start(&args.python, &args.model_path)?;
+    let mut tokenizer =
+        TokenizerHelper::start(&args.python, args.pythonpath.as_deref(), &args.model_path)?;
     let prompt = fs::read_to_string(&workload.prompt_path).map_err(|error| {
         CliError::Runtime(format!(
             "failed to read prompt {}: {error}",
@@ -97,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "run_id": run_id,
         "payload_path": payload_path.display().to_string(),
         "assistant_model_path": args.assistant_model_path.display().to_string(),
+        "pytorch_assistant_model_path": args.pytorch_assistant_model_path.display().to_string(),
         "workload_id": workload.workload_id,
         "prompt_path": workload.prompt_path,
         "prompt_sha256": prompt_sha256,
@@ -140,6 +150,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown")
             ));
+        } else if !parity_matches_native(result) {
+            blockers.push(
+                "PyTorch parity completed but pinned or incremented tokens did not match native"
+                    .to_owned(),
+            );
         }
     } else if !python.status_success {
         blockers.push(format!(
@@ -167,9 +182,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "git_status_short": git_status_short,
         "model_identity": model_identity,
         "assistant_identity": assistant_identity,
+        "pytorch_assistant_identity": pytorch_assistant_identity,
         "tokenizer_backend": tokenizer.backend(),
         "workload_id": args.workload_id,
         "block_size": args.block_size,
+        "model_path": args.model_path.display().to_string(),
+        "assistant_model_path": args.assistant_model_path.display().to_string(),
+        "pytorch_assistant_model_path": args.pytorch_assistant_model_path.display().to_string(),
         "payload_path": payload_path.display().to_string(),
         "request_path": request_path.display().to_string(),
         "parity_path": parity_path.display().to_string(),
@@ -196,6 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "reference_draft_tokens": request["reference_draft_tokens"],
         "native_matches_reference": native_matches_reference,
         "python_command": python.command,
+        "pythonpath": args.pythonpath,
         "python_exit_status": python.exit_status,
         "python_status_success": python.status_success,
         "parity_result": parity_result,
@@ -224,7 +244,9 @@ struct Args {
     workloads_path: PathBuf,
     model_path: PathBuf,
     assistant_model_path: PathBuf,
+    pytorch_assistant_model_path: PathBuf,
     python: PathBuf,
+    pythonpath: Option<String>,
     parity_script: PathBuf,
     reference_records_path: PathBuf,
     workload_id: String,
@@ -242,7 +264,9 @@ impl Args {
             workloads_path: PathBuf::from(DEFAULT_WORKLOADS),
             model_path: PathBuf::from(DEFAULT_MODEL),
             assistant_model_path: PathBuf::from(DEFAULT_ASSISTANT_MODEL),
+            pytorch_assistant_model_path: PathBuf::from(DEFAULT_PYTORCH_ASSISTANT_MODEL),
             python: PathBuf::from(DEFAULT_PYTHON),
+            pythonpath: Some(DEFAULT_PYTHONPATH.to_owned()),
             parity_script: PathBuf::from(DEFAULT_SCRIPT),
             reference_records_path: PathBuf::from(DEFAULT_REFERENCE_RECORDS),
             workload_id: DEFAULT_WORKLOAD_ID.to_owned(),
@@ -262,7 +286,13 @@ impl Args {
                     out.assistant_model_path =
                         PathBuf::from(required_value(&mut args, "--assistant-model-path")?)
                 }
+                option @ ("--pytorch-assistant-model-path" | "--dense-assistant-model-path") => {
+                    out.pytorch_assistant_model_path =
+                        PathBuf::from(required_value(&mut args, option)?)
+                }
                 "--python" => out.python = PathBuf::from(required_value(&mut args, "--python")?),
+                "--pythonpath" => out.pythonpath = Some(required_value(&mut args, "--pythonpath")?),
+                "--no-pythonpath" => out.pythonpath = None,
                 "--parity-script" => {
                     out.parity_script = PathBuf::from(required_value(&mut args, "--parity-script")?)
                 }
@@ -312,22 +342,30 @@ fn run_python_parity(
     payload_path: &Path,
     parity_path: &Path,
 ) -> PythonRun {
-    let command = vec![
+    let mut command = Vec::new();
+    if let Some(pythonpath) = args.pythonpath.as_deref() {
+        command.push(format!("PYTHONPATH={pythonpath}"));
+    }
+    command.extend([
         args.python.display().to_string(),
         args.parity_script.display().to_string(),
         "--assistant-model-path".to_owned(),
-        args.assistant_model_path.display().to_string(),
+        args.pytorch_assistant_model_path.display().to_string(),
         "--payload".to_owned(),
         payload_path.display().to_string(),
         "--request".to_owned(),
         request_path.display().to_string(),
         "--out".to_owned(),
         parity_path.display().to_string(),
-    ];
-    match Command::new(&args.python)
+    ]);
+    let mut process = Command::new(&args.python);
+    if let Some(pythonpath) = args.pythonpath.as_deref() {
+        process.env("PYTHONPATH", pythonpath);
+    }
+    match process
         .arg(&args.parity_script)
         .arg("--assistant-model-path")
-        .arg(&args.assistant_model_path)
+        .arg(&args.pytorch_assistant_model_path)
         .arg("--payload")
         .arg(payload_path)
         .arg("--request")
@@ -464,6 +502,15 @@ fn assistant_config(args: &Args, token_count: usize) -> LoadConfig {
     }
 }
 
+fn parity_matches_native(result: &serde_json::Value) -> bool {
+    result
+        .get("matches_native")
+        .and_then(|matches| {
+            Some(matches.get("pinned")?.as_bool()? && matches.get("incremented")?.as_bool()?)
+        })
+        .unwrap_or(false)
+}
+
 fn render_report(summary: &serde_json::Value) -> String {
     let mut out = String::new();
     out.push_str("# XR54 Drafter PyTorch Parity\n\n");
@@ -476,6 +523,7 @@ fn render_report(summary: &serde_json::Value) -> String {
         "block_size",
         "payload_path",
         "parity_path",
+        "pytorch_assistant_model_path",
         "native_matches_reference",
         "python_exit_status",
     ] {
@@ -566,7 +614,7 @@ fn unix_now() -> u64 {
 
 fn usage() -> String {
     format!(
-        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr54_drafter_pytorch_parity -- [--out-dir PATH] [--workload-id ID] [--block-size N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
+        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr54_drafter_pytorch_parity -- [--out-dir PATH] [--workload-id ID] [--block-size N] [--python PATH] [--pythonpath PATH|--no-pythonpath] [--pytorch-assistant-model-path PATH]\n\ndefault out-dir: {DEFAULT_OUT_DIR}\ndefault python: {DEFAULT_PYTHON}\ndefault pythonpath: {DEFAULT_PYTHONPATH}"
     )
 }
 
@@ -586,7 +634,7 @@ struct TokenizerHelper {
 }
 
 impl TokenizerHelper {
-    fn start(python: &Path, model_path: &Path) -> Result<Self, CliError> {
+    fn start(python: &Path, pythonpath: Option<&str>, model_path: &Path) -> Result<Self, CliError> {
         let script = r#"
 import json
 import sys
@@ -610,7 +658,11 @@ for line in sys.stdin:
     else:
         print(json.dumps({"ok": False, "error": f"unknown cmd {cmd}"}), flush=True)
 "#;
-        let mut child = Command::new(python)
+        let mut process = Command::new(python);
+        if let Some(pythonpath) = pythonpath {
+            process.env("PYTHONPATH", pythonpath);
+        }
+        let mut child = process
             .arg("-c")
             .arg(script)
             .arg(model_path)
@@ -719,6 +771,21 @@ for line in sys.stdin:
             )));
         }
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parity_matches_native;
+    use serde_json::json;
+
+    #[test]
+    fn parity_match_guard_requires_both_position_modes() {
+        let ok = json!({"matches_native": {"pinned": true, "incremented": true}});
+        let bad = json!({"matches_native": {"pinned": true, "incremented": false}});
+
+        assert!(parity_matches_native(&ok));
+        assert!(!parity_matches_native(&bad));
     }
 }
 

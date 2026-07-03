@@ -2,10 +2,12 @@
 
 ## Outcome
 
-Fix the Gemma 4 MTP assistant drafter RoPE position bug by pinning the drafter
-position for every step in a draft round.
+Align the Gemma 4 MTP assistant drafter with the Hugging Face constant-position
+reference convention by pinning the drafter position for every step in a draft
+round, then test whether that alignment repairs low slot-1 acceptance.
 
-Decision: `needs_more_data`.
+Decision: `reject_candidate` for the acceptance-fix hypothesis. Keep the pin as
+behaviorally neutral reference-convention alignment.
 
 ## Scope
 
@@ -72,6 +74,8 @@ GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_BLOCK_
 
 - `benchmarks/out/XR54-mtp-position-pin/rung10-native-mtp/`
 - `benchmarks/out/XR54-mtp-position-pin/pinned-xr48-config/`
+- `benchmarks/out/XR54-mtp-position-pin/xr54-r-mtp-candidate-one-trial/`
+- `benchmarks/out/XR54-mtp-position-pin/pytorch-parity/`
 - Per-slot acceptance table derived from `records.jsonl`.
 - `BENCHMARKS.md` ledger row and claim-boundary update stating that pre-XR54
   MTP acceptance numbers are historical.
@@ -154,28 +158,56 @@ the first `mtp_candidate_1k_001` draft round. Payload metadata includes
 `hidden.last.shape = 1x1x3840`, shared full/sliding KV, and
 `target.token_embeddings.shape = 1x2x3840` for token IDs `107,236792`.
 
-Native draft tokens from the diagnostic were `[236792, 236865]`, matching the
-XR54-R reference record. The actual vendored-Transformers PyTorch comparison is
-blocked in this local environment because the selected Python
-`/opt/homebrew/opt/mlx-lm/libexec/bin/python` has no `torch` module. The
-structured blocker is recorded in
-`benchmarks/out/XR54-mtp-position-pin/pytorch-parity/{summary.json,blockers.md,parity.json}`.
+The completed PyTorch reference run used
+`/Users/justin/venvs/xr54-parity/bin/python` with
+`PYTHONPATH=/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/lib/python3.14/site-packages`
+and the dequantized dense assistant checkpoint at
+`artifacts/models/gemma-4-12B-it-qat-assistant-dense-f32/`. The productionized
+dequant path is `scripts/xr54_dequant_assistant.py`; the parity script now uses
+bf16-safe safetensors loading (`framework="pt"`), constructs the reference model
+under `torch.bfloat16`, casts the payload to the model dtype, and explicitly
+ties `lm_head.weight` to `model.embed_tokens.weight`.
+
+The dense checkpoint was regenerated with:
+
+```text
+/Users/justin/venvs/xr54-parity/bin/python scripts/xr54_dequant_assistant.py --src artifacts/models/gemma-4-12B-it-qat-assistant-4bit --out artifacts/models/gemma-4-12B-it-qat-assistant-dense-f32
+```
+
+The final parity command used the runner defaults for the same Python and
+PYTHONPATH:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_LAZY_SECOND_DRAFT=1 target/debug/examples/xr54_drafter_pytorch_parity --out-dir benchmarks/out/XR54-mtp-position-pin/pytorch-parity --reference-records benchmarks/out/XR54-mtp-position-pin/xr54-r-mtp-candidate-one-trial/records.jsonl
+```
+
+Run ID `xr54-parity-1783057018` completed with no blockers:
+
+| Variant | Positions | Draft tokens | Matches native |
+|---|---:|---:|---:|
+| Native | n/a | `[236792, 236865]` | n/a |
+| PyTorch pinned | `[1023, 1023]` | `[236792, 236865]` | `true` |
+| PyTorch incremented | `[1023, 1024]` | `[236792, 236865]` | `true` |
+
+This falsifies F9: the vendored Hugging Face reference itself is
+position-insensitive for the recorded round. The byte-identical A/B evidence is
+therefore faithful behavior, and the `mtp_candidate_1k_001` slot-1 collapse is
+a model/content property rather than a native drafter implementation bug.
 
 ## Result
 
-XR54 is not promotable as an acceptance fix. The one-site change aligns Helios
-with the Hugging Face constant-position invariant and preserves greedy
-exactness, but the evidence refutes the prediction that the position pin would
-repair `mtp_candidate_1k_001` slot-1 acceptance.
+| Item | Verdict | Evidence |
+|---|---|---|
+| Acceptance-fix hypothesis | `reject_candidate` | XR54 A/B and XR54-R rerun were byte-identical to XR48; `mtp_candidate_1k_001` slot 1 stayed `3/18`. |
+| Position pin | Keep | Reference-convention alignment; behaviorally neutral and exactness-proven. |
+| PyTorch parity contingency | Complete | Pinned and incremented HF reference drafts both matched native `[236792, 236865]`. |
 
-XR55 must not start from this branch because its hypothesis depends on a fixed
-drafter. The drafter-only PyTorch parity diagnostic is implemented through
-payload export and a local reference script, but the comparison itself remains
-blocked until PyTorch is available for the vendored Transformers reference.
+XR55 is unblocked. It should proceed as broader MTP performance work with the
+revised expectation that acceptance is model/content-driven, not a remaining
+drafter position implementation defect.
 
 ## Completion Rule
 
-Accept the candidate if exactness remains intact and
-`mtp_candidate_1k_001` acceptance improves materially. If acceptance does not
-move, mark `needs_more_data` and use the handoff's drafter-only PyTorch parity
-contingency before further MTP performance work.
+The acceptance-fix candidate is rejected because exactness remained intact but
+`mtp_candidate_1k_001` acceptance did not improve. The parity contingency is
+complete, so no additional drafter-implementation XR is required before XR55.

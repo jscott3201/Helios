@@ -4,6 +4,9 @@
 This script intentionally does not download code or weights. It consumes a local
 native parity payload with `hidden.last`, shared KV tensors, and ordered target
 token embeddings exported by `xr54_drafter_pytorch_parity.rs`.
+
+The PyTorch reference path expects a dense assistant checkpoint. Generate one
+from the local MLX affine-q4 artifact with `scripts/xr54_dequant_assistant.py`.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ def main() -> int:
         )
         return 2
 
+    torch.set_default_dtype(torch.bfloat16)
+
     try:
         from safetensors import safe_open
         from safetensors.torch import load_file
@@ -51,7 +56,7 @@ def main() -> int:
     if quantized_keys:
         write_blocked(
             args.out,
-            "assistant checkpoint is MLX affine q4; PyTorch parity needs a dense/dequantized state_dict or an MLX-affine dequant loader",
+            "assistant checkpoint is MLX affine q4; run scripts/xr54_dequant_assistant.py and pass the dense checkpoint path",
             request=request,
             quantized_key_examples=quantized_keys[:12],
         )
@@ -63,23 +68,27 @@ def main() -> int:
         model = Gemma4AssistantForCausalLM(config).to(args.device).eval()
         state = load_file(str(args.assistant_model_path / "model.safetensors"), device=args.device)
         missing, unexpected = model.load_state_dict(state, strict=False)
-        if missing or unexpected:
+        missing_allowed = {"lm_head.weight"} if config.tie_word_embeddings else set()
+        hard_missing = [key for key in missing if key not in missing_allowed]
+        if hard_missing or unexpected:
             raise RuntimeError(
-                f"assistant state_dict mismatch: missing={missing[:20]} unexpected={unexpected[:20]}"
+                f"assistant state_dict mismatch: missing={hard_missing[:20]} unexpected={unexpected[:20]}"
             )
+        tie_lm_head(model)
 
-        token_embeddings = token_embedding_map(payload, metadata, args.device)
+        model_dtype = next(model.parameters()).dtype
+        token_embeddings = token_embedding_map(payload, metadata, args.device, model_dtype)
         shared_kv_states = {
             "full_attention": (
-                payload["hidden.full_attention_key"].to(args.device),
-                payload["hidden.full_attention_value"].to(args.device),
+                payload["hidden.full_attention_key"].to(device=args.device, dtype=model_dtype),
+                payload["hidden.full_attention_value"].to(device=args.device, dtype=model_dtype),
             ),
             "sliding_attention": (
-                payload["hidden.sliding_attention_key"].to(args.device),
-                payload["hidden.sliding_attention_value"].to(args.device),
+                payload["hidden.sliding_attention_key"].to(device=args.device, dtype=model_dtype),
+                payload["hidden.sliding_attention_value"].to(device=args.device, dtype=model_dtype),
             ),
         }
-        last_hidden = payload["hidden.last"].to(args.device)
+        last_hidden = payload["hidden.last"].to(device=args.device, dtype=model_dtype)
         native_tokens = [int(token) for token in request["native_draft_tokens"]]
         first_position = int(request["first_position"])
         block_size = int(request["block_size"])
@@ -124,6 +133,9 @@ def main() -> int:
         },
         "missing_state_keys": missing,
         "unexpected_state_keys": unexpected,
+        "assistant_model_path": str(args.assistant_model_path),
+        "torch_default_dtype": str(torch.get_default_dtype()),
+        "model_dtype": str(model_dtype),
     }
     args.out.write_text(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -157,7 +169,7 @@ def assistant_quantized_keys(model_path: Path) -> list[str]:
     weights = model_path / "model.safetensors"
     if not weights.exists():
         return []
-    with safe_open(str(weights), framework="np") as handle:
+    with safe_open(str(weights), framework="pt") as handle:
         return [
             key
             for key in handle.keys()
@@ -177,6 +189,15 @@ def assistant_config(model_path: Path, config_cls):
         centroid_intermediate_top_k=raw.get("centroid_intermediate_top_k", 32),
         tie_word_embeddings=raw.get("tie_word_embeddings", True),
     )
+
+
+def tie_lm_head(model) -> None:
+    if not hasattr(model, "lm_head"):
+        return
+    embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if embed_tokens is None:
+        return
+    model.lm_head.weight = embed_tokens.weight
 
 
 def load_payload(path: Path, safe_open):
@@ -199,13 +220,15 @@ def load_payload(path: Path, safe_open):
     return tensors, metadata
 
 
-def token_embedding_map(payload: dict, metadata: dict[str, str], device: str) -> dict[int, object]:
+def token_embedding_map(
+    payload: dict, metadata: dict[str, str], device: str, dtype
+) -> dict[int, object]:
     token_ids = [
         int(token_id)
         for token_id in metadata.get("target.token_embeddings.token_ids", "").split(",")
         if token_id
     ]
-    embeddings = payload["target.token_embeddings"].to(device)
+    embeddings = payload["target.token_embeddings"].to(device=device, dtype=dtype)
     if embeddings.shape[1] != len(token_ids):
         raise RuntimeError(
             f"target.token_embeddings shape/token-id mismatch: shape={tuple(embeddings.shape)} token_ids={token_ids}"
