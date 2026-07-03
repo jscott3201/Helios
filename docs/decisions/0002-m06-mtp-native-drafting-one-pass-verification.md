@@ -26,6 +26,15 @@ Native full-attention target layers use causal masking for multi-token forwards 
 - Real Gemma 4 target+assistant draft verification now has exact accept/rollback semantics for block size 1/2.
 - KV-backed verification remains a performance follow-up, not a correctness prerequisite for M06.
 
+## Amendment - XR52, 2026-07-03
+
+The last consequence used M06-era wording from before the runtime verifier path
+was audited. XR52 found that the from-scratch `verify_draft_block` /
+`forward_verify_logits` verifier had no callers and removed it. Current
+`gemma4_verify_tokens` dispatch is KV-backed; XR52's performance work targets
+KV storage growth and verifier staging/rollback overhead rather than replacing
+the removed dead verifier.
+
 ## Evidence
 
 - Commands:

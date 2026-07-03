@@ -48,6 +48,11 @@ struct NativeKvState::Impl {
         bool full_attention = false;
         std::optional<mlx::core::array> key;
         std::optional<mlx::core::array> value;
+        std::optional<mlx::core::array> key_slab;
+        std::optional<mlx::core::array> value_slab;
+        int capacity_tokens = 0;
+        int visible_tokens = 0;
+        int sliding_write_offset = 0;
     };
     std::vector<Layer> layers;
 #endif
@@ -392,8 +397,7 @@ enum class DecodeKvEvalMode {
 constexpr int kTargetLayerCount = 48;
 constexpr int kHiddenSize = 3840;
 constexpr int kSlidingWindowSize = 1024;
-constexpr uint32_t kMtpFullAttentionSharedLayer = 47;
-constexpr uint32_t kMtpSlidingAttentionSharedLayer = 46;
+constexpr int kKvSlabStepTokens = 256;
 constexpr uint64_t kBf16Bytes = 2;
 
 std::optional<array> decode_block_causal_mask(
@@ -489,6 +493,172 @@ uint64_t estimate_target_kv_bytes(uint64_t sequence_len) {
     return full_layer_count * full_layer_bytes + sliding_layer_count * sliding_layer_bytes;
 }
 
+bool native_kv_concat_fallback_enabled() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_KV_CONCAT_FALLBACK");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+int round_up_kv_capacity(int token_count) {
+    if (token_count <= 0) {
+        return kKvSlabStepTokens;
+    }
+    return ((token_count + kKvSlabStepTokens - 1) / kKvSlabStepTokens) * kKvSlabStepTokens;
+}
+
+array logical_kv_slice(const array& slab, int token_count, int n_kv_heads, int head_dim) {
+    return mlx::core::slice(slab, {0, 0, 0, 0}, {1, n_kv_heads, token_count, head_dim});
+}
+
+array chronological_sliding_kv(
+    const NativeKvState::Impl::Layer& layer,
+    const std::optional<array>& slab,
+    const std::optional<array>& fallback,
+    int n_kv_heads,
+    int head_dim) {
+    if (!slab.has_value()) {
+        if (!fallback.has_value()) {
+            throw std::runtime_error("native sliding KV layer is missing logical storage");
+        }
+        return *fallback;
+    }
+    const int visible_tokens = layer.visible_tokens > 0
+        ? layer.visible_tokens
+        : (fallback.has_value() && fallback->shape().size() >= 3 ? fallback->shape()[2] : 0);
+    if (visible_tokens <= 0) {
+        throw std::runtime_error("native sliding KV layer has invalid logical length");
+    }
+    if (visible_tokens < kSlidingWindowSize || layer.sliding_write_offset == 0) {
+        return logical_kv_slice(*slab, visible_tokens, n_kv_heads, head_dim);
+    }
+    const int offset = layer.sliding_write_offset;
+    array tail = mlx::core::slice(
+        *slab,
+        {0, 0, offset, 0},
+        {1, n_kv_heads, visible_tokens, head_dim});
+    array head = mlx::core::slice(
+        *slab,
+        {0, 0, 0, 0},
+        {1, n_kv_heads, offset, head_dim});
+    return mlx::core::concatenate({tail, head}, 2);
+}
+
+array layer_logical_key(const NativeKvState::Impl::Layer& layer, int n_kv_heads, int head_dim) {
+    if (layer.full_attention) {
+        if (!layer.key.has_value()) {
+            throw std::runtime_error("native full-attention KV layer is missing key storage");
+        }
+        return *layer.key;
+    }
+    return chronological_sliding_kv(layer, layer.key_slab, layer.key, n_kv_heads, head_dim);
+}
+
+array layer_logical_value(const NativeKvState::Impl::Layer& layer, int n_kv_heads, int head_dim) {
+    if (layer.full_attention) {
+        if (!layer.value.has_value()) {
+            throw std::runtime_error("native full-attention KV layer is missing value storage");
+        }
+        return *layer.value;
+    }
+    return chronological_sliding_kv(layer, layer.value_slab, layer.value, n_kv_heads, head_dim);
+}
+
+void materialize_layer_slab_from_logical(
+    NativeKvState::Impl::Layer* layer,
+    bool full_attention,
+    const array& keys,
+    const array& values,
+    int n_kv_heads,
+    int head_dim) {
+    if (layer == nullptr) {
+        return;
+    }
+    const auto& key_shape = keys.shape();
+    if (key_shape.size() < 3) {
+        throw std::runtime_error("native KV slab received malformed logical key shape");
+    }
+    const int logical_len = key_shape[2];
+    const int capacity = full_attention ? round_up_kv_capacity(logical_len) : kSlidingWindowSize;
+    if (logical_len > capacity) {
+        throw std::runtime_error("native KV slab logical length exceeds capacity");
+    }
+    layer->full_attention = full_attention;
+    layer->capacity_tokens = capacity;
+    layer->visible_tokens = logical_len;
+    layer->sliding_write_offset = full_attention ? 0 : (logical_len % kSlidingWindowSize);
+    if (capacity == logical_len) {
+        layer->key_slab = keys;
+        layer->value_slab = values;
+    } else {
+        array key_slab = mlx::core::zeros({1, n_kv_heads, capacity, head_dim}, keys.dtype());
+        array value_slab = mlx::core::zeros({1, n_kv_heads, capacity, head_dim}, values.dtype());
+        key_slab = mlx::core::slice_update(
+            key_slab,
+            keys,
+            {0, 0, 0, 0},
+            {1, n_kv_heads, logical_len, head_dim});
+        value_slab = mlx::core::slice_update(
+            value_slab,
+            values,
+            {0, 0, 0, 0},
+            {1, n_kv_heads, logical_len, head_dim});
+        layer->key_slab = key_slab;
+        layer->value_slab = value_slab;
+    }
+    layer->key = logical_kv_slice(*layer->key_slab, logical_len, n_kv_heads, head_dim);
+    layer->value = logical_kv_slice(*layer->value_slab, logical_len, n_kv_heads, head_dim);
+}
+
+void ensure_layer_slab_capacity(
+    NativeKvState::Impl::Layer* layer,
+    bool full_attention,
+    int required_tokens,
+    int n_kv_heads,
+    int head_dim) {
+    if (layer == nullptr || !layer->key.has_value() || !layer->value.has_value()) {
+        throw std::runtime_error("native KV slab append requires materialized logical KV");
+    }
+    if (!layer->key_slab.has_value() || !layer->value_slab.has_value() ||
+        layer->capacity_tokens <= 0) {
+        materialize_layer_slab_from_logical(
+            layer,
+            full_attention,
+            *layer->key,
+            *layer->value,
+            n_kv_heads,
+            head_dim);
+    }
+    const int target_capacity =
+        full_attention ? round_up_kv_capacity(required_tokens) : kSlidingWindowSize;
+    if (target_capacity <= layer->capacity_tokens) {
+        return;
+    }
+    array key_slab = mlx::core::zeros({1, n_kv_heads, target_capacity, head_dim}, layer->key->dtype());
+    array value_slab = mlx::core::zeros({1, n_kv_heads, target_capacity, head_dim}, layer->value->dtype());
+    key_slab = mlx::core::slice_update(
+        key_slab,
+        *layer->key,
+        {0, 0, 0, 0},
+        {1, n_kv_heads, layer->visible_tokens, head_dim});
+    value_slab = mlx::core::slice_update(
+        value_slab,
+        *layer->value,
+        {0, 0, 0, 0},
+        {1, n_kv_heads, layer->visible_tokens, head_dim});
+    layer->key_slab = key_slab;
+    layer->value_slab = value_slab;
+    layer->capacity_tokens = target_capacity;
+}
+
+void set_layer_from_logical_kv(
+    NativeKvState::Impl::Layer* layer,
+    bool full_attention,
+    const array& keys,
+    const array& values,
+    int n_kv_heads,
+    int head_dim) {
+    materialize_layer_slab_from_logical(layer, full_attention, keys, values, n_kv_heads, head_dim);
+}
+
 void store_target_layer_kv(
     NativeKvState::Impl::Layer* layer,
     bool full_attention,
@@ -502,12 +672,16 @@ void store_target_layer_kv(
     }
     layer->full_attention = full_attention;
     if (full_attention || sequence_len <= kSlidingWindowSize) {
-        layer->key = keys;
-        layer->value = values;
+        set_layer_from_logical_kv(layer, full_attention, keys, values, n_kv_heads, head_dim);
     } else {
         const int start = sequence_len - kSlidingWindowSize;
-        layer->key = mlx::core::slice(keys, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
-        layer->value = mlx::core::slice(values, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
+        set_layer_from_logical_kv(
+            layer,
+            full_attention,
+            mlx::core::slice(keys, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim}),
+            mlx::core::slice(values, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim}),
+            n_kv_heads,
+            head_dim);
     }
     if (eval_prefill_kv_when_stored(prefill_kv_eval_mode(), full_attention)) {
         mlx::core::eval({*layer->key, *layer->value});
@@ -788,24 +962,41 @@ array target_attention_decode_forward(
     values = model_dtype(mlx::core::fast::rms_norm(values, std::nullopt, 1e-6f));
     values = mlx::core::transpose(values, {0, 2, 1, 3});
 
-    array cached_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
-    array cached_values = mlx::core::concatenate({*target_kv->value, values}, 2);
-    if (!full_attention) {
-        const uint64_t combined_len = std::min<uint64_t>(previous_sequence_len, kSlidingWindowSize) + 1;
-        if (combined_len > kSlidingWindowSize) {
-            cached_keys = mlx::core::slice(
-                cached_keys,
-                {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
-                {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
-            cached_values = mlx::core::slice(
-                cached_values,
-                {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
-                {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+    if (native_kv_concat_fallback_enabled() || !full_attention) {
+        array cached_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
+        array cached_values = mlx::core::concatenate({*target_kv->value, values}, 2);
+        if (!full_attention) {
+            const uint64_t combined_len = std::min<uint64_t>(previous_sequence_len, kSlidingWindowSize) + 1;
+            if (combined_len > kSlidingWindowSize) {
+                cached_keys = mlx::core::slice(
+                    cached_keys,
+                    {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
+                    {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+                cached_values = mlx::core::slice(
+                    cached_values,
+                    {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
+                    {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+            }
         }
+        set_layer_from_logical_kv(target_kv, full_attention, cached_keys, cached_values, n_kv_heads, head_dim);
+    } else if (full_attention) {
+        const int previous_key_len = target_kv->key->shape()[2];
+        const int updated_len = previous_key_len + 1;
+        ensure_layer_slab_capacity(target_kv, full_attention, updated_len, n_kv_heads, head_dim);
+        target_kv->key_slab = mlx::core::slice_update(
+            *target_kv->key_slab,
+            keys,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->value_slab = mlx::core::slice_update(
+            *target_kv->value_slab,
+            values,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->visible_tokens = updated_len;
+        target_kv->key = logical_kv_slice(*target_kv->key_slab, updated_len, n_kv_heads, head_dim);
+        target_kv->value = logical_kv_slice(*target_kv->value_slab, updated_len, n_kv_heads, head_dim);
     }
-    target_kv->full_attention = full_attention;
-    target_kv->key = cached_keys;
-    target_kv->value = cached_values;
     if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
         mlx::core::eval({*target_kv->key, *target_kv->value});
     }
@@ -876,26 +1067,98 @@ array target_attention_decode_block_forward(
     values = model_dtype(mlx::core::fast::rms_norm(values, std::nullopt, 1e-6f));
     values = mlx::core::transpose(values, {0, 2, 1, 3});
 
-    // Attend over the unsliced cache plus new block keys; slice only the stored
-    // KV below so earlier queries in the block keep their valid sliding window.
-    array attention_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
-    array attention_values = mlx::core::concatenate({*target_kv->value, values}, 2);
-    array stored_keys = attention_keys;
-    array stored_values = attention_values;
-    const auto& attention_key_shape = attention_keys.shape();
-    if (attention_key_shape.size() < 3) {
-        throw std::runtime_error("native incremental block decode produced malformed KV key shape");
+    std::optional<array> attention_keys;
+    std::optional<array> attention_values;
+    int attention_key_len = 0;
+    if (native_kv_concat_fallback_enabled()) {
+        array previous_keys = full_attention
+            ? *target_kv->key
+            : layer_logical_key(*target_kv, n_kv_heads, head_dim);
+        array previous_values = full_attention
+            ? *target_kv->value
+            : layer_logical_value(*target_kv, n_kv_heads, head_dim);
+        array combined_keys = mlx::core::concatenate({previous_keys, keys}, 2);
+        array combined_values = mlx::core::concatenate({previous_values, values}, 2);
+        const auto& attention_key_shape = combined_keys.shape();
+        if (attention_key_shape.size() < 3) {
+            throw std::runtime_error("native incremental block decode produced malformed KV key shape");
+        }
+        attention_key_len = attention_key_shape[2];
+        array stored_keys = combined_keys;
+        array stored_values = combined_values;
+        if (!full_attention && attention_key_len > kSlidingWindowSize) {
+            stored_keys = mlx::core::slice(
+                combined_keys,
+                {0, 0, attention_key_len - kSlidingWindowSize, 0},
+                {1, n_kv_heads, attention_key_len, head_dim});
+            stored_values = mlx::core::slice(
+                combined_values,
+                {0, 0, attention_key_len - kSlidingWindowSize, 0},
+                {1, n_kv_heads, attention_key_len, head_dim});
+        }
+        set_layer_from_logical_kv(target_kv, full_attention, stored_keys, stored_values, n_kv_heads, head_dim);
+        attention_keys = std::move(combined_keys);
+        attention_values = std::move(combined_values);
+    } else if (full_attention) {
+        const int updated_len = previous_key_len + block_len;
+        ensure_layer_slab_capacity(target_kv, full_attention, updated_len, n_kv_heads, head_dim);
+        target_kv->key_slab = mlx::core::slice_update(
+            *target_kv->key_slab,
+            keys,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->value_slab = mlx::core::slice_update(
+            *target_kv->value_slab,
+            values,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->visible_tokens = updated_len;
+        target_kv->key = logical_kv_slice(*target_kv->key_slab, updated_len, n_kv_heads, head_dim);
+        target_kv->value = logical_kv_slice(*target_kv->value_slab, updated_len, n_kv_heads, head_dim);
+        attention_key_len = updated_len;
+        attention_keys = *target_kv->key;
+        attention_values = *target_kv->value;
+    } else {
+        // Sliding layers attend over the previous bounded window plus the new
+        // block, then store only the newest window in the fixed-size slab.
+        array previous_keys = layer_logical_key(*target_kv, n_kv_heads, head_dim);
+        array previous_values = layer_logical_value(*target_kv, n_kv_heads, head_dim);
+        array combined_keys = mlx::core::concatenate({previous_keys, keys}, 2);
+        array combined_values = mlx::core::concatenate({previous_values, values}, 2);
+        const auto& attention_key_shape = combined_keys.shape();
+        if (attention_key_shape.size() < 3) {
+            throw std::runtime_error("native incremental block decode produced malformed KV key shape");
+        }
+        attention_key_len = attention_key_shape[2];
+        const int stored_start = std::max(0, attention_key_len - kSlidingWindowSize);
+        const int stored_len = attention_key_len - stored_start;
+        array stored_keys = mlx::core::slice(
+            combined_keys,
+            {0, 0, stored_start, 0},
+            {1, n_kv_heads, attention_key_len, head_dim});
+        array stored_values = mlx::core::slice(
+            combined_values,
+            {0, 0, stored_start, 0},
+            {1, n_kv_heads, attention_key_len, head_dim});
+        ensure_layer_slab_capacity(target_kv, full_attention, kSlidingWindowSize, n_kv_heads, head_dim);
+        target_kv->key_slab = mlx::core::slice_update(
+            *target_kv->key_slab,
+            stored_keys,
+            {0, 0, 0, 0},
+            {1, n_kv_heads, stored_len, head_dim});
+        target_kv->value_slab = mlx::core::slice_update(
+            *target_kv->value_slab,
+            stored_values,
+            {0, 0, 0, 0},
+            {1, n_kv_heads, stored_len, head_dim});
+        target_kv->visible_tokens = stored_len;
+        target_kv->key = logical_kv_slice(*target_kv->key_slab, stored_len, n_kv_heads, head_dim);
+        target_kv->value = logical_kv_slice(*target_kv->value_slab, stored_len, n_kv_heads, head_dim);
+        attention_keys = std::move(combined_keys);
+        attention_values = std::move(combined_values);
     }
-    const int attention_key_len = attention_key_shape[2];
-    if (!full_attention && attention_key_len > kSlidingWindowSize) {
-        stored_keys = mlx::core::slice(
-            attention_keys,
-            {0, 0, attention_key_len - kSlidingWindowSize, 0},
-            {1, n_kv_heads, attention_key_len, head_dim});
-        stored_values = mlx::core::slice(
-            attention_values,
-            {0, 0, attention_key_len - kSlidingWindowSize, 0},
-            {1, n_kv_heads, attention_key_len, head_dim});
+    if (!attention_keys.has_value() || !attention_values.has_value()) {
+        throw std::runtime_error("native incremental block decode failed to build attention KV");
     }
     if (prefix_kv != nullptr && prefix_token_count > 0) {
         const int prefix_key_len = previous_key_len + prefix_token_count;
@@ -904,22 +1167,23 @@ array target_attention_decode_block_forward(
         }
         const int prefix_start =
             (!full_attention && prefix_key_len > kSlidingWindowSize) ? prefix_key_len - kSlidingWindowSize : 0;
-        prefix_kv->full_attention = full_attention;
-        prefix_kv->key = mlx::core::slice(
-            attention_keys,
-            {0, 0, prefix_start, 0},
-            {1, n_kv_heads, prefix_key_len, head_dim});
-        prefix_kv->value = mlx::core::slice(
-            attention_values,
-            {0, 0, prefix_start, 0},
-            {1, n_kv_heads, prefix_key_len, head_dim});
+        set_layer_from_logical_kv(
+            prefix_kv,
+            full_attention,
+            mlx::core::slice(
+                *attention_keys,
+                {0, 0, prefix_start, 0},
+                {1, n_kv_heads, prefix_key_len, head_dim}),
+            mlx::core::slice(
+                *attention_values,
+                {0, 0, prefix_start, 0},
+                {1, n_kv_heads, prefix_key_len, head_dim}),
+            n_kv_heads,
+            head_dim);
         if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
             mlx::core::eval({*prefix_kv->key, *prefix_kv->value});
         }
     }
-    target_kv->full_attention = full_attention;
-    target_kv->key = stored_keys;
-    target_kv->value = stored_values;
     if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
         mlx::core::eval({*target_kv->key, *target_kv->value});
     }
@@ -933,8 +1197,8 @@ array target_attention_decode_block_forward(
         full_attention);
     array output = mlx::core::fast::scaled_dot_product_attention(
         queries,
-        attention_keys,
-        attention_values,
+        *attention_keys,
+        *attention_values,
         1.0f,
         "",
         mask);
@@ -1175,19 +1439,6 @@ struct NativeForwardArrays {
     SharedKvArrays shared_kv;
 };
 
-struct NativeVerifyArrays {
-    std::vector<int32_t> greedy_tokens;
-    std::vector<float> greedy_logits;
-    std::vector<int32_t> top_token_ids;
-    std::vector<float> top_logits;
-    std::vector<float> draft_logits;
-    std::vector<float> logit_margins;
-    std::vector<bool> draft_in_top_k;
-    array last_hidden;
-    SharedKvArrays shared_kv;
-    float peak_memory_gb = 0.0f;
-};
-
 NativeHiddenArrays decode_block_hidden(
     const NativeTextModel::Impl& impl,
     const int32_t* tokens,
@@ -1255,141 +1506,6 @@ NativeHiddenArrays decode_block_hidden(
         prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
     }
     return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
-}
-
-void insert_topk(
-    std::vector<int32_t>* top_ids,
-    std::vector<float>* top_logits,
-    int32_t token_id,
-    float logit,
-    size_t top_k) {
-    for (size_t index = 0; index < top_k; ++index) {
-        if (token_id == (*top_ids)[index]) {
-            return;
-        }
-        if (logit > (*top_logits)[index]) {
-            for (size_t shift = top_k - 1; shift > index; --shift) {
-                (*top_ids)[shift] = (*top_ids)[shift - 1];
-                (*top_logits)[shift] = (*top_logits)[shift - 1];
-            }
-            (*top_ids)[index] = token_id;
-            (*top_logits)[index] = logit;
-            return;
-        }
-    }
-}
-
-void fill_shape(const array& value, uint32_t* rank, uint64_t* shape) {
-    if (rank == nullptr || shape == nullptr) {
-        return;
-    }
-    *rank = 0;
-    std::fill(shape, shape + GEMMA4_MTP_TRACE_MAX_RANK, 0);
-    const auto& dims = value.shape();
-    *rank = static_cast<uint32_t>(std::min<size_t>(dims.size(), GEMMA4_MTP_TRACE_MAX_RANK));
-    for (size_t index = 0; index < *rank; ++index) {
-        shape[index] = static_cast<uint64_t>(dims[index]);
-    }
-}
-
-void fill_optional_shape(const std::optional<array>& value, uint32_t* rank, uint64_t* shape) {
-    if (!value.has_value()) {
-        if (rank != nullptr) {
-            *rank = 0;
-        }
-        if (shape != nullptr) {
-            std::fill(shape, shape + GEMMA4_MTP_TRACE_MAX_RANK, 0);
-        }
-        return;
-    }
-    fill_shape(*value, rank, shape);
-}
-
-void initialize_mtp_trace(Gemma4MtpTraceInfo* trace) {
-    if (trace == nullptr) {
-        return;
-    }
-    *trace = Gemma4MtpTraceInfo{};
-    std::fill(
-        trace->draft_tokens,
-        trace->draft_tokens + GEMMA4_MTP_TRACE_MAX_POSITIONS,
-        static_cast<int32_t>(-1));
-    std::fill(
-        trace->target_tokens,
-        trace->target_tokens + GEMMA4_MTP_TRACE_MAX_POSITIONS,
-        static_cast<int32_t>(-1));
-    std::fill(
-        trace->top_token_ids,
-        trace->top_token_ids + (GEMMA4_MTP_TRACE_MAX_POSITIONS * GEMMA4_MTP_TRACE_TOP_K),
-        static_cast<int32_t>(-1));
-    trace->full_attention_layer = kMtpFullAttentionSharedLayer;
-    trace->sliding_attention_layer = kMtpSlidingAttentionSharedLayer;
-}
-
-void populate_mtp_trace(
-    Gemma4StepResult* out,
-    uint64_t context_sequence_len,
-    const int32_t* draft_tokens,
-    size_t draft_count,
-    const NativeVerifyArrays& verified) {
-    if (out == nullptr) {
-        return;
-    }
-    Gemma4MtpTraceInfo* trace = &out->mtp_trace;
-    initialize_mtp_trace(trace);
-    trace->context_sequence_len = context_sequence_len;
-    trace->first_position = context_sequence_len == 0 ? 0 : context_sequence_len - 1;
-    trace->position_count = static_cast<uint32_t>(
-        std::min<size_t>(verified.greedy_tokens.size(), GEMMA4_MTP_TRACE_MAX_POSITIONS));
-    trace->top_k = GEMMA4_MTP_TRACE_TOP_K;
-
-    for (size_t position = 0; position < trace->position_count; ++position) {
-        trace->position_offsets[position] = trace->first_position + position;
-        trace->target_tokens[position] = verified.greedy_tokens[position];
-        if (position < verified.greedy_logits.size()) {
-            trace->target_logits[position] = verified.greedy_logits[position];
-        }
-        if (draft_tokens != nullptr && position < draft_count) {
-            trace->draft_tokens[position] = draft_tokens[position];
-            if (position < verified.draft_logits.size()) {
-                trace->draft_logits[position] = verified.draft_logits[position];
-            }
-            if (position < verified.logit_margins.size()) {
-                trace->logit_margins[position] = verified.logit_margins[position];
-            }
-            if (position < verified.draft_in_top_k.size()) {
-                trace->draft_in_top_k[position] = verified.draft_in_top_k[position];
-            }
-        }
-
-        for (size_t rank = 0; rank < GEMMA4_MTP_TRACE_TOP_K; ++rank) {
-            const size_t trace_index = position * GEMMA4_MTP_TRACE_TOP_K + rank;
-            if (trace_index < verified.top_token_ids.size()) {
-                trace->top_token_ids[trace_index] = verified.top_token_ids[trace_index];
-            }
-            if (trace_index < verified.top_logits.size()) {
-                trace->top_logits[trace_index] = verified.top_logits[trace_index];
-            }
-        }
-    }
-
-    fill_shape(verified.last_hidden, &trace->hidden_rank, trace->hidden_shape);
-    fill_optional_shape(
-        verified.shared_kv.full_attention_key,
-        &trace->full_attention_key_rank,
-        trace->full_attention_key_shape);
-    fill_optional_shape(
-        verified.shared_kv.full_attention_value,
-        &trace->full_attention_value_rank,
-        trace->full_attention_value_shape);
-    fill_optional_shape(
-        verified.shared_kv.sliding_attention_key,
-        &trace->sliding_attention_key_rank,
-        trace->sliding_attention_key_shape);
-    fill_optional_shape(
-        verified.shared_kv.sliding_attention_value,
-        &trace->sliding_attention_value_rank,
-        trace->sliding_attention_value_shape);
 }
 
 NativeHiddenArrays forward_hidden(
@@ -1647,104 +1763,6 @@ NativeForwardArrays decode_block_logits(
         prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
     }
     return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(shared_kv)};
-}
-
-NativeVerifyArrays forward_verify_logits(
-    const NativeTextModel::Impl& impl,
-    const std::vector<int32_t>& tokens,
-    size_t first_position,
-    size_t position_count,
-    const int32_t* draft_tokens,
-    size_t draft_count) {
-    if (position_count == 0) {
-        throw std::runtime_error("native MTP verify requires at least one logit position");
-    }
-    if (first_position + position_count > tokens.size()) {
-        throw std::runtime_error("native MTP verify logit positions exceed token context");
-    }
-    if (first_position + position_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        throw std::runtime_error("native MTP verify position exceeds MLX shape limits");
-    }
-
-    mlx::core::reset_peak_memory();
-    NativeHiddenArrays forward = forward_hidden(impl, tokens);
-    const int first = static_cast<int>(first_position);
-    const int stop = static_cast<int>(first_position + position_count);
-    array selected_hidden = mlx::core::slice(forward.hidden, {0, first, 0}, {1, stop, 3840});
-    array logits = target_logits_for_hidden(impl, selected_hidden);
-    array logits_f32 = to_float32(logits);
-    array greedy = mlx::core::argmax(logits, -1);
-    array greedy_logits = to_float32(mlx::core::max(logits, -1));
-    array last_hidden = mlx::core::slice(
-        forward.hidden,
-        {0, static_cast<int>(tokens.size() - 1), 0},
-        {1, static_cast<int>(tokens.size()), 3840});
-    mlx::core::eval({greedy, greedy_logits, last_hidden, logits_f32});
-
-    std::vector<int32_t> greedy_tokens;
-    std::vector<float> greedy_logits_out;
-    std::vector<int32_t> top_token_ids;
-    std::vector<float> top_logits;
-    std::vector<float> draft_logits;
-    std::vector<float> logit_margins;
-    std::vector<bool> draft_in_top_k;
-    greedy_tokens.reserve(position_count);
-    greedy_logits_out.reserve(position_count);
-    top_token_ids.reserve(position_count * GEMMA4_MTP_TRACE_TOP_K);
-    top_logits.reserve(position_count * GEMMA4_MTP_TRACE_TOP_K);
-    draft_logits.reserve(draft_count);
-    logit_margins.reserve(draft_count);
-    draft_in_top_k.reserve(draft_count);
-    const int* token_data = greedy.data<int>();
-    const float* logit_data = greedy_logits.data<float>();
-    const float* all_logits = logits_f32.data<float>();
-    const auto& logits_shape = logits_f32.shape();
-    const int vocab_size = logits_shape.empty() ? 0 : logits_shape.back();
-    for (size_t index = 0; index < position_count; ++index) {
-        greedy_tokens.push_back(static_cast<int32_t>(token_data[index]));
-        greedy_logits_out.push_back(logit_data[index]);
-
-        std::vector<int32_t> position_top_ids(GEMMA4_MTP_TRACE_TOP_K, -1);
-        std::vector<float> position_top_logits(
-            GEMMA4_MTP_TRACE_TOP_K,
-            -std::numeric_limits<float>::infinity());
-        const float* row = all_logits + (index * static_cast<size_t>(vocab_size));
-        for (int token = 0; token < vocab_size; ++token) {
-            insert_topk(
-                &position_top_ids,
-                &position_top_logits,
-                static_cast<int32_t>(token),
-                row[token],
-                GEMMA4_MTP_TRACE_TOP_K);
-        }
-        top_token_ids.insert(top_token_ids.end(), position_top_ids.begin(), position_top_ids.end());
-        top_logits.insert(top_logits.end(), position_top_logits.begin(), position_top_logits.end());
-
-        if (draft_tokens != nullptr && index < draft_count) {
-            const int32_t draft_token = draft_tokens[index];
-            const bool valid_draft = draft_token >= 0 && draft_token < vocab_size;
-            const float draft_logit =
-                valid_draft ? row[draft_token] : -std::numeric_limits<float>::infinity();
-            draft_logits.push_back(draft_logit);
-            logit_margins.push_back(logit_data[index] - draft_logit);
-            draft_in_top_k.push_back(
-                std::find(position_top_ids.begin(), position_top_ids.end(), draft_token) !=
-                position_top_ids.end());
-        }
-    }
-    const float peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
-    return NativeVerifyArrays{
-        std::move(greedy_tokens),
-        std::move(greedy_logits_out),
-        std::move(top_token_ids),
-        std::move(top_logits),
-        std::move(draft_logits),
-        std::move(logit_margins),
-        std::move(draft_in_top_k),
-        std::move(last_hidden),
-        std::move(forward.shared_kv),
-        peak_memory_gb,
-    };
 }
 
 array target_token_embedding(const NativeTextModel::Impl& impl, int32_t token_id) {
@@ -2295,7 +2313,25 @@ std::unique_ptr<NativeKvState> NativeKvState::clone() const {
     }
     std::unique_ptr<NativeKvState> cloned(new NativeKvState());
 #ifdef GEMMA4D_MLX_AVAILABLE
-    cloned->impl_->layers = impl_->layers;
+    cloned->impl_->layers.reserve(impl_->layers.size());
+    for (const NativeKvState::Impl::Layer& layer : impl_->layers) {
+        NativeKvState::Impl::Layer logical_layer;
+        logical_layer.full_attention = layer.full_attention;
+        const int n_kv_heads = layer.full_attention ? 1 : 8;
+        const int head_dim = layer.full_attention ? 512 : 256;
+        if (layer.key.has_value()) {
+            logical_layer.key = layer_logical_key(layer, n_kv_heads, head_dim);
+        }
+        if (layer.value.has_value()) {
+            logical_layer.value = layer_logical_value(layer, n_kv_heads, head_dim);
+        }
+        if (logical_layer.key.has_value() && logical_layer.key->shape().size() >= 3) {
+            logical_layer.visible_tokens = logical_layer.key->shape()[2];
+            logical_layer.capacity_tokens = logical_layer.visible_tokens;
+            logical_layer.sliding_write_offset = 0;
+        }
+        cloned->impl_->layers.push_back(std::move(logical_layer));
+    }
 #endif
     cloned->impl_->sequence_len = impl_->sequence_len;
     cloned->impl_->active_bytes = impl_->active_bytes;
@@ -2342,15 +2378,21 @@ bool NativeKvState::save_safetensors(
             payload_metadata[prefix + ".has_value"] = bool_metadata(layer.value.has_value());
             if (layer.key.has_value()) {
                 const std::string name = prefix + ".key";
-                arrays.insert_or_assign(name, *layer.key);
-                payload_metadata[name + ".shape"] = shape_metadata(*layer.key);
-                eval_arrays.push_back(*layer.key);
+                const int n_kv_heads = layer.full_attention ? 1 : 8;
+                const int head_dim = layer.full_attention ? 512 : 256;
+                array logical_key = layer_logical_key(layer, n_kv_heads, head_dim);
+                arrays.insert_or_assign(name, logical_key);
+                payload_metadata[name + ".shape"] = shape_metadata(logical_key);
+                eval_arrays.push_back(logical_key);
             }
             if (layer.value.has_value()) {
                 const std::string name = prefix + ".value";
-                arrays.insert_or_assign(name, *layer.value);
-                payload_metadata[name + ".shape"] = shape_metadata(*layer.value);
-                eval_arrays.push_back(*layer.value);
+                const int n_kv_heads = layer.full_attention ? 1 : 8;
+                const int head_dim = layer.full_attention ? 512 : 256;
+                array logical_value = layer_logical_value(layer, n_kv_heads, head_dim);
+                arrays.insert_or_assign(name, logical_value);
+                payload_metadata[name + ".shape"] = shape_metadata(logical_value);
+                eval_arrays.push_back(logical_value);
             }
         }
 
@@ -2472,10 +2514,13 @@ bool NativeKvState::save_compressed_safetensors(
                 mode,
                 compress_global_layers,
                 compress_sliding_layers);
+            const int n_kv_heads = layer.full_attention ? 1 : 8;
+            const int head_dim = layer.full_attention ? 512 : 256;
             if (layer.key.has_value()) {
+                array logical_key = layer_logical_key(layer, n_kv_heads, head_dim);
                 add_encoded_tensor(
                     prefix + ".key",
-                    *layer.key,
+                    logical_key,
                     compress_layer,
                     mode,
                     &arrays,
@@ -2484,9 +2529,10 @@ bool NativeKvState::save_compressed_safetensors(
                     &compressed_tensor_count);
             }
             if (layer.value.has_value()) {
+                array logical_value = layer_logical_value(layer, n_kv_heads, head_dim);
                 add_encoded_tensor(
                     prefix + ".value",
-                    *layer.value,
+                    logical_value,
                     compress_layer,
                     mode,
                     &arrays,
@@ -3542,145 +3588,6 @@ bool NativeTextModel::decode_incremental_block_with_prefix(
         return false;
     } catch (...) {
         *error = "native Gemma 4 incremental block decode failed with an unknown exception";
-        return false;
-    }
-#endif
-}
-
-bool NativeTextModel::verify_draft_block(
-    const std::vector<int32_t>& context_tokens,
-    const int32_t* draft_tokens,
-    size_t draft_count,
-    std::vector<int32_t>* committed_tokens,
-    Gemma4StepResult* out,
-    std::string* error,
-    std::unique_ptr<NativeHiddenState>* last_hidden) const {
-    if (committed_tokens == nullptr || out == nullptr || error == nullptr) {
-        return false;
-    }
-    committed_tokens->clear();
-    *out = Gemma4StepResult{};
-    error->clear();
-    if (last_hidden != nullptr) {
-        last_hidden->reset();
-    }
-    if (context_tokens.empty()) {
-        *error = "native MTP verify requires a non-empty accepted context";
-        return false;
-    }
-    if (draft_count == 0 || draft_tokens == nullptr) {
-        *error = "native MTP verify requires at least one draft token";
-        return false;
-    }
-    if (draft_count > 2) {
-        *error = "native MTP verify currently supports draft_count <= 2 for M06";
-        return false;
-    }
-    if (context_tokens.size() + draft_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        *error = "native MTP verify token count exceeds MLX shape limits";
-        return false;
-    }
-
-#ifndef GEMMA4D_MLX_AVAILABLE
-    (void)draft_tokens;
-    (void)last_hidden;
-    *error = "native Gemma 4 graph was requested, but gemma4_mlx was not built with MLX";
-    return false;
-#else
-    try {
-        if (impl_ == nullptr || impl_->language_tensor_count == 0) {
-            *error = "native Gemma 4 model state is not loaded";
-            return false;
-        }
-
-        std::vector<int32_t> candidate_tokens = context_tokens;
-        candidate_tokens.insert(candidate_tokens.end(), draft_tokens, draft_tokens + draft_count);
-        NativeVerifyArrays verified = forward_verify_logits(
-            *impl_,
-            candidate_tokens,
-            context_tokens.size() - 1,
-            draft_count + 1,
-            draft_tokens,
-            draft_count);
-
-        size_t accepted_count = 0;
-        bool rejected = false;
-        int32_t fallback_token = 0;
-        for (size_t index = 0; index < draft_count; ++index) {
-            const int32_t target_token = verified.greedy_tokens[index];
-            if (draft_tokens[index] == target_token) {
-                ++accepted_count;
-                continue;
-            }
-            rejected = true;
-            fallback_token = target_token;
-            break;
-        }
-
-        if (rejected) {
-            std::vector<int32_t> fallback_tokens = context_tokens;
-            fallback_tokens.insert(fallback_tokens.end(), draft_tokens, draft_tokens + accepted_count);
-            fallback_tokens.push_back(fallback_token);
-
-            Gemma4StepResult fallback_step{};
-            std::unique_ptr<NativeHiddenState> fallback_hidden;
-            if (!forward_greedy(fallback_tokens, &fallback_step, error, &fallback_hidden)) {
-                return false;
-            }
-            if (fallback_step.peak_memory_gb < verified.peak_memory_gb) {
-                fallback_step.peak_memory_gb = verified.peak_memory_gb;
-            }
-            *committed_tokens = std::move(fallback_tokens);
-            *out = fallback_step;
-            populate_mtp_trace(out, context_tokens.size(), draft_tokens, draft_count, verified);
-            out->accepted_draft_count = static_cast<uint32_t>(accepted_count);
-            out->committed_count = static_cast<uint32_t>(committed_tokens->size() - context_tokens.size());
-            for (size_t index = 0; index < out->committed_count && index < 4; ++index) {
-                out->committed_tokens[index] = (*committed_tokens)[context_tokens.size() + index];
-            }
-            if (last_hidden != nullptr) {
-                *last_hidden = std::move(fallback_hidden);
-                out->native_last_hidden = last_hidden->get();
-            }
-            return true;
-        }
-
-        std::unique_ptr<NativeHiddenState> hidden;
-        if (last_hidden != nullptr) {
-            std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
-                std::move(verified.last_hidden),
-                std::move(verified.shared_kv.full_attention_key),
-                std::move(verified.shared_kv.full_attention_value),
-                std::move(verified.shared_kv.sliding_attention_key),
-                std::move(verified.shared_kv.sliding_attention_value),
-                static_cast<uint64_t>(candidate_tokens.size()),
-                3840,
-            });
-            hidden.reset(new NativeHiddenState(std::move(hidden_impl)));
-        }
-
-        *committed_tokens = std::move(candidate_tokens);
-        out->greedy_token = verified.greedy_tokens[draft_count];
-        out->greedy_logit = verified.greedy_logits[draft_count];
-        out->sequence_len = committed_tokens->size();
-        out->peak_memory_gb = verified.peak_memory_gb;
-        out->peak_rss_mb = 0.0f;
-        populate_mtp_trace(out, context_tokens.size(), draft_tokens, draft_count, verified);
-        out->accepted_draft_count = static_cast<uint32_t>(draft_count);
-        out->committed_count = static_cast<uint32_t>(draft_count);
-        for (size_t index = 0; index < draft_count && index < 4; ++index) {
-            out->committed_tokens[index] = draft_tokens[index];
-        }
-        out->native_last_hidden = hidden.get();
-        if (last_hidden != nullptr) {
-            *last_hidden = std::move(hidden);
-        }
-        return true;
-    } catch (const std::exception& ex) {
-        *error = std::string("native Gemma 4 MTP verify failed: ") + ex.what();
-        return false;
-    } catch (...) {
-        *error = "native Gemma 4 MTP verify failed with an unknown exception";
         return false;
     }
 #endif

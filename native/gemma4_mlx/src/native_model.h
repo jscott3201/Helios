@@ -193,15 +193,6 @@ public:
         std::string* error,
         std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
 
-    bool verify_draft_block(
-        const std::vector<int32_t>& context_tokens,
-        const int32_t* draft_tokens,
-        size_t draft_count,
-        std::vector<int32_t>* committed_tokens,
-        Gemma4StepResult* out,
-        std::string* error,
-        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
-
 private:
     std::unique_ptr<Impl> impl_;
 
