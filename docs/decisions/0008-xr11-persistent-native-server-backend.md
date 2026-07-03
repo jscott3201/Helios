@@ -57,8 +57,11 @@ gate for model-backed serving:
   stub behavior.
 - Explicit `--backend real-helper --model-path PATH` remains available as a
   helper-backed opt-out.
-- Admission memory estimates now use measured XR51/P04 native memory constants
-  rather than the original stub-era `(prompt + max_tokens) * 4096` estimate.
+- Admission memory estimates are backend-aware. Stub keeps the original
+  lightweight `(legacy_prompt_tokens + max_tokens) * 4096` estimate with no
+  native resident-weights charge, while RealHelper and PersistentNative use
+  measured XR51/P04 native memory constants and fail closed for unchunked
+  prompt estimates above 16K.
 
 ## Evidence
 
