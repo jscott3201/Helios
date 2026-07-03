@@ -782,7 +782,7 @@ fn run_mtp(
         }
         let accepted_usize = usize::try_from(step.accepted_draft_count).unwrap_or(usize::MAX);
         let expected_trace_positions = if terminal_skip_applied {
-            accepted_usize.min(draft.len())
+            draft.len()
         } else if accepted_usize >= draft.len() {
             draft.len() + 1
         } else {
@@ -1421,6 +1421,15 @@ fn startup_blockers(args: &Args, source_replay: &Option<SourceReplaySummary>) ->
     }
     if env::var_os("GEMMA4D_REQUIRE_MLX").is_none() {
         blockers.push("GEMMA4D_REQUIRE_MLX=1 is required for XR15".to_owned());
+    }
+    if env::var_os("GEMMA4D_EXPERIMENTAL_MTP_BATCH_VERIFY").is_some()
+        && args.block_sizes.iter().any(|block_size| *block_size > 2)
+    {
+        blockers.push(
+            "GEMMA4D_EXPERIMENTAL_MTP_BATCH_VERIFY only supports block size 2; \
+             unset it or restrict --block-sizes to <=2"
+                .to_owned(),
+        );
     }
     if args.experimental_terminal_no_lookahead {
         for flag in [

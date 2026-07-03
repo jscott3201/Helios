@@ -108,18 +108,20 @@ measured default-off block-prefix experiment to N>2.
   `benchmarks/out/XR55-nblock-generalization/xr55-nblock-summary.{md,json}`.
   Provenance, block coverage, workload/trial coverage, greedy exactness,
   tiny16 memory, trace completeness, full-N=8 event coverage, summary policy,
-  and sequential differential gates passed.
+  and sequential differential gates passed. Active `GEMMA4D_*` env stamping was
+  added after these XR55 benchmark legs, so the existing records disclose the
+  intended env through commands/ledger text rather than `build_provenance`.
 
 Block sweep aggregate:
 
 | N | Exact measured | Speedup | Acceptance | Tokens/verify | Draft ms | Verify ms | Verify forward ms | Verify repair ms | Draft-step verify units | Peak MLX |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | `9/9` | `-8.266%` | `162/234 = 0.692` | `1.231` | `1200.8` | `22778.1` | `22765.4` | `0.0` | `0.053` | `7.652 GB` |
-| 2 | `9/9` | `+14.168%` | `165/237 = 0.696` | `2.000` | `1253.6` | `17157.7` | `15341.2` | `1808.6` | `0.044` | `8.008 GB` |
-| 3 | `9/9` | `+18.054%` | `165/252 = 0.655` | `2.400` | `1283.0` | `16100.2` | `14258.0` | `1835.7` | `0.038` | `8.357 GB` |
-| 4 | `9/9` | `+7.151%` | `162/270 = 0.600` | `3.097` | `1317.1` | `18921.8` | `12798.8` | `6116.7` | `0.024` | `8.357 GB` |
-| 6 | `9/9` | `-1.367%` | `162/348 = 0.466` | `3.310` | `1541.0` | `20907.0` | `14642.8` | `6258.2` | `0.018` | `8.358 GB` |
-| 8 | `9/9` | `-9.353%` | `162/423 = 0.383` | `3.429` | `1743.9` | `22778.6` | `16502.8` | `6270.0` | `0.015` | `8.358 GB` |
+| 1 | `9/9` | `-8.266%` | `162/234 = 0.692` | `1.000` | `1200.8` | `22778.1` | `22765.4` | `0.0` | `0.053` | `7.652 GB` |
+| 2 | `9/9` | `+14.168%` | `165/237 = 0.696` | `1.641` | `1253.6` | `17157.7` | `15341.2` | `1808.6` | `0.044` | `8.008 GB` |
+| 3 | `9/9` | `+18.054%` | `165/252 = 0.655` | `2.065` | `1283.0` | `16100.2` | `14258.0` | `1835.7` | `0.038` | `8.357 GB` |
+| 4 | `9/9` | `+7.151%` | `162/270 = 0.600` | `2.783` | `1317.1` | `18921.8` | `12798.8` | `6116.7` | `0.024` | `8.357 GB` |
+| 6 | `9/9` | `-1.367%` | `162/348 = 0.466` | `3.048` | `1541.0` | `20907.0` | `14642.8` | `6258.2` | `0.018` | `8.358 GB` |
+| 8 | `9/9` | `-9.353%` | `162/423 = 0.383` | `3.200` | `1743.9` | `22778.6` | `16502.8` | `6270.0` | `0.015` | `8.358 GB` |
 
 Per-slot acceptance:
 
@@ -149,7 +151,9 @@ Interpretation:
 - N=3 was the best fixed block in aggregate. Fixed N=4, N=6, and N=8 are not
   broad candidates because at least two held-out workloads regress.
 - `mtp_candidate_1k_001` still auto-disables in every measured record and is
-  not a selected workload.
+  not a selected workload. Its fixed-N legs regress by roughly `-0.8%` at best
+  and `-26.5%` at N=8; unselected workloads enter the guarded aggregate at
+  baseline latency on both sides.
 - Draft cost per draft step stayed below the `0.1` verify-unit flag threshold
   for every block. The binding cost for N>=4 is exact prefix repair, not draft
   step cost.

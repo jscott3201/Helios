@@ -1737,7 +1737,7 @@ Gemma4Status verify_tokens_impl(
             }
             verify_forward_ms += elapsed_ms(forward_started);
 
-            const size_t lookahead_index = draft_count;
+            const size_t lookahead_index = 1;
             fallback_step.peak_memory_gb =
                 std::max(fallback_step.peak_memory_gb, cache->last_step.peak_memory_gb);
             fallback_step.active_kv_bytes =

@@ -79,6 +79,24 @@ def fmt_float(value: float, digits: int = 3) -> str:
     return f"{value:.{digits}f}"
 
 
+def required_float(
+    record: dict[str, Any],
+    section: str,
+    field: str,
+    failures: list[str],
+    key: tuple[str, str, int, int],
+) -> float | None:
+    value = (record.get(section) or {}).get(field)
+    if value is None:
+        failures.append(f"{key}: missing {section}.{field}")
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        failures.append(f"{key}: invalid {section}.{field}={value!r}")
+        return None
+
+
 def block_coverage_failures(
     records: list[dict[str, Any]],
     expected_blocks: list[int],
@@ -153,11 +171,11 @@ def memory_failures(records: list[dict[str, Any]], memory_cliff_gb: float) -> li
     failures: list[str] = []
     for record in records:
         key = record_key(record)
-        mtp_peak = float(record.get("mtp", {}).get("peak_memory_gb") or 0.0)
-        baseline_peak = float(record.get("baseline", {}).get("peak_memory_gb") or 0.0)
-        if mtp_peak > memory_cliff_gb:
+        mtp_peak = required_float(record, "mtp", "peak_memory_gb", failures, key)
+        baseline_peak = required_float(record, "baseline", "peak_memory_gb", failures, key)
+        if mtp_peak is not None and mtp_peak > memory_cliff_gb:
             failures.append(f"{key}: MTP peak {mtp_peak:.3f} GB > cliff {memory_cliff_gb:.3f} GB")
-        if baseline_peak > memory_cliff_gb:
+        if baseline_peak is not None and baseline_peak > memory_cliff_gb:
             failures.append(
                 f"{key}: baseline peak {baseline_peak:.3f} GB > cliff {memory_cliff_gb:.3f} GB"
             )
@@ -174,7 +192,7 @@ def trace_failures(records: list[dict[str, Any]]) -> list[str]:
             draft_len = len(event.get("draft_tokens") or [])
             accepted = int(event.get("accepted_draft_count") or 0)
             if event.get("terminal_no_lookahead"):
-                expected = min(accepted, draft_len)
+                expected = draft_len
             elif accepted >= draft_len:
                 expected = draft_len + 1
             else:
@@ -239,7 +257,15 @@ def aggregate_blocks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         attempted = sum(int(record["mtp"]["attempted_draft_tokens"]) for record in block_records)
         accepted = sum(int(record["mtp"]["accepted_draft_tokens"]) for record in block_records)
         verify_passes = sum(int(record["mtp"]["target_verify_passes"]) for record in block_records)
-        generated_tokens = sum(len(record["mtp"]["generated_tokens"]) for record in block_records)
+        verifier_records = [
+            record for record in block_records if not record["mtp"].get("auto_disabled")
+        ]
+        verifier_generated_tokens = sum(
+            len(record["mtp"]["generated_tokens"]) for record in verifier_records
+        )
+        verifier_passes = sum(
+            int(record["mtp"]["target_verify_passes"]) for record in verifier_records
+        )
         peak_mlx_gb = max(float(record["mtp"]["peak_memory_gb"]) for record in block_records)
         baseline_peak_gb = max(float(record["baseline"]["peak_memory_gb"]) for record in block_records)
         exact_records = sum(
@@ -277,9 +303,12 @@ def aggregate_blocks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "acceptance_rate": safe_ratio(accepted, attempted),
                 "accepted": accepted,
                 "attempted": attempted,
-                "tokens_per_verify_pass": safe_ratio(generated_tokens, verify_passes),
+                "tokens_per_verify_pass": safe_ratio(verifier_generated_tokens, verifier_passes),
                 "accepted_tokens_per_verify_pass": safe_ratio(accepted, verify_passes),
                 "verify_passes": verify_passes,
+                "tokens_per_verify_records": len(verifier_records),
+                "tokens_per_verify_generated_tokens": verifier_generated_tokens,
+                "tokens_per_verify_passes": verifier_passes,
                 "draft_ms": draft_ms,
                 "verify_ms": verify_ms,
                 "verify_forward_ms": verify_forward_ms,
@@ -347,6 +376,11 @@ def render_markdown(
 ) -> str:
     first = candidate_records[0]
     guarded = policy_summary(candidate_summary, GUARDED_POLICY)
+    gemma4d_env = (first.get("build_provenance") or {}).get("gemma4d_env")
+    if gemma4d_env:
+        env_line = ", ".join(f"{key}={value}" for key, value in sorted(gemma4d_env.items()))
+    else:
+        env_line = "not captured; env stamping postdates these XR55 legs"
     lines = [
         "# XR55 N-Block MTP Evidence",
         "",
@@ -357,6 +391,7 @@ def render_markdown(
         f"- Dirty diff SHA-256: `{first.get('build_provenance', {}).get('dirty_diff_sha256')}`",
         f"- Runner: `{first.get('build_provenance', {}).get('runner_binary_path')}`",
         f"- Runner link mtime: `{first.get('build_provenance', {}).get('runner_binary_link_mtime_unix_seconds')}`",
+        f"- GEMMA4D env: `{env_line}`",
         f"- Tiny16 memory cliff: `{fmt_float(memory_cliff_gb, 3)} GB`",
         "",
         "## Block Sweep",
