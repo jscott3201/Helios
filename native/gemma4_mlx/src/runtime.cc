@@ -166,6 +166,9 @@ void remember_last_step(NativeKvCache* cache, const Gemma4StepResult* step) {
     cache->last_step.verify_stage_ms = 0.0;
     cache->last_step.verify_forward_ms = 0.0;
     cache->last_step.verify_repair_ms = 0.0;
+    cache->last_step.repair_clone_ms = 0.0;
+    cache->last_step.repair_forward_ms = 0.0;
+    cache->last_step.repair_fallback_ms = 0.0;
     cache->has_last_step = true;
 }
 
@@ -707,7 +710,7 @@ Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_runtime_version requires a non-null out pointer");
     }
 
-    out->abi_version = 2;
+    out->abi_version = 3;
     out->backend_name = "gemma4_mlx";
     out->backend_version = kBackendVersion;
     return ok();
@@ -1700,6 +1703,9 @@ Gemma4Status verify_tokens_impl(
         double verify_stage_ms = 0.0;
         double verify_forward_ms = 0.0;
         double verify_repair_ms = 0.0;
+        double repair_clone_ms = 0.0;
+        double repair_forward_ms = 0.0;
+        double repair_fallback_ms = 0.0;
         auto attach_verify_timings = [&](Gemma4StepResult* step) {
             if (step == nullptr) {
                 return;
@@ -1707,6 +1713,9 @@ Gemma4Status verify_tokens_impl(
             step->verify_stage_ms = verify_stage_ms;
             step->verify_forward_ms = verify_forward_ms;
             step->verify_repair_ms = verify_repair_ms;
+            step->repair_clone_ms = repair_clone_ms;
+            step->repair_forward_ms = repair_forward_ms;
+            step->repair_fallback_ms = repair_fallback_ms;
         };
         // Experimental XR30 prototype: when the first draft token already
         // disagrees with the cached target greedy token, no speculative token
@@ -1790,13 +1799,14 @@ Gemma4Status verify_tokens_impl(
             std::vector<int32_t> block_greedy_tokens;
             std::vector<float> block_greedy_logits;
             std::unique_ptr<gemma4d::NativeHiddenState> block_hidden;
+            size_t retroactive_prefix_count = 0;
             const auto forward_started = std::chrono::steady_clock::now();
-            if (!target->native_model->decode_incremental_block_with_prefix(
+            if (!target->native_model->decode_incremental_block_with_retroactive_prefix(
                     draft_tokens,
                     draft_count,
-                    1,
                     block_kv.get(),
                     prefix_kv.get(),
+                    &retroactive_prefix_count,
                     &block_step,
                     &block_greedy_tokens,
                     &block_greedy_logits,
@@ -1817,6 +1827,11 @@ Gemma4Status verify_tokens_impl(
                 ++accepted_prefix_count;
             }
             const bool full_block_accepted = accepted_prefix_count == draft_count;
+            if (retroactive_prefix_count != accepted_prefix_count) {
+                return fail(
+                    GEMMA4_ERR_RUNTIME,
+                    "native MTP block-prefix retroactive prefix count disagreed with verifier comparison");
+            }
 
             const uint64_t context_sequence_len = cache->native_tokens.size();
             Gemma4MtpTraceInfo trace{};
@@ -1842,12 +1857,14 @@ Gemma4Status verify_tokens_impl(
             auto commit_serial_repaired_state =
                 [&](const std::vector<int32_t>& committed_tokens, uint32_t accepted_count) -> Gemma4Status {
                 const auto repair_started = std::chrono::steady_clock::now();
+                const auto clone_started = std::chrono::steady_clock::now();
                 std::unique_ptr<gemma4d::NativeKvState> serial_kv = cache->native_kv_state->clone();
                 if (serial_kv == nullptr) {
                     return fail(
                         GEMMA4_ERR_RUNTIME,
                         "native MTP block-prefix serial-state repair failed to clone target KV state");
                 }
+                repair_clone_ms += elapsed_ms(clone_started);
                 Gemma4StepResult serial_step{};
                 std::unique_ptr<gemma4d::NativeHiddenState> serial_hidden;
                 float peak_memory_gb = std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
@@ -1855,6 +1872,7 @@ Gemma4Status verify_tokens_impl(
                 for (size_t index = 0; index < committed_count; ++index) {
                     if (state_only_serial_repair && index + 1 < committed_count) {
                         Gemma4StepResult state_step{};
+                        const auto forward_started = std::chrono::steady_clock::now();
                         if (!target->native_model->decode_incremental_state_only(
                                 committed_tokens[index],
                                 serial_kv.get(),
@@ -1862,9 +1880,11 @@ Gemma4Status verify_tokens_impl(
                                 &native_error)) {
                             return fail(GEMMA4_ERR_RUNTIME, native_error);
                         }
+                        repair_forward_ms += elapsed_ms(forward_started);
                         peak_memory_gb = std::max(peak_memory_gb, state_step.peak_memory_gb);
                         continue;
                     }
+                    const auto forward_started = std::chrono::steady_clock::now();
                     if (!target->native_model->decode_incremental(
                             committed_tokens[index],
                             serial_kv.get(),
@@ -1873,6 +1893,7 @@ Gemma4Status verify_tokens_impl(
                             &serial_hidden)) {
                         return fail(GEMMA4_ERR_RUNTIME, native_error);
                     }
+                    repair_forward_ms += elapsed_ms(forward_started);
                     peak_memory_gb = std::max(peak_memory_gb, serial_step.peak_memory_gb);
                 }
                 verify_repair_ms += elapsed_ms(repair_started);
@@ -1914,47 +1935,31 @@ Gemma4Status verify_tokens_impl(
                 const size_t accepted_count_usize = static_cast<size_t>(accepted_count);
                 const int32_t fallback_token = committed_tokens.back();
                 const auto repair_started = std::chrono::steady_clock::now();
-                std::unique_ptr<gemma4d::NativeKvState> accepted_block_kv = cache->native_kv_state->clone();
-                if (accepted_block_kv == nullptr) {
+                if (prefix_kv == nullptr || prefix_kv->sequence_len() !=
+                        cache->native_tokens.size() + accepted_count_usize) {
                     return fail(
                         GEMMA4_ERR_RUNTIME,
-                        "native MTP block-prefix repair failed to clone target KV state");
-                }
-                std::unique_ptr<gemma4d::NativeKvState> accepted_prefix_kv(new gemma4d::NativeKvState());
-                Gemma4StepResult accepted_prefix_step{};
-                std::vector<int32_t> accepted_prefix_greedy_tokens;
-                std::vector<float> accepted_prefix_greedy_logits;
-                if (!target->native_model->decode_incremental_block_with_prefix(
-                        draft_tokens,
-                        accepted_count_usize,
-                        accepted_count_usize,
-                        accepted_block_kv.get(),
-                        accepted_prefix_kv.get(),
-                        &accepted_prefix_step,
-                        &accepted_prefix_greedy_tokens,
-                        &accepted_prefix_greedy_logits,
-                        &native_error,
-                        nullptr)) {
-                    return fail(GEMMA4_ERR_RUNTIME, native_error);
+                        "native MTP block-prefix repair missing retroactive accepted-prefix KV");
                 }
 
                 Gemma4StepResult fallback_step{};
                 std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
+                const auto fallback_started = std::chrono::steady_clock::now();
                 if (!target->native_model->decode_incremental(
                         fallback_token,
-                        accepted_prefix_kv.get(),
+                        prefix_kv.get(),
                         &fallback_step,
                         &native_error,
                         &fallback_hidden)) {
                     return fail(GEMMA4_ERR_RUNTIME, native_error);
                 }
+                repair_fallback_ms += elapsed_ms(fallback_started);
                 verify_repair_ms += elapsed_ms(repair_started);
                 fallback_step.peak_memory_gb = std::max(
                     {fallback_step.peak_memory_gb,
-                     accepted_prefix_step.peak_memory_gb,
                      block_step.peak_memory_gb,
                      cache->last_step.peak_memory_gb});
-                fallback_step.active_kv_bytes = accepted_prefix_kv->active_bytes();
+                fallback_step.active_kv_bytes = prefix_kv->active_bytes();
                 record_mtp_target_step(&trace, committed_tokens.size(), context_sequence_len, fallback_step);
                 record_mtp_hidden_shape(&trace, fallback_hidden.get());
 
@@ -1971,7 +1976,7 @@ Gemma4Status verify_tokens_impl(
                 for (int32_t token : committed_tokens) {
                     cache->native_tokens.push_back(token);
                 }
-                cache->native_kv_state = std::move(accepted_prefix_kv);
+                cache->native_kv_state = std::move(prefix_kv);
                 cache->last_hidden = std::move(fallback_hidden);
                 fallback_step.native_last_hidden = cache->last_hidden.get();
                 *out = fallback_step;
@@ -2040,6 +2045,7 @@ Gemma4Status verify_tokens_impl(
             Gemma4StepResult fallback_step{};
             std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
             const auto repair_started = std::chrono::steady_clock::now();
+            const auto fallback_started = std::chrono::steady_clock::now();
             if (!target->native_model->decode_incremental(
                     fallback_token,
                     prefix_kv.get(),
@@ -2048,6 +2054,7 @@ Gemma4Status verify_tokens_impl(
                     &fallback_hidden)) {
                 return fail(GEMMA4_ERR_RUNTIME, native_error);
             }
+            repair_fallback_ms += elapsed_ms(fallback_started);
             verify_repair_ms += elapsed_ms(repair_started);
             fallback_step.peak_memory_gb =
                 std::max(fallback_step.peak_memory_gb, block_step.peak_memory_gb);

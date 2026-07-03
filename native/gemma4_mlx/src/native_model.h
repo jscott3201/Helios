@@ -197,6 +197,18 @@ public:
         std::string* error,
         std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
 
+    bool decode_incremental_block_with_retroactive_prefix(
+        const int32_t* tokens,
+        size_t token_count,
+        NativeKvState* kv_state,
+        NativeKvState* prefix_kv_state,
+        size_t* out_accepted_prefix_count,
+        Gemma4StepResult* out,
+        std::vector<int32_t>* greedy_tokens,
+        std::vector<float>* greedy_logits,
+        std::string* error,
+        std::unique_ptr<NativeHiddenState>* last_hidden = nullptr) const;
+
 private:
     std::unique_ptr<Impl> impl_;
 
