@@ -18,8 +18,25 @@ use std::{
 use crate::{GenerateOptions, GenerateSummary, ResidentTarget, detokenize_tokens, generate};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
-pub const PERSISTENT_NATIVE_GATE_ENV: &str = "GEMMA4D_EXPERIMENTAL_PERSISTENT_SERVER";
 const SERVER_NAME: &str = "gemma4d";
+// XR53 admission model constants from XR51 server A/B peak MLX memory and P04
+// active-KV records. Unchunked points are measured prefill peaks including
+// resident weights; chunked prefill uses a conservative near-flat slope above 1K.
+const ADMISSION_WEIGHTS_BASE_BYTES: u64 = 7_864_036_352;
+const ADMISSION_DECODE_KV_BYTES_PER_TOKEN: u64 = 16_384;
+const ADMISSION_CHUNKED_PREFILL_BYTES_PER_TOKEN_ABOVE_1K: u64 = 31 * 1024;
+const ADMISSION_BASE_CONTEXT_TOKENS: usize = 1024;
+const ADMISSION_BPE_CORRECTION_NUMERATOR: usize = 13;
+const ADMISSION_BPE_CORRECTION_DENOMINATOR: usize = 10;
+const ADMISSION_BYTE_BOUND_NUMERATOR: usize = 4;
+const ADMISSION_BYTE_BOUND_DENOMINATOR: usize = 9;
+const STUB_ADMISSION_BYTES_PER_TOKEN: u64 = 4096;
+const ADMISSION_UNCHUNKED_PREFILL_POINTS: &[(usize, u64)] = &[
+    (1024, 7_864_036_352),
+    (4096, 9_895_433_216),
+    (8192, 13_708_834_816),
+    (16_384, 23_487_508_480),
+];
 
 pub type HttpResult<T> = std::result::Result<T, HttpError>;
 
@@ -62,6 +79,8 @@ pub struct ServerConfig {
     pub model_path: Option<PathBuf>,
     pub max_context_tokens: usize,
     pub memory_budget_bytes: u64,
+    #[serde(default)]
+    pub admission_prefill_chunked: bool,
     pub queue_capacity: usize,
     pub adapters: Vec<ServerAdapter>,
 }
@@ -103,6 +122,7 @@ impl Default for ServerConfig {
             model_path: None,
             max_context_tokens: 32_768,
             memory_budget_bytes: 12 * 1024 * 1024 * 1024,
+            admission_prefill_chunked: false,
             queue_capacity: 0,
             adapters: vec![ServerAdapter::stub_loaded("rust-coding-r16-v1")],
         }
@@ -404,8 +424,8 @@ impl ServerRuntime {
                 "backend": self.config.backend.as_str(),
                 "model_path": self.config.model_path.as_ref().map(|path| path.display().to_string()),
                 "max_context_tokens": self.config.max_context_tokens,
+                "admission_prefill_chunked": self.config.admission_prefill_chunked,
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
-                "persistent_native_gate_env": PERSISTENT_NATIVE_GATE_ENV,
             })),
             ("POST", "/v1/config/validate") => self.json_ok(json!({
                 "status": "valid",
@@ -694,7 +714,7 @@ impl ServerRuntime {
             ));
         }
         let max_tokens = request.max_tokens.unwrap_or(16);
-        let prompt_tokens = estimate_prompt_tokens(&request.messages);
+        let prompt_tokens = estimate_admission_prompt_tokens(&request.messages);
         let total_context = prompt_tokens.saturating_add(max_tokens);
         if total_context > self.config.max_context_tokens {
             return Err(ApiError::new(
@@ -706,7 +726,14 @@ impl ServerRuntime {
                 ),
             ));
         }
-        let estimated_bytes = (total_context as u64).saturating_mul(4096);
+        let estimated_bytes = estimate_admission_bytes_for_backend(
+            self.config.backend,
+            prompt_tokens,
+            estimate_prompt_tokens(&request.messages),
+            max_tokens,
+            self.config.admission_prefill_chunked,
+        )
+        .unwrap_or(u64::MAX);
         if estimated_bytes > self.config.memory_budget_bytes {
             self.record_error("memory_guard_rejected");
             self.metrics
@@ -1428,6 +1455,85 @@ fn estimate_prompt_tokens(messages: &[ChatMessage]) -> usize {
         .max(1)
 }
 
+fn estimate_admission_prompt_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            corrected_bpe_token_estimate(estimate_text_tokens(&message.content))
+                .max(byte_density_token_bound(&message.content))
+                .saturating_add(1)
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+fn corrected_bpe_token_estimate(tokens: usize) -> usize {
+    tokens
+        .saturating_mul(ADMISSION_BPE_CORRECTION_NUMERATOR)
+        .div_ceil(ADMISSION_BPE_CORRECTION_DENOMINATOR)
+        .max(1)
+}
+
+fn byte_density_token_bound(text: &str) -> usize {
+    text.len()
+        .saturating_mul(ADMISSION_BYTE_BOUND_NUMERATOR)
+        .div_ceil(ADMISSION_BYTE_BOUND_DENOMINATOR)
+        .max(1)
+}
+
+fn estimate_admission_bytes_for_backend(
+    backend: ServerBackend,
+    prompt_tokens: usize,
+    legacy_prompt_tokens: usize,
+    max_tokens: usize,
+    chunked_prefill: bool,
+) -> Option<u64> {
+    if backend == ServerBackend::Stub {
+        let total_tokens = legacy_prompt_tokens.saturating_add(max_tokens);
+        return Some((total_tokens as u64).saturating_mul(STUB_ADMISSION_BYTES_PER_TOKEN));
+    }
+    estimate_admission_bytes(prompt_tokens, max_tokens, chunked_prefill)
+}
+
+fn estimate_admission_bytes(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    chunked_prefill: bool,
+) -> Option<u64> {
+    let prefill_bytes = if chunked_prefill {
+        Some(estimate_chunked_prefill_bytes(prompt_tokens))
+    } else {
+        estimate_unchunked_prefill_bytes(prompt_tokens)
+    }?;
+    let decode_bytes = (max_tokens as u64).saturating_mul(ADMISSION_DECODE_KV_BYTES_PER_TOKEN);
+    Some(prefill_bytes.saturating_add(decode_bytes))
+}
+
+fn estimate_chunked_prefill_bytes(prompt_tokens: usize) -> u64 {
+    let extra_tokens = prompt_tokens.saturating_sub(ADMISSION_BASE_CONTEXT_TOKENS);
+    ADMISSION_WEIGHTS_BASE_BYTES.saturating_add(
+        (extra_tokens as u64).saturating_mul(ADMISSION_CHUNKED_PREFILL_BYTES_PER_TOKEN_ABOVE_1K),
+    )
+}
+
+fn estimate_unchunked_prefill_bytes(prompt_tokens: usize) -> Option<u64> {
+    let first = ADMISSION_UNCHUNKED_PREFILL_POINTS[0];
+    if prompt_tokens <= first.0 {
+        return Some(first.1);
+    }
+    for window in ADMISSION_UNCHUNKED_PREFILL_POINTS.windows(2) {
+        let (lower_tokens, lower_bytes) = window[0];
+        let (upper_tokens, upper_bytes) = window[1];
+        if prompt_tokens <= upper_tokens {
+            let token_span = upper_tokens.saturating_sub(lower_tokens) as u64;
+            let byte_span = upper_bytes.saturating_sub(lower_bytes);
+            let offset = prompt_tokens.saturating_sub(lower_tokens) as u64;
+            return Some(lower_bytes.saturating_add(byte_span.saturating_mul(offset) / token_span));
+        }
+    }
+    None
+}
+
 fn estimate_text_tokens(text: &str) -> usize {
     text.split_whitespace().count().max(1)
 }
@@ -1541,6 +1647,8 @@ fn parse_raw_http_response(raw: &str) -> HttpResult<HttpResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use std::{fs, path::Path};
 
     fn runtime() -> ServerRuntime {
         ServerRuntime::new(ServerConfig::default())
@@ -1559,6 +1667,31 @@ mod tests {
   "max_tokens":8{adapter}
 }}"#
         )
+    }
+
+    fn chat_body_with_word_count(words: usize, max_tokens: usize) -> String {
+        let content = std::iter::repeat_n("aa", words)
+            .collect::<Vec<_>>()
+            .join(" ");
+        chat_body_with_content(content, max_tokens)
+    }
+
+    fn chat_body_with_content(content: String, max_tokens: usize) -> String {
+        serde_json::json!({
+            "model": "mlx-community/gemma-4-12B-it-4bit",
+            "messages": [{"role": "user", "content": content}],
+            "stream": false,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        })
+        .to_string()
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkloadManifestRecord {
+        workload_id: String,
+        prompt_path: String,
+        actual_context_tokens: usize,
     }
 
     fn http_request_with_retry(
@@ -1703,6 +1836,162 @@ mod tests {
         );
         assert_eq!(memory.status, 400);
         assert!(memory.body.contains("memory_guard_rejected"));
+    }
+
+    #[test]
+    fn admission_estimator_matches_f8_memory_table() {
+        let points = [
+            (1024, 7_864_036_352, 7_864_036_352),
+            (4096, 9_895_433_216, 7_837_993_472),
+            (8192, 13_708_834_816, 7_947_432_960),
+            (16_384, 23_487_508_480, 8_201_657_344),
+        ];
+
+        for (tokens, unchunked_measured, chunked_measured) in points {
+            assert_estimator_within_band_or_high(
+                estimate_admission_bytes(tokens, 0, false).expect("within unchunked table"),
+                unchunked_measured,
+            );
+            assert_estimator_within_band_or_high(
+                estimate_admission_bytes(tokens, 0, true).expect("chunked estimate"),
+                chunked_measured,
+            );
+        }
+
+        assert!(estimate_admission_bytes(16_385, 0, false).is_none());
+        assert!(estimate_admission_bytes(32_768, 1, true).is_some());
+    }
+
+    #[test]
+    fn admission_token_estimate_covers_real_workload_corpus() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest_path = repo_root.join("benchmarks/workloads/real-contexts/workloads.jsonl");
+        let manifest = fs::read_to_string(&manifest_path).expect("read workload manifest");
+
+        for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
+            let record: WorkloadManifestRecord =
+                serde_json::from_str(line).expect("parse workload manifest record");
+            let prompt = fs::read_to_string(repo_root.join(&record.prompt_path))
+                .unwrap_or_else(|error| panic!("read {}: {error}", record.prompt_path));
+            let estimated = estimate_admission_prompt_tokens(&[ChatMessage {
+                role: "user".to_owned(),
+                content: prompt,
+            }]);
+            assert!(
+                estimated >= record.actual_context_tokens,
+                "{} estimated {estimated} tokens below actual {}",
+                record.workload_id,
+                record.actual_context_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn stub_admission_does_not_charge_native_weights_floor() {
+        let body = chat_body_with_word_count(5_600, 1);
+        let runtime = ServerRuntime::new(ServerConfig {
+            max_context_tokens: 32_768,
+            memory_budget_bytes: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        });
+        let response = runtime.handle_request("POST", "/v1/chat/completions", body.as_bytes());
+
+        assert_eq!(response.status, 200);
+        assert!(!response.body.contains("memory_guard_rejected"));
+    }
+
+    #[test]
+    fn native_admission_charges_weights_floor() {
+        let body = chat_body_with_word_count(5_600, 1);
+        let runtime = ServerRuntime::new(ServerConfig {
+            backend: ServerBackend::RealHelper,
+            max_context_tokens: 32_768,
+            memory_budget_bytes: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        });
+        let response = runtime.handle_request("POST", "/v1/chat/completions", body.as_bytes());
+
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("memory_guard_rejected"));
+    }
+
+    #[test]
+    fn native_admission_rejects_real_16k_workload_at_tiny16_budget() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let prompt = fs::read_to_string(
+            repo_root.join("benchmarks/workloads/real-contexts/prompts/benchmark_qa_16k_001.txt"),
+        )
+        .expect("read 16K workload prompt");
+        let runtime = ServerRuntime::new(ServerConfig {
+            backend: ServerBackend::RealHelper,
+            max_context_tokens: 32_768,
+            memory_budget_bytes: 14_336_u64 * 1024 * 1024,
+            ..ServerConfig::default()
+        });
+        let response = runtime.handle_request(
+            "POST",
+            "/v1/chat/completions",
+            chat_body_with_content(prompt, 1).as_bytes(),
+        );
+
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("memory_guard_rejected"));
+    }
+
+    #[test]
+    fn admission_guard_rejects_16k_unchunked_and_admits_chunked() {
+        let body = chat_body_with_word_count(12_602, 1);
+        let memory_budget_bytes = 14_336_u64 * 1024 * 1024;
+        let base = ServerConfig {
+            max_context_tokens: 32_768,
+            memory_budget_bytes,
+            ..ServerConfig::default()
+        };
+
+        let unchunked = ServerRuntime::new(ServerConfig {
+            backend: ServerBackend::RealHelper,
+            ..base.clone()
+        })
+        .handle_request("POST", "/v1/chat/completions", body.as_bytes());
+        assert_eq!(unchunked.status, 400);
+        assert!(unchunked.body.contains("memory_guard_rejected"));
+
+        assert!(
+            estimate_admission_bytes_for_backend(
+                ServerBackend::PersistentNative,
+                estimate_admission_prompt_tokens(&[ChatMessage {
+                    role: "user".to_owned(),
+                    content: std::iter::repeat_n("aa", 12_602)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                }]),
+                12_603,
+                1,
+                true,
+            )
+            .expect("chunked estimate")
+                <= memory_budget_bytes
+        );
+
+        let stub = ServerRuntime::new(ServerConfig {
+            admission_prefill_chunked: true,
+            ..base
+        })
+        .handle_request("POST", "/v1/chat/completions", body.as_bytes());
+        assert_eq!(stub.status, 200);
+    }
+
+    fn assert_estimator_within_band_or_high(estimated: u64, measured: u64) {
+        if estimated >= measured {
+            return;
+        }
+        let measured = measured as f64;
+        let estimated = estimated as f64;
+        let error = (measured - estimated) / measured;
+        assert!(
+            error <= 0.15,
+            "estimated {estimated} should be within 15% low of measured {measured}"
+        );
     }
 
     #[test]
