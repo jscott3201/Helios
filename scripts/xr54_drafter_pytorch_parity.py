@@ -19,7 +19,16 @@ from pathlib import Path
 
 def main() -> int:
     args = parse_args()
-    request = json.loads(args.request.read_text())
+    try:
+        request = json.loads(args.request.read_text())
+    except Exception as exc:
+        write_blocked(
+            args.out,
+            "failed to load PyTorch parity request",
+            request_path=str(args.request),
+            detail=str(exc),
+        )
+        return 2
 
     try:
         import torch
@@ -52,7 +61,24 @@ def main() -> int:
         )
         return 2
 
-    quantized_keys = assistant_quantized_keys(args.assistant_model_path)
+    try:
+        quantized_keys = assistant_quantized_keys(args.assistant_model_path)
+    except FileNotFoundError as exc:
+        write_blocked(
+            args.out,
+            "assistant checkpoint is missing model.safetensors",
+            request=request,
+            detail=str(exc),
+        )
+        return 2
+    except Exception as exc:
+        write_blocked(
+            args.out,
+            "failed to inspect assistant checkpoint format",
+            request=request,
+            detail=str(exc),
+        )
+        return 2
     if quantized_keys:
         write_blocked(
             args.out,
@@ -168,7 +194,7 @@ def assistant_quantized_keys(model_path: Path) -> list[str]:
 
     weights = model_path / "model.safetensors"
     if not weights.exists():
-        return []
+        raise FileNotFoundError(str(weights))
     with safe_open(str(weights), framework="pt") as handle:
         return [
             key

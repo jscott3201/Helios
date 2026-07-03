@@ -9,7 +9,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use gemma4d_bench::{CliError, manifest, workload_corpus::WorkloadRecord};
+use gemma4d_bench::{
+    BuildProvenance, CliError, capture_build_provenance, manifest, workload_corpus::WorkloadRecord,
+};
 use gemma4d_ffi::{
     Drafter, KvCache, KvPolicy, LoadConfig, Target, decode_one, draft_block, prefill,
     verify_tokens, verify_tokens_terminal_no_lookahead,
@@ -51,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let decision_path = args.out_dir.join("decision.md");
 
     let run_id = run_id();
-    let build_provenance = build_provenance()?;
+    let build_provenance = capture_build_provenance()?;
     let command = command_line();
     let model_identity =
         manifest::capture_artifact_identity(&args.model_path, "GEMMA4D_MODEL_REVISION");
@@ -404,16 +406,6 @@ struct Summary {
     failed_hypotheses: Vec<String>,
     measurement_notes: Vec<String>,
     records: Vec<Record>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct BuildProvenance {
-    git_sha: String,
-    git_status_short: String,
-    dirty_diff_sha256: String,
-    dirty_diff_bytes: usize,
-    runner_binary_path: String,
-    runner_binary_link_mtime_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1710,79 +1702,6 @@ fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn build_provenance() -> Result<BuildProvenance, CliError> {
-    let git_sha = required_command_stdout("git", &["rev-parse", "HEAD"], "git SHA")?;
-    let git_status_short = required_command_stdout("git", &["status", "--short"], "git status")?;
-    let dirty_diff = required_command_stdout_bytes(
-        "git",
-        &["diff", "--binary", "HEAD", "--", "."],
-        "dirty diff",
-    )?;
-    let runner_binary = env::current_exe().map_err(|error| {
-        CliError::Runtime(format!(
-            "failed to capture build provenance: current executable path unavailable: {error}"
-        ))
-    })?;
-    let runner_metadata = fs::metadata(&runner_binary).map_err(|error| {
-        CliError::Runtime(format!(
-            "failed to capture build provenance: runner binary metadata unavailable for {}: {error}",
-            runner_binary.display()
-        ))
-    })?;
-    let runner_mtime = runner_metadata.modified().map_err(|error| {
-        CliError::Runtime(format!(
-            "failed to capture build provenance: runner binary mtime unavailable for {}: {error}",
-            runner_binary.display()
-        ))
-    })?;
-
-    Ok(BuildProvenance {
-        git_sha,
-        git_status_short,
-        dirty_diff_sha256: sha256_hex(&dirty_diff),
-        dirty_diff_bytes: dirty_diff.len(),
-        runner_binary_path: runner_binary.display().to_string(),
-        runner_binary_link_mtime_unix_seconds: system_time_unix_seconds(
-            runner_mtime,
-            "runner binary link mtime",
-        )?,
-    })
-}
-
-fn required_command_stdout(command: &str, args: &[&str], label: &str) -> Result<String, CliError> {
-    let bytes = required_command_stdout_bytes(command, args, label)?;
-    Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
-}
-
-fn required_command_stdout_bytes(
-    command: &str,
-    args: &[&str],
-    label: &str,
-) -> Result<Vec<u8>, CliError> {
-    let output = Command::new(command).args(args).output().map_err(|error| {
-        CliError::Runtime(format!(
-            "failed to capture build provenance {label}: `{}` could not start: {error}",
-            command_invocation(command, args)
-        ))
-    })?;
-    if !output.status.success() {
-        return Err(CliError::Runtime(format!(
-            "failed to capture build provenance {label}: `{}` exited with {}: {}",
-            command_invocation(command, args),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(output.stdout)
-}
-
-fn command_invocation(command: &str, args: &[&str]) -> String {
-    std::iter::once(command)
-        .chain(args.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn run_id() -> String {
     format!("xr15-{}", unix_now())
 }
@@ -1792,16 +1711,6 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn system_time_unix_seconds(time: SystemTime, label: &str) -> Result<u64, CliError> {
-    time.duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|error| {
-            CliError::Runtime(format!(
-                "failed to capture build provenance {label}: before UNIX_EPOCH: {error}"
-            ))
-        })
 }
 
 fn file_sha256(path: &Path) -> String {

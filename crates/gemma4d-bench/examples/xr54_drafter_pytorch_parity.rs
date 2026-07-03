@@ -8,7 +8,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use gemma4d_bench::{CliError, manifest, workload_corpus::WorkloadRecord};
+use gemma4d_bench::{
+    CliError, capture_build_provenance, manifest, workload_corpus::WorkloadRecord,
+};
 use gemma4d_ffi::{Drafter, KvCache, KvPolicy, LoadConfig, Target, draft_block, prefill};
 use gemma4d_tokenizer::sha256_hex;
 use serde_json::json;
@@ -31,6 +33,13 @@ const DEFAULT_WORKLOAD_ID: &str = "mtp_candidate_1k_001";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1))?;
+    if !args.python.exists() {
+        return Err(CliError::Runtime(format!(
+            "XR54 parity python interpreter not found: {}; pass --python PATH or create the default environment at {DEFAULT_PYTHON}",
+            args.python.display()
+        ))
+        .into());
+    }
     fs::create_dir_all(&args.out_dir)?;
 
     let payload_path = args.out_dir.join("payload.safetensors");
@@ -43,10 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let blockers_path = args.out_dir.join("blockers.md");
 
     let run_id = run_id();
-    let git_sha =
-        command_stdout("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
-    let git_status_short =
-        command_stdout("git", &["status", "--short"]).unwrap_or_else(|| "unknown".to_owned());
+    let build_provenance = capture_build_provenance()?;
+    let git_sha = build_provenance.git_sha.clone();
+    let git_status_short = build_provenance.git_status_short.clone();
     let command = command_line();
     let model_identity =
         manifest::capture_artifact_identity(&args.model_path, "GEMMA4D_MODEL_REVISION");
@@ -93,7 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = cache.export_snapshot()?;
     snapshot.save_mtp_parity_to_path(&target, &parity_token_ids, &payload_path)?;
 
-    let reference_draft_tokens = read_reference_draft_tokens(&args.reference_records_path);
+    let reference_draft_tokens =
+        read_reference_draft_tokens(&args.reference_records_path, &args.workload_id);
     let native_matches_reference = reference_draft_tokens
         .as_ref()
         .map(|tokens| tokens == &native_draft_tokens)
@@ -133,9 +142,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "native draft tokens did not match the supplied XR54-R reference record".to_owned(),
         );
     }
-    let parity_result = fs::read_to_string(&parity_path)
-        .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+    let parity_result = match fs::read_to_string(&parity_path) {
+        Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(result) => Some(result),
+            Err(error) => {
+                blockers.push(format!(
+                    "PyTorch parity result is unparseable JSON at {}: {error}",
+                    parity_path.display()
+                ));
+                None
+            }
+        },
+        Err(error) => {
+            blockers.push(format!(
+                "PyTorch parity result is missing or unreadable at {}: {error}",
+                parity_path.display()
+            ));
+            None
+        }
+    };
     if let Some(result) = &parity_result {
         if result
             .get("status")
@@ -156,7 +181,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .to_owned(),
             );
         }
-    } else if !python.status_success {
+    }
+    if !python.status_success {
         blockers.push(format!(
             "PyTorch parity script did not complete: {}",
             python.blocker
@@ -180,6 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "command": command,
         "git_sha": git_sha,
         "git_status_short": git_status_short,
+        "build_provenance": build_provenance,
         "model_identity": model_identity,
         "assistant_identity": assistant_identity,
         "pytorch_assistant_identity": pytorch_assistant_identity,
@@ -358,6 +385,21 @@ fn run_python_parity(
         "--out".to_owned(),
         parity_path.display().to_string(),
     ]);
+    if parity_path.exists() {
+        if let Err(error) = fs::remove_file(parity_path) {
+            return PythonRun {
+                command: command.join(" "),
+                status_success: false,
+                exit_status: "not_started".to_owned(),
+                stdout: String::new(),
+                stderr: String::new(),
+                blocker: format!(
+                    "failed to remove stale Python parity result {} before run: {error}",
+                    parity_path.display()
+                ),
+            };
+        }
+    }
     let mut process = Command::new(&args.python);
     if let Some(pythonpath) = args.pythonpath.as_deref() {
         process.env("PYTHONPATH", pythonpath);
@@ -457,13 +499,16 @@ fn validate_workload_tokens(
     Ok(())
 }
 
-fn read_reference_draft_tokens(path: &Path) -> Option<Vec<i32>> {
+fn read_reference_draft_tokens(path: &Path, workload_id: &str) -> Option<Vec<i32>> {
     let file = File::open(path).ok()?;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
         let value = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+        if value.get("workload_id").and_then(serde_json::Value::as_str) != Some(workload_id) {
+            continue;
+        }
         return value
             .get("mtp")?
             .get("events")?
@@ -591,14 +636,6 @@ fn value_to_inline(value: &serde_json::Value) -> String {
 
 fn command_line() -> String {
     env::args().collect::<Vec<_>>().join(" ")
-}
-
-fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn run_id() -> String {

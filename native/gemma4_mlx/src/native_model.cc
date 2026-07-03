@@ -1505,6 +1505,14 @@ array target_token_embedding(const NativeTextModel::Impl& impl, int32_t token_id
     return model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
 }
 
+int64_t target_embedding_vocab_size(const NativeTextModel::Impl& impl) {
+    const auto& shape = tensor_or_throw(impl, "language_model.model.embed_tokens.weight").shape();
+    if (shape.empty()) {
+        throw std::runtime_error("target embedding weight has no vocab dimension");
+    }
+    return static_cast<int64_t>(shape[0]);
+}
+
 array assistant_logits(const NativeMtpAssistantModel::Impl& impl, const array& h) {
     const QuantizationSpec embed_quantization = quantization_for(impl, "model.embed_tokens");
     array logits = mlx::core::quantized_matmul(
@@ -2152,11 +2160,28 @@ bool NativeKvState::save_safetensors(
             std::vector<array> token_embeddings;
             token_embeddings.reserve(token_embedding_token_ids->size());
             std::string token_id_csv;
+            int64_t token_embedding_vocab_size = 0;
+            try {
+                token_embedding_vocab_size =
+                    target_embedding_vocab_size(*token_embedding_model->impl_);
+            } catch (const std::exception& ex) {
+                *error = std::string("native KV snapshot token embedding export failed: ") + ex.what();
+                return false;
+            }
             for (size_t index = 0; index < token_embedding_token_ids->size(); ++index) {
                 if (!token_id_csv.empty()) {
                     token_id_csv.push_back(',');
                 }
                 const int32_t token_id = (*token_embedding_token_ids)[index];
+                if (token_id < 0 ||
+                    static_cast<int64_t>(token_id) >= token_embedding_vocab_size) {
+                    std::ostringstream message;
+                    message
+                        << "native KV snapshot token embedding export token id out of bounds: "
+                        << token_id << " not in [0," << token_embedding_vocab_size << ")";
+                    *error = message.str();
+                    return false;
+                }
                 token_id_csv += std::to_string(token_id);
                 token_embeddings.push_back(target_token_embedding(*token_embedding_model->impl_, token_id));
             }
