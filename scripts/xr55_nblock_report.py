@@ -17,6 +17,11 @@ DEFAULT_EXPECTED_WORKLOADS = (
     "mtp_candidate_1k_001",
 )
 GUARDED_POLICY = "net_latency_guarded_5pct"
+REPAIR_SUBTIMER_KEYS = (
+    "repair_clone_ms",
+    "repair_forward_ms",
+    "repair_fallback_ms",
+)
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -77,6 +82,12 @@ def percent(numerator: float, denominator: float) -> float:
 
 def fmt_float(value: float, digits: int = 3) -> str:
     return f"{value:.{digits}f}"
+
+
+def fmt_repair_subtimer(row: dict[str, Any], key: str) -> str:
+    if not row["repair_subtimers_captured"]:
+        return "not captured (pre-ABI-v3)"
+    return fmt_float(float(row[key]), 1)
 
 
 def required_float(
@@ -256,9 +267,30 @@ def aggregate_blocks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         verify_ms = sum(float(record["mtp"]["verify_ms"]) for record in block_records)
         verify_forward_ms = sum(float(record["mtp"]["verify_forward_ms"]) for record in block_records)
         verify_repair_ms = sum(float(record["mtp"]["verify_repair_ms"]) for record in block_records)
-        repair_clone_ms = sum(float(record["mtp"].get("repair_clone_ms") or 0.0) for record in block_records)
-        repair_forward_ms = sum(float(record["mtp"].get("repair_forward_ms") or 0.0) for record in block_records)
-        repair_fallback_ms = sum(float(record["mtp"].get("repair_fallback_ms") or 0.0) for record in block_records)
+        repair_subtimer_presence = [
+            all(key in record["mtp"] for key in REPAIR_SUBTIMER_KEYS)
+            for record in block_records
+        ]
+        repair_subtimers_captured = all(repair_subtimer_presence)
+        if any(repair_subtimer_presence) and not repair_subtimers_captured:
+            raise SystemExit(
+                f"block {block_size}: repair sub-timer fields are present on only some measured records"
+            )
+        repair_clone_ms = (
+            sum(float(record["mtp"]["repair_clone_ms"]) for record in block_records)
+            if repair_subtimers_captured
+            else None
+        )
+        repair_forward_ms = (
+            sum(float(record["mtp"]["repair_forward_ms"]) for record in block_records)
+            if repair_subtimers_captured
+            else None
+        )
+        repair_fallback_ms = (
+            sum(float(record["mtp"]["repair_fallback_ms"]) for record in block_records)
+            if repair_subtimers_captured
+            else None
+        )
         attempted = sum(int(record["mtp"]["attempted_draft_tokens"]) for record in block_records)
         accepted = sum(int(record["mtp"]["accepted_draft_tokens"]) for record in block_records)
         verify_passes = sum(int(record["mtp"]["target_verify_passes"]) for record in block_records)
@@ -321,6 +353,7 @@ def aggregate_blocks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "repair_clone_ms": repair_clone_ms,
                 "repair_forward_ms": repair_forward_ms,
                 "repair_fallback_ms": repair_fallback_ms,
+                "repair_subtimers_captured": repair_subtimers_captured,
                 "draft_step_verify_units": safe_ratio(draft_ms_per_attempt, verify_ms_per_pass),
                 "peak_mlx_gb": peak_mlx_gb,
                 "baseline_peak_gb": baseline_peak_gb,
@@ -424,9 +457,9 @@ def render_markdown(
                 verify_ms=fmt_float(row["verify_ms"], 1),
                 verify_forward_ms=fmt_float(row["verify_forward_ms"], 1),
                 verify_repair_ms=fmt_float(row["verify_repair_ms"], 1),
-                repair_clone_ms=fmt_float(row["repair_clone_ms"], 1),
-                repair_forward_ms=fmt_float(row["repair_forward_ms"], 1),
-                repair_fallback_ms=fmt_float(row["repair_fallback_ms"], 1),
+                repair_clone_ms=fmt_repair_subtimer(row, "repair_clone_ms"),
+                repair_forward_ms=fmt_repair_subtimer(row, "repair_forward_ms"),
+                repair_fallback_ms=fmt_repair_subtimer(row, "repair_fallback_ms"),
                 draft_units=fmt_float(row["draft_step_verify_units"], 3),
                 peak_mlx=fmt_float(row["peak_mlx_gb"], 3),
                 full_len_events=row["full_len_events"],

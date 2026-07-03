@@ -7,7 +7,7 @@ MTP block-prefix path by reusing the first batched verify forward's prefix KV
 tensors, while preserving greedy exactness and sequential-oracle commit
 semantics.
 
-Decision: pending fresh main baseline and candidate sweep.
+Decision: `keep_experimental`.
 
 ## Scope
 
@@ -141,13 +141,15 @@ Guarded policy:
 
 Interpretation:
 
-- S1 succeeded: `repair_forward_ms` and `repair_clone_ms` are `0.0` across the
-  measured candidate records, so accepted-prefix repair no longer replays a
-  second block forward.
+- S1 succeeded: `repair_forward_ms` is `0.0` across the measured candidate
+  records, so accepted-prefix repair no longer replays a second block forward.
 - Remaining `verify_repair_ms` is fallback decode (`repair_fallback_ms`).
 - N=4 rose from XR55 `+7.151%` to `+17.609%`, satisfying the main repair-cost
   prediction. The guarded optimum did not shift to N=4; it selected N=3 for
-  chat and N=6 for tool JSON.
+  chat and N=6 for tool JSON. The tool JSON N=6 pick is within noise of N=3/N=4
+  at 3 measured trials, so wave-5 should not overfit that exact block choice.
+- N=6 and N=8 improved versus XR55 and remained acceptance-bound, so prediction
+  4 held: the curve flattened rather than inverted.
 - `mtp_candidate_1k_001` stayed unselected, auto-disabled in `18/18` measured
   records, and only reached `+0.380%` at its best fixed N.
 

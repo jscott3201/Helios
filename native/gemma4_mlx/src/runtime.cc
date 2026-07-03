@@ -2045,6 +2045,12 @@ Gemma4Status verify_tokens_impl(
             Gemma4StepResult fallback_step{};
             std::unique_ptr<gemma4d::NativeHiddenState> fallback_hidden;
             const auto repair_started = std::chrono::steady_clock::now();
+            if (prefix_kv == nullptr || prefix_kv->sequence_len() !=
+                    cache->native_tokens.size() + accepted_prefix_count) {
+                return fail(
+                    GEMMA4_ERR_RUNTIME,
+                    "native MTP block-prefix repair missing one-token accepted-prefix KV");
+            }
             const auto fallback_started = std::chrono::steady_clock::now();
             if (!target->native_model->decode_incremental(
                     fallback_token,
