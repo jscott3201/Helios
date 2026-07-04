@@ -457,6 +457,54 @@ DSpark draft outputs against DeepSpec/PyTorch using the native tap snapshot as
 the target-hidden input, then determine whether the remaining zero acceptance is
 native decoder math, 4-bit-vs-BF16 target distribution, or prompt selection.
 
+## Native-Tap DeepSpec Reference Fixture Path
+
+The reference fixture exporter now has a concrete native-tap mode for G1/G2:
+it reads `native_tap_snapshot_manifest.json`, validates the small native
+safetensors payload header without requiring the Python `safetensors` package,
+and, when the PyTorch stack is available, runs pinned DeepSpec
+`Gemma4DSparkModel` with those native taps as `target_hidden_states`.
+
+This avoids loading the full 12B target in PyTorch for the first parity check.
+The target side is Helios-owned native MLX; DeepSpec is only the released
+DSpark drafter reference over the exported target hidden taps.
+
+Command:
+
+```text
+python3 tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 --native-tap-manifest benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/native_tap_snapshot_manifest.json --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap --prompt-token-ids 9259 --allow-blocked
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap/manifest.json
+benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap/blockers.md
+```
+
+Current result:
+
+- status: `blocked`
+- native tap manifest: `ready`
+- snapshot payload: present, `419662` bytes
+- snapshot SHA-256:
+  `4aff723da113f6afe941a29c030603fceb60c22a66a24089050005d7be2b3bd9`
+- prompt tokens: `[9259]`
+- anchor token from native prefill: `236772`
+- tap tensors: `dspark_context.tap_0.hidden` through
+  `dspark_context.tap_4.hidden`
+- tap layer ids: `[5, 17, 29, 41, 46]`
+- tap tensor dtype/shape: five BF16 `[1, 1, 3840]` tensors
+- expected reference output:
+  `benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap/reference_fixture.json`
+- blockers: missing `torch`, `safetensors`, `transformers`, and importable
+  pinned DeepSpec package in the local Python environment
+
+When unblocked, the exporter will emit compact top-k base logits, Markov logits,
+greedy draft tokens, confidence logits/probabilities, native target tap values,
+and `hidden.last` for the tiny smoke fixture. Full logits can be requested with
+`--include-full-logits`.
+
 ## Verification
 
 Commands run:
@@ -482,6 +530,8 @@ GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --ex
 GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/warm-anchor-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 2
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 3
+python3 -m py_compile tools/dspark/dspark_common.py tools/dspark/export_reference_fixture.py tools/dspark/convert_to_mlx.py tools/dspark/compare_mlx_parity.py
+python3 tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 --native-tap-manifest benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/native_tap_snapshot_manifest.json --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap --prompt-token-ids 9259 --allow-blocked
 ```
 
 Observed result:
@@ -521,6 +571,11 @@ Observed result:
   Exactness passed for both bounded workloads and all fixed block sizes with
   `warmup_target_tokens = 1`, but every record still had
   `accepted_draft_tokens = 0`.
+- The native-tap reference fixture command wrote blocked artifacts under
+  `benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap/`.
+  It validated the native tap safetensors header and checkpoint identity, but
+  could not run DeepSpec/PyTorch because the local Python environment lacks
+  `torch`, `safetensors`, `transformers`, and importable `deepspec`.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
@@ -528,7 +583,8 @@ Observed result:
 
 ## Current Blockers / Gated Work
 
-- DeepSpec/PyTorch fixture code is not yet integrated.
+- DeepSpec/PyTorch native-tap fixture code is integrated, but fixture execution
+  is blocked by missing local Python packages/importable pinned DeepSpec.
 - Hidden-tap parity against a revision-pinned DeepSpec fixture is not measured.
 - Native DSpark decoder math is not parity-verified against the released
   checkpoint.
@@ -541,7 +597,8 @@ Observed result:
 
 ## Next Slice
 
-Generate a revision-pinned DeepSpec/PyTorch fixture for the released checkpoint,
-compare native hidden taps and draft logits/tokens against it, then diagnose
-whether zero acceptance comes from decoder math, checkpoint/target mismatch,
-prompt selection, or verifier overhead.
+Install/provide the pinned DeepSpec/PyTorch reference environment, rerun the
+native-tap reference fixture command to emit `reference_fixture.json`, then
+compare native DSpark draft logits/tokens against it to diagnose whether zero
+acceptance comes from decoder math, checkpoint/target mismatch, prompt
+selection, or verifier overhead.

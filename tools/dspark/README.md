@@ -25,13 +25,22 @@ local validation, but `artifacts/` is ignored by repository policy.
 python3 tools/dspark/export_reference_fixture.py \
   --draft-path artifacts/drafts/dspark-gemma4-12b-block7 \
   --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 \
+  --native-tap-manifest benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/native_tap_snapshot_manifest.json \
   --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures \
   --allow-blocked
 ```
 
-This writes a manifest and blockers when the DeepSpec/PyTorch reference stack or
-`model.safetensors` is missing. It does not claim fixture parity until the
-reference stack is available.
+The current reference path uses native tap snapshots as the
+`target_hidden_states` input to pinned DeepSpec/PyTorch `Gemma4DSparkModel`.
+This avoids loading the full 12B target in PyTorch for the first parity check:
+native Helios emits `dspark_context.tap_*.hidden`, and DeepSpec runs only the
+released DSpark drafter over those taps.
+
+When `torch`, `safetensors`, `transformers`, or an importable pinned DeepSpec
+checkout are missing, the script still validates the local DSpark config,
+checkpoint hash, native tap manifest, and safetensors header, then writes
+`manifest.json` plus `blockers.md`. It does not claim fixture parity until the
+reference stack is available and `reference_fixture.json` is emitted.
 
 ## MLX Conversion Manifest
 
