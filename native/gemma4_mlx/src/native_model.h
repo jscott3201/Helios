@@ -258,4 +258,29 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+class NativeDSparkModel {
+public:
+    struct Impl;
+
+    NativeDSparkModel();
+    ~NativeDSparkModel();
+
+    NativeDSparkModel(const NativeDSparkModel&) = delete;
+    NativeDSparkModel& operator=(const NativeDSparkModel&) = delete;
+    NativeDSparkModel(NativeDSparkModel&&) noexcept;
+    NativeDSparkModel& operator=(NativeDSparkModel&&) noexcept;
+
+    static bool load(
+        const std::filesystem::path& model_path,
+        const Gemma4ModelManifest& manifest,
+        std::unique_ptr<NativeDSparkModel>* out,
+        std::string* error);
+
+    size_t tensor_count() const;
+    std::string summary() const;
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
 } // namespace gemma4d

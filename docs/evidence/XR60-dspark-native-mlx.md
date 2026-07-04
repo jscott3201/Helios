@@ -86,13 +86,49 @@ Current behavior is intentionally fail-closed:
   `NativeHiddenState`.
 - `gemma4_kv_dspark_tap_info` reports tap ids, shapes, and resident bytes
   without exposing raw MLX pointers over the C ABI.
-- Strict DSpark loads return unsupported until the native tensor loader exists.
-- Draft calls return unsupported until DSpark tensor loading and draft execution
-  are implemented.
+- Strict DSpark loads validate the released block-7 config and tensor inventory.
+- On a native-graph target build, strict DSpark loads materialize matching
+  DSpark safetensors into an opaque `NativeDSparkModel`.
+- Draft calls remain unsupported until DSpark forward execution is implemented.
 - Adapter-active and compressed-active-KV DSpark paths are rejected.
 
 The reference header at `references/ffi/gemma4_mlx.h` was synced to the live
 native header after adding the DSpark ABI.
+
+## Native DSpark Loader Slice
+
+The DSpark manifest path now accepts only the current
+`deepseek-ai/dspark_gemma4_12b_block7` shape:
+
+- `Gemma4DSparkModel`
+- `model_type = gemma4_text`
+- `target_model_type = gemma4_unified`
+- `dtype = bfloat16`
+- `block_size = 7`
+- `num_hidden_layers = 5`
+- `hidden_size = 3840`
+- `intermediate_size = 15360`
+- `attention_k_eq_v = true`
+- `tie_word_embeddings = false`
+- `markov_head_type = vanilla`
+- `markov_rank = 256`
+- `enable_confidence_head = true`
+- `confidence_head_with_markov = true`
+- `target_layer_ids = [5, 17, 29, 41, 46]`
+
+The tensor inventory is strict: 74 DSpark tensors, 0 quantized groups, and no
+ignored extras. Required top-level tensors include `embed_tokens.weight`,
+`fc.weight`, `hidden_norm.weight`, `norm.weight`, `lm_head.weight`,
+`markov_head.markov_w1.weight`, `markov_head.markov_w2.weight`,
+`confidence_head.proj.weight`, and `confidence_head.proj.bias`. Each of the
+five draft layers requires q/k/o attention projections, q/k norms, four
+layernorm/scalar tensors, and gate/up/down MLP projections. No `v_proj` is
+accepted because the released config uses `attention_k_eq_v = true`.
+
+In smoke/no-MLX builds, the strict loader still validates the manifest and
+safetensors header, then defers tensor materialization unless the target was
+loaded with the native graph. This mirrors the existing MTP assistant loader
+behavior and keeps tests runnable without downloading the 6.86 GB checkpoint.
 
 ## Verification
 
@@ -109,7 +145,8 @@ cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benc
 
 Observed result:
 
-- `cargo test -p gemma4d-ffi --lib`: 19 passed, 1 ignored.
+- `cargo test -p gemma4d-ffi --lib`: 21 passed, 1 ignored after adding
+  DSpark strict loader tests.
 - `cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run`:
   compiled successfully.
 - The fixed-prefix harness wrote
@@ -125,10 +162,10 @@ Observed result:
 - DSpark weights are not present locally:
   `artifacts/drafts/dspark-gemma4-12b-block7/model.safetensors`.
 - DeepSpec/PyTorch fixture code is not yet integrated.
-- Native DSpark tensor loading and draft execution are not yet implemented.
+- Native DSpark draft execution is not yet implemented.
 
 ## Next Slice
 
-Load and validate the released DSpark tensors behind the new ABI, then execute
-fixed-prefix DSpark drafts against the captured native tap arrays and existing
-`gemma4_verify_tokens` verifier semantics.
+Implement fixed-prefix DSpark drafts against the captured native tap arrays and
+existing `gemma4_verify_tokens` verifier semantics once the 6.86 GB DSpark
+weights are available locally.

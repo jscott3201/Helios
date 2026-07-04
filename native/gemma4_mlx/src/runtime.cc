@@ -117,7 +117,9 @@ struct NativeDSparkDrafter {
     uint64_t magic;
     bool model_loaded;
     std::string model_path;
+    gemma4d::Gemma4ModelManifest manifest;
     const gemma4d::NativeTextModel* target_native_model;
+    std::unique_ptr<gemma4d::NativeDSparkModel> native_model;
 };
 
 struct NativeAdapter {
@@ -1924,30 +1926,56 @@ Gemma4Status gemma4_load_dspark_drafter(
     drafter->magic = kDSparkDrafterMagic;
     drafter->model_loaded = false;
     drafter->model_path = config->model_path;
+    drafter->manifest = gemma4d::Gemma4ModelManifest{};
     drafter->target_native_model = target->use_native_graph ? target->native_model.get() : nullptr;
+    drafter->native_model.reset();
 
     if (!config->allow_unsupported_config) {
         std::error_code exists_error;
-        if (!std::filesystem::exists(config->model_path, exists_error)) {
+        const std::filesystem::path model_path(config->model_path);
+        if (!std::filesystem::exists(model_path, exists_error)) {
             delete drafter;
             return fail(GEMMA4_ERR_MODEL_LOAD, "DSpark model_path does not exist");
         }
-        if (!target->use_native_graph || target->native_model == nullptr) {
+        if (!std::filesystem::is_directory(model_path, exists_error)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_MODEL_LOAD,
+                "DSpark model_path is not a directory: " + model_path.string());
+        }
+        if (!std::filesystem::exists(model_path / "config.json", exists_error)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_MODEL_LOAD,
+                "DSpark model_path is missing config.json: " + model_path.string());
+        }
+        if (!has_safetensors_file(model_path)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_MODEL_LOAD,
+                "DSpark model_path is missing model.safetensors: " + model_path.string());
+        }
+
+        std::string manifest_error;
+        if (!gemma4d::load_gemma4_dspark_manifest(model_path, &drafter->manifest, &manifest_error)) {
             delete drafter;
             return fail(
                 GEMMA4_ERR_UNSUPPORTED_CONFIG,
-                "gemma4_load_dspark_drafter requires a loaded native target graph");
+                "unsupported Gemma 4 DSpark manifest: " + manifest_error);
         }
-        if (!target->dspark_taps_enabled) {
-            delete drafter;
-            return fail(
-                GEMMA4_ERR_UNSUPPORTED_CONFIG,
-                "gemma4_load_dspark_drafter requires XR60 target hidden taps to be enabled");
+
+        if (target->use_native_graph) {
+            std::string native_error;
+            if (!gemma4d::NativeDSparkModel::load(
+                    model_path,
+                    drafter->manifest,
+                    &drafter->native_model,
+                    &native_error)) {
+                delete drafter;
+                return fail(GEMMA4_ERR_MODEL_LOAD, "native DSpark drafter load failed: " + native_error);
+            }
         }
-        delete drafter;
-        return fail(
-            GEMMA4_ERR_UNSUPPORTED_CONFIG,
-            "native DSpark drafter tensor loader is not implemented yet");
+        drafter->model_loaded = true;
     }
 
     *out = drafter;
@@ -2014,6 +2042,11 @@ Gemma4Status gemma4_dspark_draft_block(
         return fail(
             GEMMA4_ERR_UNSUPPORTED_CONFIG,
             "gemma4_dspark_draft_block requires a native target graph");
+    }
+    if (drafter->native_model == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires native DSpark tensors to be loaded");
     }
     if (drafter->target_native_model->has_adapter()) {
         return fail(

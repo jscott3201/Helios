@@ -2040,6 +2040,55 @@ mod tests {
     }
 
     #[test]
+    fn dspark_drafter_strict_load_reports_missing_path() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let config = LoadConfig {
+            model_path: "/tmp/gemma4d-missing-dspark-drafter".to_owned(),
+            model_id: Some("deepseek-ai/dspark_gemma4_12b_block7".to_owned()),
+            model_revision: Some("2fa72e7".to_owned()),
+            expected_architecture: Some("Gemma4DSparkModel".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let err = target
+            .load_dspark_drafter(&config)
+            .expect_err("strict DSpark load should fail");
+        assert_eq!(err.status(), Status::ModelLoad);
+        assert!(err.message().contains("DSpark model_path does not exist"));
+    }
+
+    #[test]
+    fn dspark_drafter_strict_load_accepts_released_block7_manifest_but_requires_taps() {
+        let fixture = write_dspark_fixture();
+        let mut target =
+            Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        target
+            .set_dspark_taps(&DSparkTapConfig::xr60_default())
+            .expect("XR60 taps should be accepted before loading DSpark");
+        let config = LoadConfig {
+            model_path: fixture.to_string_lossy().into_owned(),
+            model_id: Some("deepseek-ai/dspark_gemma4_12b_block7".to_owned()),
+            model_revision: Some("2fa72e7".to_owned()),
+            expected_architecture: Some("Gemma4DSparkModel".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let drafter = target
+            .load_dspark_drafter(&config)
+            .expect("released DSpark block-7 manifest should load");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let err = drafter
+            .draft_block(&mut cache, NonZeroU32::new(1).expect("non-zero"))
+            .expect_err("DSpark draft execution still requires native hidden taps");
+        assert_eq!(err.status(), Status::UnsupportedConfig);
+        assert!(err.message().contains("target hidden taps"));
+
+        fs::remove_dir_all(fixture).expect("remove DSpark fixture");
+    }
+
+    #[test]
     fn smoke_drafter_draft_block_is_unsupported() {
         let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
         let drafter = Drafter::load(&LoadConfig::smoke("/tmp/gemma4d-smoke-drafter"), &target)
@@ -2075,6 +2124,20 @@ mod tests {
             .expect("write assistant config");
         fs::write(dir.join("tokenizer.json"), "{}").expect("write assistant tokenizer");
         write_safetensors_header(&dir.join("model.safetensors"), assistant_tensor_keys());
+        dir
+    }
+
+    fn write_dspark_fixture() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        dir.push(format!("gemma4d-dspark-fixture-{unique}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create DSpark fixture dir");
+        fs::write(dir.join("config.json"), dspark_config_json()).expect("write DSpark config");
+        write_safetensors_header(&dir.join("model.safetensors"), dspark_tensor_keys());
         dir
     }
 
@@ -2149,6 +2212,86 @@ mod tests {
                     format!("{prefix}.biases"),
                 ]);
             }
+        }
+        keys
+    }
+
+    fn dspark_config_json() -> &'static str {
+        r#"{
+  "architectures": ["Gemma4DSparkModel"],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "attention_k_eq_v": true,
+  "block_size": 7,
+  "bos_token_id": 2,
+  "confidence_head_with_markov": true,
+  "dtype": "bfloat16",
+  "enable_confidence_head": true,
+  "enable_moe_block": false,
+  "eos_token_id": 1,
+  "global_head_dim": 512,
+  "head_dim": 256,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "hidden_size": 3840,
+  "intermediate_size": 15360,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "markov_head_type": "vanilla",
+  "markov_rank": 256,
+  "mask_token_id": 4,
+  "max_position_embeddings": 262144,
+  "model_type": "gemma4_text",
+  "num_anchors": 512,
+  "num_attention_heads": 16,
+  "num_global_key_value_heads": 1,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_kv_shared_layers": 0,
+  "pad_token_id": 0,
+  "sliding_window": 1024,
+  "target_layer_ids": [5, 17, 29, 41, 46],
+  "target_model_type": "gemma4_unified",
+  "target_text_model_type": "gemma4_unified_text",
+  "tie_word_embeddings": false,
+  "vocab_size": 262144,
+  "vocab_size_per_layer_input": 262144
+}"#
+    }
+
+    fn dspark_tensor_keys() -> Vec<String> {
+        let mut keys = vec![
+            "embed_tokens.weight".to_owned(),
+            "fc.weight".to_owned(),
+            "hidden_norm.weight".to_owned(),
+            "norm.weight".to_owned(),
+            "lm_head.weight".to_owned(),
+            "markov_head.markov_w1.weight".to_owned(),
+            "markov_head.markov_w2.weight".to_owned(),
+            "confidence_head.proj.weight".to_owned(),
+            "confidence_head.proj.bias".to_owned(),
+        ];
+        for layer in 0..5 {
+            let base = format!("layers.{layer}");
+            keys.extend([
+                format!("{base}.input_layernorm.weight"),
+                format!("{base}.post_attention_layernorm.weight"),
+                format!("{base}.pre_feedforward_layernorm.weight"),
+                format!("{base}.post_feedforward_layernorm.weight"),
+                format!("{base}.layer_scalar"),
+                format!("{base}.self_attn.q_proj.weight"),
+                format!("{base}.self_attn.k_proj.weight"),
+                format!("{base}.self_attn.o_proj.weight"),
+                format!("{base}.self_attn.q_norm.weight"),
+                format!("{base}.self_attn.k_norm.weight"),
+                format!("{base}.mlp.gate_proj.weight"),
+                format!("{base}.mlp.up_proj.weight"),
+                format!("{base}.mlp.down_proj.weight"),
+            ]);
         }
         keys
     }

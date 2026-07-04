@@ -112,6 +112,16 @@ struct NativeMtpAssistantModel::Impl {
     std::string manifest_summary;
 };
 
+struct NativeDSparkModel::Impl {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    std::unordered_map<std::string, mlx::core::array> tensors;
+#endif
+    size_t safetensor_file_count = 0;
+    size_t dspark_tensor_count = 0;
+    size_t total_tensor_count_seen = 0;
+    std::string manifest_summary;
+};
+
 namespace {
 
 std::vector<std::filesystem::path> safetensor_files(const std::filesystem::path& model_path) {
@@ -132,6 +142,13 @@ bool is_language_tensor(const std::string& key) {
 bool is_assistant_tensor(const std::string& key) {
     return key.rfind("model.", 0) == 0 || key.rfind("pre_projection.", 0) == 0 ||
         key.rfind("post_projection.", 0) == 0;
+}
+
+bool is_dspark_tensor(const std::string& key) {
+    return key.rfind("layers.", 0) == 0 || key.rfind("embed_tokens.", 0) == 0 ||
+        key.rfind("lm_head.", 0) == 0 || key.rfind("fc.", 0) == 0 ||
+        key.rfind("hidden_norm.", 0) == 0 || key.rfind("norm.", 0) == 0 ||
+        key.rfind("markov_head.", 0) == 0 || key.rfind("confidence_head.", 0) == 0;
 }
 
 bool experimental_mtp_real_margins_enabled() {
@@ -3903,6 +3920,105 @@ std::string NativeMtpAssistantModel::summary() const {
     std::ostringstream out;
     out << "native Gemma 4 MTP assistant loaded " << impl_->assistant_tensor_count
         << " assistant tensors from " << impl_->safetensor_file_count
+        << " safetensor files (" << impl_->total_tensor_count_seen << " tensors scanned)";
+    if (!impl_->manifest_summary.empty()) {
+        out << "; " << impl_->manifest_summary;
+    }
+    return out.str();
+}
+
+NativeDSparkModel::NativeDSparkModel() : impl_(std::make_unique<Impl>()) {}
+
+NativeDSparkModel::~NativeDSparkModel() = default;
+
+NativeDSparkModel::NativeDSparkModel(NativeDSparkModel&&) noexcept = default;
+
+NativeDSparkModel& NativeDSparkModel::operator=(NativeDSparkModel&&) noexcept = default;
+
+bool NativeDSparkModel::load(
+    const std::filesystem::path& model_path,
+    const Gemma4ModelManifest& manifest,
+    std::unique_ptr<NativeDSparkModel>* out,
+    std::string* error) {
+    if (out == nullptr || error == nullptr) {
+        return false;
+    }
+    out->reset();
+    error->clear();
+
+    if (!manifest.is_dspark) {
+        *error = "native DSpark load requires a DSpark manifest";
+        return false;
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)model_path;
+    (void)manifest;
+    *error = "native Gemma 4 DSpark drafter was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        std::unique_ptr<NativeDSparkModel> model(new NativeDSparkModel());
+        model->impl_->manifest_summary = manifest.summary();
+
+        const std::vector<std::filesystem::path> files = safetensor_files(model_path);
+        if (files.empty()) {
+            *error = "no safetensors files found in " + model_path.string();
+            return false;
+        }
+
+        for (const std::filesystem::path& file : files) {
+            auto loaded = mlx::core::load_safetensors(file.string());
+            ++model->impl_->safetensor_file_count;
+            model->impl_->total_tensor_count_seen += loaded.first.size();
+            for (auto& entry : loaded.first) {
+                if (!is_dspark_tensor(entry.first)) {
+                    continue;
+                }
+                auto inserted = model->impl_->tensors.emplace(std::move(entry.first), std::move(entry.second));
+                if (!inserted.second) {
+                    *error = "duplicate DSpark tensor while loading " + file.string();
+                    return false;
+                }
+            }
+        }
+
+        model->impl_->dspark_tensor_count = model->impl_->tensors.size();
+        if (model->impl_->safetensor_file_count != manifest.safetensor_file_count ||
+            model->impl_->total_tensor_count_seen != manifest.total_tensor_count ||
+            model->impl_->dspark_tensor_count != manifest.language_tensor_count) {
+            std::ostringstream message;
+            message << "native loaded DSpark tensor inventory does not match manifest: files="
+                    << model->impl_->safetensor_file_count << " tensors="
+                    << model->impl_->total_tensor_count_seen << " dspark_tensors="
+                    << model->impl_->dspark_tensor_count;
+            *error = message.str();
+            return false;
+        }
+
+        *out = std::move(model);
+        return true;
+    } catch (const std::exception& ex) {
+        *error = std::string("MLX native DSpark load failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "MLX native DSpark load failed with an unknown exception";
+        return false;
+    }
+#endif
+}
+
+size_t NativeDSparkModel::tensor_count() const {
+    return impl_ == nullptr ? 0 : impl_->dspark_tensor_count;
+}
+
+std::string NativeDSparkModel::summary() const {
+    if (impl_ == nullptr) {
+        return "native Gemma 4 DSpark model is empty";
+    }
+    std::ostringstream out;
+    out << "native Gemma 4 DSpark loaded " << impl_->dspark_tensor_count
+        << " DSpark tensors from " << impl_->safetensor_file_count
         << " safetensor files (" << impl_->total_tensor_count_seen << " tensors scanned)";
     if (!impl_->manifest_summary.empty()) {
         out << "; " << impl_->manifest_summary;

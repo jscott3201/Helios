@@ -15,6 +15,16 @@ namespace {
 bool parse_json_string(const std::string& text, size_t* pos, std::string* out);
 void skip_ws(const std::string& text, size_t* pos);
 bool skip_json_value(const std::string& text, size_t* pos);
+bool parse_json_string_after(
+    const std::string& text,
+    std::string_view anchor,
+    std::string_view key,
+    std::string* out);
+bool parse_json_uint_array_after(
+    const std::string& text,
+    std::string_view anchor,
+    std::string_view key,
+    std::vector<uint32_t>* out);
 
 std::string read_text_file(const std::filesystem::path& path, std::string* error) {
     std::ifstream input(path);
@@ -94,6 +104,80 @@ bool parse_json_bool_after(
     if (text.compare(pos, 5, "false") == 0) {
         *out = false;
         return true;
+    }
+    return false;
+}
+
+bool parse_json_string_after(
+    const std::string& text,
+    std::string_view anchor,
+    std::string_view key,
+    std::string* out) {
+    const size_t start = find_anchor(text, anchor);
+    const std::string quoted_key = "\"" + std::string(key) + "\"";
+    const size_t key_pos = text.find(quoted_key, start);
+    if (key_pos == std::string::npos) {
+        return false;
+    }
+    size_t pos = text.find(':', key_pos + quoted_key.size());
+    if (pos == std::string::npos) {
+        return false;
+    }
+    ++pos;
+    skip_ws(text, &pos);
+    return parse_json_string(text, &pos, out);
+}
+
+bool parse_json_uint_array_after(
+    const std::string& text,
+    std::string_view anchor,
+    std::string_view key,
+    std::vector<uint32_t>* out) {
+    const size_t start = find_anchor(text, anchor);
+    const std::string quoted_key = "\"" + std::string(key) + "\"";
+    const size_t key_pos = text.find(quoted_key, start);
+    if (key_pos == std::string::npos) {
+        return false;
+    }
+    size_t pos = text.find(':', key_pos + quoted_key.size());
+    if (pos == std::string::npos) {
+        return false;
+    }
+    ++pos;
+    skip_ws(text, &pos);
+    if (pos >= text.size() || text[pos] != '[') {
+        return false;
+    }
+    ++pos;
+    out->clear();
+    while (pos < text.size()) {
+        skip_ws(text, &pos);
+        if (pos < text.size() && text[pos] == ']') {
+            ++pos;
+            return true;
+        }
+        if (pos >= text.size() || !std::isdigit(static_cast<unsigned char>(text[pos]))) {
+            return false;
+        }
+        uint64_t value = 0;
+        while (pos < text.size() && std::isdigit(static_cast<unsigned char>(text[pos]))) {
+            value = (value * 10) + static_cast<uint64_t>(text[pos] - '0');
+            if (value > UINT32_MAX) {
+                return false;
+            }
+            ++pos;
+        }
+        out->push_back(static_cast<uint32_t>(value));
+        skip_ws(text, &pos);
+        if (pos < text.size() && text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (pos < text.size() && text[pos] == ']') {
+            ++pos;
+            return true;
+        }
+        return false;
     }
     return false;
 }
@@ -270,6 +354,96 @@ bool parse_assistant_config(
         manifest->quantization_group_size != 64 || !manifest->attention_k_eq_v ||
         !manifest->tie_word_embeddings) {
         *error = "config.json does not match the expected Gemma 4 12B MTP assistant shape";
+        return false;
+    }
+    return true;
+}
+
+bool parse_dspark_config(
+    const std::filesystem::path& model_path,
+    Gemma4ModelManifest* manifest,
+    std::string* error) {
+    const std::string config = read_text_file(model_path / "config.json", error);
+    if (config.empty()) {
+        return false;
+    }
+    if (!has_text(config, "\"Gemma4DSparkModel\"")) {
+        *error = "config.json does not advertise Gemma4DSparkModel";
+        return false;
+    }
+
+    std::string string_value;
+    if (!parse_json_string_after(config, "", "model_type", &string_value) ||
+        string_value != "gemma4_text") {
+        *error = "config.json model_type is not gemma4_text";
+        return false;
+    }
+    if (!parse_json_string_after(config, "", "target_model_type", &string_value) ||
+        string_value != "gemma4_unified") {
+        *error = "config.json target_model_type is not gemma4_unified";
+        return false;
+    }
+    if (!parse_json_string_after(config, "", "dtype", &string_value) || string_value != "bfloat16") {
+        *error = "config.json dtype is not bfloat16";
+        return false;
+    }
+    if (!parse_json_string_after(config, "", "markov_head_type", &string_value) ||
+        string_value != "vanilla") {
+        *error = "config.json markov_head_type is not vanilla";
+        return false;
+    }
+
+    manifest->is_dspark = true;
+    const struct Field {
+        std::string_view key;
+        uint32_t* out;
+    } fields[] = {
+        {"hidden_size", &manifest->hidden_size},
+        {"intermediate_size", &manifest->intermediate_size},
+        {"num_hidden_layers", &manifest->num_hidden_layers},
+        {"num_attention_heads", &manifest->num_attention_heads},
+        {"num_key_value_heads", &manifest->num_key_value_heads},
+        {"num_global_key_value_heads", &manifest->num_global_key_value_heads},
+        {"vocab_size", &manifest->vocab_size},
+        {"sliding_window", &manifest->sliding_window},
+        {"block_size", &manifest->block_size},
+        {"markov_rank", &manifest->markov_rank},
+        {"mask_token_id", &manifest->mask_token_id},
+        {"num_anchors", &manifest->num_anchors},
+    };
+    for (const Field& field : fields) {
+        if (!parse_json_uint_after(config, "", field.key, field.out)) {
+            *error = "config.json is missing " + std::string(field.key);
+            return false;
+        }
+    }
+    if (!parse_json_bool_after(config, "", "attention_k_eq_v", &manifest->attention_k_eq_v) ||
+        !parse_json_bool_after(config, "", "tie_word_embeddings", &manifest->tie_word_embeddings) ||
+        !parse_json_bool_after(config, "", "enable_confidence_head", &manifest->enable_confidence_head) ||
+        !parse_json_bool_after(
+            config,
+            "",
+            "confidence_head_with_markov",
+            &manifest->confidence_head_with_markov)) {
+        *error = "config.json is missing DSpark attention/embedding/confidence flags";
+        return false;
+    }
+    if (!parse_json_uint_array_after(config, "", "target_layer_ids", &manifest->target_layer_ids)) {
+        *error = "config.json is missing target_layer_ids";
+        return false;
+    }
+
+    const std::vector<uint32_t> expected_taps = {5, 17, 29, 41, 46};
+    if (manifest->hidden_size != 3840 || manifest->intermediate_size != 15360 ||
+        manifest->num_hidden_layers != 5 || manifest->num_attention_heads != 16 ||
+        manifest->num_key_value_heads != 8 || manifest->num_global_key_value_heads != 1 ||
+        manifest->vocab_size != 262144 || manifest->sliding_window != 1024 ||
+        manifest->block_size != 7 || manifest->markov_rank != 256 ||
+        manifest->mask_token_id != 4 || manifest->num_anchors != 512 ||
+        !manifest->attention_k_eq_v || manifest->tie_word_embeddings ||
+        !manifest->enable_confidence_head || !manifest->confidence_head_with_markov ||
+        manifest->target_layer_ids != expected_taps) {
+        *error = "config.json does not match the expected XR60 Gemma4 DSpark block-7 shape";
         return false;
     }
     return true;
@@ -554,6 +728,61 @@ bool validate_assistant_tensor_inventory(
     return true;
 }
 
+bool is_dspark_tensor_key(std::string_view key) {
+    return key.rfind("layers.", 0) == 0 || key.rfind("embed_tokens.", 0) == 0 ||
+        key.rfind("lm_head.", 0) == 0 || key.rfind("fc.", 0) == 0 ||
+        key.rfind("hidden_norm.", 0) == 0 || key.rfind("norm.", 0) == 0 ||
+        key.rfind("markov_head.", 0) == 0 || key.rfind("confidence_head.", 0) == 0;
+}
+
+bool validate_dspark_tensor_inventory(
+    const std::set<std::string>& keys,
+    Gemma4ModelManifest* manifest,
+    std::string* error) {
+    std::vector<std::string> missing;
+    require_key(keys, "embed_tokens.weight", &missing);
+    require_key(keys, "fc.weight", &missing);
+    require_key(keys, "hidden_norm.weight", &missing);
+    require_key(keys, "norm.weight", &missing);
+    require_key(keys, "lm_head.weight", &missing);
+    require_key(keys, "markov_head.markov_w1.weight", &missing);
+    require_key(keys, "markov_head.markov_w2.weight", &missing);
+    require_key(keys, "confidence_head.proj.weight", &missing);
+    require_key(keys, "confidence_head.proj.bias", &missing);
+
+    for (uint32_t layer = 0; layer < manifest->num_hidden_layers; ++layer) {
+        const std::string base = "layers." + std::to_string(layer);
+        require_key(keys, base + ".input_layernorm.weight", &missing);
+        require_key(keys, base + ".post_attention_layernorm.weight", &missing);
+        require_key(keys, base + ".pre_feedforward_layernorm.weight", &missing);
+        require_key(keys, base + ".post_feedforward_layernorm.weight", &missing);
+        require_key(keys, base + ".layer_scalar", &missing);
+        require_key(keys, base + ".self_attn.q_proj.weight", &missing);
+        require_key(keys, base + ".self_attn.k_proj.weight", &missing);
+        require_key(keys, base + ".self_attn.o_proj.weight", &missing);
+        require_key(keys, base + ".self_attn.q_norm.weight", &missing);
+        require_key(keys, base + ".self_attn.k_norm.weight", &missing);
+        require_key(keys, base + ".mlp.gate_proj.weight", &missing);
+        require_key(keys, base + ".mlp.up_proj.weight", &missing);
+        require_key(keys, base + ".mlp.down_proj.weight", &missing);
+    }
+
+    if (!missing.empty()) {
+        *error = "missing required Gemma 4 DSpark tensor: " + missing.front();
+        return false;
+    }
+
+    for (const std::string& key : keys) {
+        if (is_dspark_tensor_key(key)) {
+            ++manifest->language_tensor_count;
+        } else {
+            ++manifest->ignored_multimodal_tensor_count;
+        }
+    }
+
+    return true;
+}
+
 bool collect_safetensor_keys(
     const std::filesystem::path& model_path,
     Gemma4ModelManifest* out,
@@ -592,10 +821,14 @@ bool collect_safetensor_keys(
 
 std::string Gemma4ModelManifest::summary() const {
     std::ostringstream out;
-    out << (is_assistant ? "Gemma4 MTP assistant manifest: layers=" : "Gemma4 text manifest: layers=")
+    out << (is_dspark ? "Gemma4 DSpark manifest: layers="
+                      : (is_assistant ? "Gemma4 MTP assistant manifest: layers="
+                                      : "Gemma4 text manifest: layers="))
         << num_hidden_layers
         << " hidden=" << hidden_size
         << " backbone_hidden=" << backbone_hidden_size
+        << " block_size=" << block_size
+        << " markov_rank=" << markov_rank
         << " kv_shared_layers=" << num_kv_shared_layers
         << " vocab=" << vocab_size
         << " quant=" << quantization_bits << "bit/group" << quantization_group_size
@@ -684,6 +917,42 @@ bool load_gemma4_mtp_assistant_manifest(
             "Gemma 4 MTP assistant tensor inventory did not match expected 4-bit counts: tensors=" +
             std::to_string(out->total_tensor_count) +
             " assistant_tensors=" + std::to_string(out->language_tensor_count) +
+            " quantized_groups=" + std::to_string(out->quantized_linear_count) +
+            " ignored_tensors=" + std::to_string(out->ignored_multimodal_tensor_count);
+        return false;
+    }
+
+    return true;
+}
+
+bool load_gemma4_dspark_manifest(
+    const std::filesystem::path& model_path,
+    Gemma4ModelManifest* out,
+    std::string* error) {
+    if (out == nullptr || error == nullptr) {
+        return false;
+    }
+    *out = Gemma4ModelManifest{};
+    error->clear();
+    if (!parse_dspark_config(model_path, out, error)) {
+        return false;
+    }
+
+    std::set<std::string> keys;
+    if (!collect_safetensor_keys(model_path, out, &keys, error)) {
+        return false;
+    }
+    if (!validate_dspark_tensor_inventory(keys, out, error)) {
+        return false;
+    }
+
+    if (out->language_tensor_count != 74 || out->quantized_linear_count != 0 ||
+        out->ignored_multimodal_tensor_count != 0 ||
+        out->total_tensor_count != out->language_tensor_count) {
+        *error =
+            "Gemma 4 DSpark tensor inventory did not match expected BF16 counts: tensors=" +
+            std::to_string(out->total_tensor_count) +
+            " dspark_tensors=" + std::to_string(out->language_tensor_count) +
             " quantized_groups=" + std::to_string(out->quantized_linear_count) +
             " ignored_tensors=" + std::to_string(out->ignored_multimodal_tensor_count);
         return false;
