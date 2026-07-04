@@ -15,7 +15,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{GenerateOptions, GenerateSummary, ResidentTarget, detokenize_tokens, generate};
+use crate::{
+    GenerateOptions, GenerateSummary, NativeServerDefaultPrefillChunkPolicySelection,
+    ResidentTarget, detokenize_tokens, generate,
+};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const SERVER_NAME: &str = "gemma4d";
@@ -210,6 +213,7 @@ struct PersistentNativeState {
     requests_total: u64,
     errors_total: u64,
     last_error: Option<String>,
+    native_prefill_policy: NativePrefillPolicyState,
 }
 
 impl PersistentNativeState {
@@ -222,6 +226,57 @@ impl PersistentNativeState {
             requests_total: 0,
             errors_total: 0,
             last_error: None,
+            native_prefill_policy: NativePrefillPolicyState::pending(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NativePrefillPolicyState {
+    status: String,
+    policy: Option<String>,
+    reason: String,
+    warning: Option<String>,
+}
+
+impl NativePrefillPolicyState {
+    fn pending() -> Self {
+        Self {
+            status: "pending".to_owned(),
+            policy: None,
+            reason: "persistent-native worker has not finished loading".to_owned(),
+            warning: None,
+        }
+    }
+
+    fn applied(selection: NativeServerDefaultPrefillChunkPolicySelection) -> Self {
+        Self {
+            status: "applied".to_owned(),
+            policy: selection.policy_name().map(str::to_owned),
+            reason: "server-owned native prefill default applied after target load".to_owned(),
+            warning: None,
+        }
+    }
+
+    fn skipped(selection: NativeServerDefaultPrefillChunkPolicySelection) -> Self {
+        Self {
+            status: "skipped".to_owned(),
+            policy: None,
+            reason: selection
+                .skip_reason()
+                .unwrap_or("server-owned native prefill default not selected")
+                .to_owned(),
+            warning: None,
+        }
+    }
+
+    fn failed(selection: NativeServerDefaultPrefillChunkPolicySelection, warning: String) -> Self {
+        Self {
+            status: "failed".to_owned(),
+            policy: selection.policy_name().map(str::to_owned),
+            reason: "server-owned native prefill default setter failed after target load"
+                .to_owned(),
+            warning: Some(warning),
         }
     }
 }
@@ -247,14 +302,15 @@ fn native_prefill_policy_warning(error: impl std::fmt::Display) -> String {
 fn mark_persistent_native_ready(
     worker_state: &Arc<Mutex<PersistentNativeState>>,
     model_load: Duration,
-    policy_warning: Option<String>,
+    policy_state: NativePrefillPolicyState,
 ) {
     let mut state = worker_state.lock().expect("persistent state lock");
     state.status = "ready".to_owned();
     state.model_loaded = true;
     state.model_load_count = 1;
     state.model_load_seconds = model_load.as_secs_f64();
-    state.last_error = policy_warning;
+    state.last_error = policy_state.warning.clone();
+    state.native_prefill_policy = policy_state;
 }
 
 impl PersistentNativeBackend {
@@ -265,17 +321,26 @@ impl PersistentNativeBackend {
         thread::spawn(move || {
             let resident = match ResidentTarget::load(model_path, max_context_tokens) {
                 Ok(mut resident) => {
-                    let policy_warning = resident
-                        .apply_native_server_default_prefill_chunk_policy()
-                        .err()
-                        .map(native_prefill_policy_warning);
+                    let selection = crate::native_server_default_prefill_chunk_policy_selection();
+                    let policy_state =
+                        match resident.apply_native_server_default_prefill_chunk_policy() {
+                            Ok(NativeServerDefaultPrefillChunkPolicySelection::Apply(_)) => {
+                                NativePrefillPolicyState::applied(selection)
+                            }
+                            Ok(skipped) => NativePrefillPolicyState::skipped(skipped),
+                            Err(error) => {
+                                let warning = native_prefill_policy_warning(error);
+                                NativePrefillPolicyState::failed(selection, warning)
+                            }
+                        };
+                    let policy_warning = policy_state.warning.clone();
                     if let Some(warning) = policy_warning.as_ref() {
                         eprintln!("{warning}");
                     }
                     mark_persistent_native_ready(
                         &worker_state,
                         resident.model_load(),
-                        policy_warning,
+                        policy_state,
                     );
                     Some(resident)
                 }
@@ -425,6 +490,15 @@ impl ServerRuntime {
                 "model_path": self.config.model_path.as_ref().map(|path| path.display().to_string()),
                 "max_context_tokens": self.config.max_context_tokens,
                 "admission_prefill_chunked": self.config.admission_prefill_chunked,
+                "native_prefill": {
+                    "admission_prefill_chunked": self.config.admission_prefill_chunked,
+                    "server_default_policy": if self.config.admission_prefill_chunked {
+                        Some("long_context_256")
+                    } else {
+                        None
+                    },
+                    "state_source": "server_config",
+                },
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
             })),
             ("POST", "/v1/config/validate") => self.json_ok(json!({
@@ -2033,11 +2107,17 @@ mod tests {
     #[test]
     fn persistent_native_policy_warning_keeps_loaded_state_ready() {
         let state = Arc::new(Mutex::new(PersistentNativeState::loading()));
+        let warning = native_prefill_policy_warning("setter failed");
 
         mark_persistent_native_ready(
             &state,
             Duration::from_millis(1250),
-            Some(native_prefill_policy_warning("setter failed")),
+            NativePrefillPolicyState::failed(
+                NativeServerDefaultPrefillChunkPolicySelection::Apply(
+                    gemma4d_ffi::PrefillChunkPolicy::LongContext256,
+                ),
+                warning,
+            ),
         );
 
         let snapshot = state.lock().expect("persistent state lock").clone();
@@ -2052,6 +2132,59 @@ mod tests {
                 "native server prefill chunk policy warning: setter failed; continuing without default policy"
             )
         );
+        assert_eq!(snapshot.native_prefill_policy.status, "failed");
+        assert_eq!(
+            snapshot.native_prefill_policy.policy.as_deref(),
+            Some("long_context_256")
+        );
+        assert_eq!(
+            snapshot.native_prefill_policy.warning.as_deref(),
+            Some(
+                "native server prefill chunk policy warning: setter failed; continuing without default policy"
+            )
+        );
+    }
+
+    #[test]
+    fn native_prefill_policy_state_records_applied_and_skipped_decisions() {
+        let applied = NativePrefillPolicyState::applied(
+            NativeServerDefaultPrefillChunkPolicySelection::Apply(
+                gemma4d_ffi::PrefillChunkPolicy::LongContext256,
+            ),
+        );
+        assert_eq!(applied.status, "applied");
+        assert_eq!(applied.policy.as_deref(), Some("long_context_256"));
+        assert_eq!(
+            applied.reason,
+            "server-owned native prefill default applied after target load"
+        );
+
+        let skipped = NativePrefillPolicyState::skipped(
+            NativeServerDefaultPrefillChunkPolicySelection::SkipExplicitEnvOverride,
+        );
+        assert_eq!(skipped.status, "skipped");
+        assert!(skipped.policy.is_none());
+        assert_eq!(
+            skipped.reason,
+            "explicit native prefill env override is set"
+        );
+    }
+
+    #[test]
+    fn config_endpoint_exposes_native_prefill_policy_hint() {
+        let runtime = ServerRuntime::new(ServerConfig {
+            admission_prefill_chunked: true,
+            ..ServerConfig::default()
+        });
+        let response = runtime.handle_request("GET", "/v1/config", b"");
+        assert_eq!(response.status, 200);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("json");
+        assert_eq!(value["native_prefill"]["admission_prefill_chunked"], true);
+        assert_eq!(
+            value["native_prefill"]["server_default_policy"],
+            "long_context_256"
+        );
+        assert_eq!(value["native_prefill"]["state_source"], "server_config");
     }
 
     #[test]

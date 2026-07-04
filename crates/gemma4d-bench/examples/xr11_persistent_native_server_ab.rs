@@ -123,11 +123,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .candidate
         .as_ref()
         .is_some_and(|metrics| metrics.model_load_count == Some(1.0));
-    let baseline_load_count_ok = final_metrics
-        .baseline
-        .as_ref()
-        .and_then(|metrics| metrics.model_load_count)
-        .is_none_or(|count| count >= records.len() as f64);
+    let baseline_load_count_ok = baseline_load_count_ok(
+        args.baseline_backend,
+        final_metrics.baseline.as_ref(),
+        &records,
+    );
     let decision = if !all_blockers.is_empty() {
         "blocked_with_evidence"
     } else if token_text_matches && candidate_load_count_ok && baseline_load_count_ok {
@@ -158,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status: status.to_owned(),
         decision: decision.to_owned(),
         run_id,
-        mode: MODE.to_owned(),
+        mode: mode_for_args(&args).to_owned(),
         command,
         model_path: args.model_path.display().to_string(),
         model_identity,
@@ -168,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_new_tokens: args.max_new_tokens,
         max_context_tokens: args.max_context_tokens,
         memory_budget_mb: args.memory_budget_mb,
+        baseline_backend: args.baseline_backend,
         selected_workloads: selected
             .iter()
             .map(|workload| workload.workload_id.clone())
@@ -179,7 +180,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         blockers: all_blockers,
         records: records.clone(),
         measurement_notes: vec![
-            "Baseline uses ServerBackend::RealHelper over a localhost TcpListener and pays target load inside each HTTP request.",
+            "The baseline backend is selected by --baseline-backend. The default baseline is ServerBackend::RealHelper; persistent-native baseline mode passes an explicit --backend persistent-native flag.",
             "Candidate is built from parse_serve_options with --model-path and no --backend flag; XR53 defaults that path to ServerBackend::PersistentNative.",
             "The persistent-native worker owns one ResidentTarget and creates fresh KV per request.",
             "The benchmark compares response text and generated token ids from gemma4d_metrics.generated_token_ids.",
@@ -219,6 +220,7 @@ struct Args {
     max_new_tokens: usize,
     max_context_tokens: usize,
     memory_budget_mb: u64,
+    baseline_backend: ServerBackend,
 }
 
 impl Args {
@@ -236,6 +238,7 @@ impl Args {
         let mut max_new_tokens = 8usize;
         let mut max_context_tokens = 32_768usize;
         let mut memory_budget_mb = 12 * 1024u64;
+        let mut baseline_backend = ServerBackend::RealHelper;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -280,9 +283,13 @@ impl Args {
                         return Err("--memory-budget-mb must be greater than zero".into());
                     }
                 }
+                "--baseline-backend" => {
+                    baseline_backend =
+                        parse_baseline_backend(&required(&mut args, "--baseline-backend")?)?;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- [--out-dir PATH] [--model-path PATH] [--workloads PATH] [--workload-ids CSV] [--repeats N] [--max-new-tokens N]"
+                        "usage: cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- [--out-dir PATH] [--model-path PATH] [--workloads PATH] [--workload-ids CSV] [--repeats N] [--max-new-tokens N] [--baseline-backend real-helper|persistent-native]"
                     );
                     std::process::exit(0);
                 }
@@ -304,6 +311,7 @@ impl Args {
             max_new_tokens,
             max_context_tokens,
             memory_budget_mb,
+            baseline_backend,
         })
     }
 }
@@ -433,6 +441,7 @@ struct Summary {
     max_new_tokens: usize,
     max_context_tokens: usize,
     memory_budget_mb: u64,
+    baseline_backend: ServerBackend,
     selected_workloads: Vec<String>,
     generated_files: Vec<String>,
     environment: Environment,
@@ -480,7 +489,7 @@ fn run_cases(
     environment: &Environment,
     model_identity: &manifest::ArtifactIdentity,
 ) -> Result<RunOutput, Box<dyn std::error::Error>> {
-    let baseline_server = start_server(args, ServerBackend::RealHelper)?;
+    let baseline_server = start_server(args, args.baseline_backend, true)?;
     let mut baseline = Vec::new();
     for workload in workloads {
         let prompt = fs::read_to_string(&workload.prompt_path)?;
@@ -490,7 +499,7 @@ fn run_cases(
                 repeat_index,
                 run_backend_request(
                     baseline_server.addr,
-                    ServerBackend::RealHelper,
+                    args.baseline_backend,
                     &prompt,
                     args.max_new_tokens,
                 ),
@@ -501,7 +510,7 @@ fn run_cases(
         fetch_prometheus(baseline_server.addr).unwrap_or_else(PrometheusSnapshot::default);
     drop(baseline_server);
 
-    let candidate_server = start_server(args, ServerBackend::PersistentNative)?;
+    let candidate_server = start_server(args, ServerBackend::PersistentNative, false)?;
     let mut records = Vec::new();
     let mut baseline_iter = baseline.into_iter();
     for workload in workloads {
@@ -566,12 +575,13 @@ fn run_cases(
 fn start_server(
     args: &Args,
     backend: ServerBackend,
+    explicit_backend_flag: bool,
 ) -> Result<RunningServer, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let server_shutdown = Arc::clone(&shutdown);
-    let config = server_config_from_args(args, backend, addr)?;
+    let config = server_config_from_args(args, backend, explicit_backend_flag, addr)?;
     let runtime = ServerRuntime::new(config);
     let handle = thread::spawn(move || serve_listener(listener, runtime, server_shutdown));
     wait_for_health(addr)?;
@@ -585,6 +595,7 @@ fn start_server(
 fn server_config_from_args(
     args: &Args,
     backend: ServerBackend,
+    explicit_backend_flag: bool,
     addr: std::net::SocketAddr,
 ) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let mut serve_args = vec![
@@ -597,8 +608,8 @@ fn server_config_from_args(
         "--memory-budget-mb".to_owned(),
         args.memory_budget_mb.to_string(),
     ];
-    if backend == ServerBackend::RealHelper {
-        serve_args.extend(["--backend".to_owned(), "real-helper".to_owned()]);
+    if explicit_backend_flag {
+        serve_args.extend(["--backend".to_owned(), backend.cli_name().to_owned()]);
     }
     let config = config_from_serve_options(parse_serve_options(serve_args)?);
     if config.backend != backend {
@@ -917,6 +928,10 @@ fn render_report(summary: &Summary) -> String {
     out.push_str(&format!("- Decision: `{}`\n", summary.decision));
     out.push_str(&format!("- Run ID: `{}`\n", summary.run_id));
     out.push_str(&format!("- Mode: `{}`\n", summary.mode));
+    out.push_str(&format!(
+        "- Baseline backend: `{}`\n",
+        summary.baseline_backend.as_str()
+    ));
     out.push_str(&format!("- Command: `{}`\n\n", summary.command));
     out.push_str("## Model Identity\n\n");
     out.push_str("| Field | Value |\n");
@@ -989,6 +1004,22 @@ fn render_report(summary: &Summary) -> String {
             record.candidate.generated_token_ids.len(),
         ));
     }
+    out.push_str("\n## Runtime Snapshot Evidence\n\n");
+    out.push_str("| Workload | Repeat | Baseline backend | Baseline policy | Candidate backend | Candidate policy | Candidate policy reason | Candidate loaded |\n");
+    out.push_str("|---|---:|---|---|---|---|---|---:|\n");
+    for record in &summary.records {
+        out.push_str(&format!(
+            "| `{}` | {} | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+            record.workload_id,
+            record.repeat_index,
+            record.baseline.backend,
+            runtime_policy_status(&record.baseline),
+            record.candidate.backend,
+            runtime_policy_status(&record.candidate),
+            runtime_policy_reason(&record.candidate),
+            runtime_model_loaded(&record.candidate),
+        ));
+    }
     out.push_str("\n## Workload Metadata\n\n");
     out.push_str("| Workload | Seed | Target tokens | Actual tokens | Prompt SHA-256 |\n");
     out.push_str("|---|---:|---:|---:|---|\n");
@@ -1011,6 +1042,42 @@ fn render_report(summary: &Summary) -> String {
         }
     }
     out
+}
+
+fn runtime_policy_status(run: &BackendRun) -> String {
+    run.runtime_snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            snapshot
+                .pointer("/persistent_backend/native_prefill_policy/status")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("n/a")
+        .to_owned()
+}
+
+fn runtime_policy_reason(run: &BackendRun) -> String {
+    run.runtime_snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            snapshot
+                .pointer("/persistent_backend/native_prefill_policy/reason")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("n/a")
+        .replace('|', "\\|")
+}
+
+fn runtime_model_loaded(run: &BackendRun) -> String {
+    run.runtime_snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            snapshot
+                .pointer("/health/model_loaded")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .map(|loaded| loaded.to_string())
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 fn render_blockers(summary: &Summary) -> String {
@@ -1044,6 +1111,29 @@ fn render_decision(summary: &Summary) -> String {
     out
 }
 
+fn baseline_load_count_ok(
+    baseline_backend: ServerBackend,
+    metrics: Option<&PrometheusSnapshot>,
+    records: &[Xr11Record],
+) -> bool {
+    let count = metrics.and_then(|metrics| metrics.model_load_count);
+    match baseline_backend {
+        ServerBackend::RealHelper => count.is_none_or(|count| count >= records.len() as f64),
+        ServerBackend::PersistentNative => count == Some(1.0),
+        ServerBackend::Stub => false,
+    }
+}
+
+fn mode_for_args(args: &Args) -> &'static str {
+    match args.baseline_backend {
+        ServerBackend::RealHelper => MODE,
+        ServerBackend::PersistentNative => {
+            "server_explicit_persistent_native_vs_default_persistent_native"
+        }
+        ServerBackend::Stub => "invalid_stub_baseline",
+    }
+}
+
 fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = fs::File::create(path)?;
     for record in records {
@@ -1054,7 +1144,7 @@ fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<(), Box<dyn s
 
 fn command_display(args: &Args) -> String {
     format!(
-        "cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- --out-dir {} --model-path {} --workloads {} --workload-ids {} --repeats {} --max-new-tokens {} --max-context-tokens {} --memory-budget-mb {}",
+        "cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- --out-dir {} --model-path {} --workloads {} --workload-ids {} --repeats {} --max-new-tokens {} --max-context-tokens {} --memory-budget-mb {} --baseline-backend {}",
         args.out_dir.display(),
         args.model_path.display(),
         args.workloads_path.display(),
@@ -1063,6 +1153,7 @@ fn command_display(args: &Args) -> String {
         args.max_new_tokens,
         args.max_context_tokens,
         args.memory_budget_mb,
+        args.baseline_backend.cli_name(),
     )
 }
 
@@ -1131,6 +1222,18 @@ fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, Box<dyn std::e
         return Err(format!("{flag} must be greater than zero").into());
     }
     Ok(parsed)
+}
+
+fn parse_baseline_backend(value: &str) -> Result<ServerBackend, Box<dyn std::error::Error>> {
+    match value {
+        "real-helper" | "real_helper" => Ok(ServerBackend::RealHelper),
+        "persistent-native" | "persistent_native" => Ok(ServerBackend::PersistentNative),
+        "stub" => Err("--baseline-backend stub is not valid for XR11 comparison evidence".into()),
+        other => Err(format!(
+            "--baseline-backend must be real-helper or persistent-native, got '{other}'"
+        )
+        .into()),
+    }
 }
 
 fn usize_at(value: &serde_json::Value, key: &str) -> usize {
