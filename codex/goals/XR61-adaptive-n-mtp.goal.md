@@ -7,7 +7,24 @@ using XR56 repair-cost evidence and XR57 real margin/top-k signals, while
 preserving greedy exactness, sequential-oracle commit semantics, and default-off
 MTP behavior until all default-on gates pass.
 
-Decision: pending.
+Decision: `keep_experimental`.
+
+XR61 P1 is closed as an env-gated/harness-only result. The safe-bypass
+adaptive policy preserved measured exactness on the proven primary lanes and
+protected 4K/protected holdouts, and the sequential-oracle differential matched
+generated tokens record-by-record. It did not clear default-on gates: selected
+aggregate speed was `+21.303%`, below the `25%` threshold, default-path overhead
+was not remeasured, and risk review was not recorded. The earlier generic
+holdout probe is retained as blocker evidence because `code_review_rust_4k_001`
+failed exactness under generic adaptive `N=2`.
+
+Result artifacts:
+
+- `benchmarks/out/XR61-adaptive-n-mtp/candidate-adaptive-n-v2-safe-bypass/`
+- `benchmarks/out/XR61-adaptive-n-mtp/candidate-adaptive-n-v2-safe-bypass-holdouts/`
+- `benchmarks/out/XR61-adaptive-n-mtp/sequential-oracle-adaptive-n-v2-safe-bypass/`
+- `benchmarks/out/XR61-adaptive-n-mtp/xr61-adaptive-n-summary.md`
+- `benchmarks/out/XR61-adaptive-n-mtp/xr61-adaptive-n-summary.json`
 
 ## Scope
 
@@ -146,3 +163,19 @@ Complete XR61 when Adaptive-N MTP is accepted, kept experimental, rejected, or
 blocked with evidence, and any deferred server/default or native decode work is
 explicitly tied to measured limiters. If no valid tiny16 `>5%` lane remains,
 stop with blocker evidence instead of speculating.
+
+Completion result:
+
+- Status: `keep_experimental`
+- Primary candidate: `9/9` measured exact, selected
+  `chat_short_1k_001:adaptive` and `tool_json_1k_001:adaptive`, aggregate
+  `8315.953 -> 6544.437 ms` (`+21.303%`), weighted acceptance
+  `144/204 = 0.706`, peak MLX `8.008 GB`.
+- Holdout: `9/9` measured exact, selected no MTP workloads, baseline-bypassed
+  `code_review_rust_4k_001`, `benchmark_qa_4k_001`, and
+  `mtp_candidate_4k_001`, aggregate `+0.000%`, peak MLX `9.244 GB`.
+- Oracle: compared `9` measured candidate records with no generated-token
+  mismatches.
+- Default path: unchanged; no server/default promotion.
+- Next measured limiter: accepted tokens per verifier/fallback cost. Adaptive
+  policy selection alone does not exceed XR56 or the `25%` default-on gate.

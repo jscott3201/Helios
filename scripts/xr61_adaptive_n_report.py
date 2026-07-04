@@ -205,6 +205,9 @@ def default_on_gates(
     candidate: dict[str, Any],
     holdout: dict[str, Any],
     oracle: dict[str, Any],
+    *,
+    ledger_updated: bool = False,
+    risk_review_recorded: bool = False,
 ) -> dict[str, Any]:
     holdout_result = holdout_gate(holdout)
     speed = candidate["policy_speedup_percent"]
@@ -219,8 +222,8 @@ def default_on_gates(
         "real_margins_env_gated": candidate["mtp_real_margins_enabled"],
         "provenance_complete": candidate["provenance_complete"]
         and holdout["provenance_complete"],
-        "ledger_updated": False,
-        "risk_review_recorded": False,
+        "ledger_updated": ledger_updated,
+        "risk_review_recorded": risk_review_recorded,
     }
     return {
         "passed": all(gates.values()),
@@ -236,12 +239,21 @@ def decide(
     candidate_summary: dict[str, Any] | None,
     holdout_summary: dict[str, Any] | None,
     oracle_summary: dict[str, Any] | None,
+    *,
+    ledger_updated: bool = False,
+    risk_review_recorded: bool = False,
 ) -> tuple[str, str, list[str], dict[str, Any]]:
     blockers = list(policy_search.get("blockers") or [])
     candidate = run_summary("candidate", candidate_summary)
     holdout = run_summary("holdout", holdout_summary)
     oracle = compare_oracle(candidate_summary, oracle_summary)
-    gates = default_on_gates(candidate, holdout, oracle)
+    gates = default_on_gates(
+        candidate,
+        holdout,
+        oracle,
+        ledger_updated=ledger_updated,
+        risk_review_recorded=risk_review_recorded,
+    )
 
     if candidate_summary is None:
         blockers.append("candidate summary missing")
@@ -444,6 +456,8 @@ def main() -> None:
     parser.add_argument("--oracle-summary")
     parser.add_argument("--out-md", default=DEFAULT_OUT_MD)
     parser.add_argument("--out-json", default=DEFAULT_OUT_JSON)
+    parser.add_argument("--ledger-updated", action="store_true")
+    parser.add_argument("--risk-review-recorded", action="store_true")
     args = parser.parse_args()
 
     policy_search = load_json(Path(args.policy_candidates), required=True)
@@ -457,6 +471,8 @@ def main() -> None:
         candidate_summary,
         holdout_summary,
         oracle_summary,
+        ledger_updated=args.ledger_updated,
+        risk_review_recorded=args.risk_review_recorded,
     )
 
     result = {
