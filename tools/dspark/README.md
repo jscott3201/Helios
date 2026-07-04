@@ -118,6 +118,29 @@ The token exporter fails closed on prompt SHA-256 and token-count mismatches
 against `benchmarks/workloads/real-contexts/workloads.jsonl`, unless
 `--allow-mismatch` is set for diagnostic-only output.
 
+## Final Decision Rollup
+
+After the fixed-prefix, real-context, parity, and target-distribution artifacts
+exist, generate the goal-level root artifact set:
+
+```bash
+python3 tools/dspark/summarize_xr60_decision.py \
+  --decision reject_for_now
+```
+
+This writes:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/summary.json
+benchmarks/out/XR60-dspark-native-mlx/report.md
+benchmarks/out/XR60-dspark-native-mlx/blockers.md
+benchmarks/out/XR60-dspark-native-mlx/decision.md
+```
+
+The finalizer fails closed if required source evidence is missing unless
+`--allow-missing` is used for diagnostic-only output.
+
 ## MLX Conversion Manifest
 
 ```bash
