@@ -82,14 +82,16 @@ Current behavior is intentionally fail-closed:
 - Enabling taps only accepts the released XR60 layer set
   `[5, 17, 29, 41, 46]`.
 - When enabled on the native graph, target prefill/decode captures selected
-  post-layer hidden taps as last-token views and keeps them in
-  `NativeHiddenState`.
+  post-layer hidden taps as cache-owned context sequences in `NativeKvState`
+  and last-token metadata views in `NativeHiddenState`.
 - `gemma4_kv_dspark_tap_info` reports tap ids, shapes, and resident bytes
   without exposing raw MLX pointers over the C ABI.
 - Strict DSpark loads validate the released block-7 config and tensor inventory.
 - On a native-graph target build, strict DSpark loads materialize matching
   DSpark safetensors into an opaque `NativeDSparkModel`.
-- Draft calls remain unsupported until DSpark forward execution is implemented.
+- Draft calls validate the loaded drafter, cached target tap context, last-token
+  tap metadata, and native token alignment, then remain unsupported until
+  DSpark decoder math is implemented.
 - Adapter-active and compressed-active-KV DSpark paths are rejected.
 
 The reference header at `references/ffi/gemma4_mlx.h` was synced to the live
@@ -130,6 +132,31 @@ safetensors header, then defers tensor materialization unless the target was
 loaded with the native graph. This mirrors the existing MTP assistant loader
 behavior and keeps tests runnable without downloading the 6.86 GB checkpoint.
 
+## Native Tap Context Slice
+
+DeepSpec DSpark does not consume only the final target hidden state. Its
+`extract_context_feature` path concatenates selected target hidden-state
+sequences for layer ids `[5, 17, 29, 41, 46]`, producing a context tensor with
+`5 * 3840 = 19200` features per target position before `fc.weight`.
+
+The native target path now preserves that prerequisite state:
+
+- `NativeKvState` owns selected DSpark tap context arrays beside target KV.
+- Prefill replaces the DSpark context with full selected tap sequences.
+- Incremental decode and block decode append selected tap deltas as target KV
+  advances.
+- Retroactive-prefix materialization preserves the corresponding DSpark tap
+  prefix for rollback/verify semantics.
+- KV snapshot save/load persists restored DSpark context taps, and hidden-state
+  load reconstructs last-token tap views from the restored context.
+- `NativeDSparkModel::draft_block` is now the single native admission point for
+  DSpark drafting. It validates tensor load state, block size, context tokens,
+  cached tap ids, cached tap shapes `[1, S, 3840]`, and last-token tap shapes
+  `[1, 1, 3840]` before returning the current decoder-math blocker.
+
+This slice deliberately avoids a last-token-only DSpark implementation, because
+that would not match the released DeepSpec architecture.
+
 ## Verification
 
 Commands run:
@@ -146,7 +173,7 @@ cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benc
 Observed result:
 
 - `cargo test -p gemma4d-ffi --lib`: 21 passed, 1 ignored after adding
-  DSpark strict loader tests.
+  DSpark strict loader and tap-context admission changes.
 - `cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run`:
   compiled successfully.
 - The fixed-prefix harness wrote

@@ -57,6 +57,7 @@ struct NativeKvState::Impl {
         std::optional<mlx::core::array> value;
     };
     std::vector<Layer> layers;
+    std::vector<NativeHiddenState::Impl::DSparkTap> dspark_context_taps;
 #endif
     uint64_t sequence_len = 0;
     uint64_t active_bytes = 0;
@@ -119,6 +120,8 @@ struct NativeDSparkModel::Impl {
     size_t safetensor_file_count = 0;
     size_t dspark_tensor_count = 0;
     size_t total_tensor_count_seen = 0;
+    uint32_t block_size = 0;
+    std::vector<uint32_t> target_layer_ids;
     std::string manifest_summary;
 };
 
@@ -437,6 +440,8 @@ struct BlockPrefixSources {
     uint64_t previous_sequence_len = 0;
     size_t token_count = 0;
     std::vector<BlockPrefixSourceLayer> layers;
+    std::vector<NativeHiddenState::Impl::DSparkTap> previous_dspark_context_taps;
+    std::vector<NativeHiddenState::Impl::DSparkTap> block_dspark_taps;
 };
 
 enum class PrefillKvEvalMode {
@@ -1247,6 +1252,70 @@ DSparkHiddenTaps last_token_dspark_taps(DSparkHiddenTaps taps, int sequence_len)
     return taps;
 }
 
+void replace_dspark_context_taps(NativeKvState::Impl* target_kv, const DSparkHiddenTaps& taps) {
+    if (target_kv == nullptr) {
+        return;
+    }
+    target_kv->dspark_context_taps = taps.taps;
+}
+
+void append_dspark_context_taps(NativeKvState::Impl* target_kv, const DSparkHiddenTaps& taps) {
+    if (target_kv == nullptr || taps.taps.empty()) {
+        return;
+    }
+    if (target_kv->dspark_context_taps.empty()) {
+        target_kv->dspark_context_taps = taps.taps;
+        return;
+    }
+    if (target_kv->dspark_context_taps.size() != taps.taps.size()) {
+        throw std::runtime_error("native DSpark context tap append received a different tap count");
+    }
+    for (size_t index = 0; index < taps.taps.size(); ++index) {
+        NativeHiddenState::Impl::DSparkTap& existing = target_kv->dspark_context_taps[index];
+        const NativeHiddenState::Impl::DSparkTap& next = taps.taps[index];
+        if (existing.layer_id != next.layer_id) {
+            throw std::runtime_error("native DSpark context tap append received mismatched layer ids");
+        }
+        existing.hidden = mlx::core::concatenate({existing.hidden, next.hidden}, 1);
+    }
+}
+
+std::vector<NativeHiddenState::Impl::DSparkTap> prefix_dspark_context_taps(
+    const std::vector<NativeHiddenState::Impl::DSparkTap>& block_taps,
+    size_t prefix_token_count) {
+    if (prefix_token_count == 0 || prefix_token_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native DSpark context prefix count is invalid");
+    }
+    std::vector<NativeHiddenState::Impl::DSparkTap> prefix_taps;
+    prefix_taps.reserve(block_taps.size());
+    for (const NativeHiddenState::Impl::DSparkTap& tap : block_taps) {
+        prefix_taps.push_back(NativeHiddenState::Impl::DSparkTap{
+            tap.layer_id,
+            mlx::core::slice(
+                tap.hidden,
+                {0, 0, 0},
+                {1, static_cast<int>(prefix_token_count), kHiddenSize})});
+    }
+    return prefix_taps;
+}
+
+std::vector<NativeHiddenState::Impl::DSparkTap> last_token_from_dspark_context_taps(
+    const std::vector<NativeHiddenState::Impl::DSparkTap>& context_taps,
+    uint64_t sequence_len) {
+    if (sequence_len == 0 || sequence_len > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+        return {};
+    }
+    std::vector<NativeHiddenState::Impl::DSparkTap> last_taps;
+    last_taps.reserve(context_taps.size());
+    const int stop = static_cast<int>(sequence_len);
+    for (const NativeHiddenState::Impl::DSparkTap& tap : context_taps) {
+        last_taps.push_back(NativeHiddenState::Impl::DSparkTap{
+            tap.layer_id,
+            mlx::core::slice(tap.hidden, {0, stop - 1, 0}, {1, stop, kHiddenSize})});
+    }
+    return last_taps;
+}
+
 struct NativeHiddenArrays {
     array hidden;
     SharedKvArrays shared_kv;
@@ -1298,6 +1367,7 @@ NativeHiddenArrays decode_block_hidden(
             &shared_kv);
         maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
+    append_dspark_context_taps(target_kv, dspark_taps);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
@@ -1344,6 +1414,9 @@ NativeHiddenArrays forward_hidden(
         const std::string label = "layer" + std::to_string(layer);
         dump_hidden_tensor(label.c_str(), h);
         trace_hidden_stats(label.c_str(), h, sequence_len);
+    }
+    if (target_kv != nullptr) {
+        replace_dspark_context_taps(target_kv, dspark_taps);
     }
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -1454,6 +1527,7 @@ NativeForwardArrays decode_last_logits(
             &shared_kv);
         maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
+    append_dspark_context_taps(target_kv, dspark_taps);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
@@ -1499,6 +1573,7 @@ NativeHiddenArrays decode_last_hidden(
             &shared_kv);
         maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
+    append_dspark_context_taps(target_kv, dspark_taps);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
@@ -1540,6 +1615,8 @@ NativeForwardArrays decode_block_logits(
         prefix_sources->token_count = token_count;
         prefix_sources->layers.clear();
         prefix_sources->layers.reserve(kTargetLayerCount);
+        prefix_sources->previous_dspark_context_taps = target_kv->dspark_context_taps;
+        prefix_sources->block_dspark_taps.clear();
     }
 
     for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
@@ -1559,6 +1636,10 @@ NativeForwardArrays decode_block_logits(
             prefix_source_layer);
         maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
+    if (prefix_sources != nullptr) {
+        prefix_sources->block_dspark_taps = dspark_taps.taps;
+    }
+    append_dspark_context_taps(target_kv, dspark_taps);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
@@ -1632,6 +1713,12 @@ void materialize_block_prefix_kv(
     eval_deferred_decode_kv(prefix_kv, mode);
     prefix_kv->sequence_len = sources.previous_sequence_len + prefix_token_count;
     prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
+    prefix_kv->dspark_context_taps = sources.previous_dspark_context_taps;
+    if (!sources.block_dspark_taps.empty()) {
+        DSparkHiddenTaps prefix_taps;
+        prefix_taps.taps = prefix_dspark_context_taps(sources.block_dspark_taps, prefix_token_count);
+        append_dspark_context_taps(prefix_kv, prefix_taps);
+    }
 }
 
 array target_token_embedding(const NativeTextModel::Impl& impl, int32_t token_id) {
@@ -2401,6 +2488,7 @@ void NativeKvState::clear() {
     if (impl_ != nullptr) {
 #ifdef GEMMA4D_MLX_AVAILABLE
         impl_->layers.clear();
+        impl_->dspark_context_taps.clear();
 #endif
         impl_->sequence_len = 0;
         impl_->active_bytes = 0;
@@ -2422,6 +2510,7 @@ std::unique_ptr<NativeKvState> NativeKvState::clone() const {
     std::unique_ptr<NativeKvState> cloned(new NativeKvState());
 #ifdef GEMMA4D_MLX_AVAILABLE
     cloned->impl_->layers = impl_->layers;
+    cloned->impl_->dspark_context_taps = impl_->dspark_context_taps;
 #endif
     cloned->impl_->sequence_len = impl_->sequence_len;
     cloned->impl_->active_bytes = impl_->active_bytes;
@@ -2467,7 +2556,7 @@ bool NativeKvState::save_safetensors(
         payload_metadata["kv_layer_count"] = std::to_string(impl_->layers.size());
 
         std::vector<array> eval_arrays;
-        eval_arrays.reserve((impl_->layers.size() * 2) + 5);
+        eval_arrays.reserve((impl_->layers.size() * 2) + impl_->dspark_context_taps.size() + 5);
         for (size_t index = 0; index < impl_->layers.size(); ++index) {
             const NativeKvState::Impl::Layer& layer = impl_->layers[index];
             const std::string prefix = "kv.layer_" + std::to_string(index);
@@ -2486,6 +2575,15 @@ bool NativeKvState::save_safetensors(
                 payload_metadata[name + ".shape"] = shape_metadata(*layer.value);
                 eval_arrays.push_back(*layer.value);
             }
+        }
+        payload_metadata["dspark_context_tap_count"] = std::to_string(impl_->dspark_context_taps.size());
+        for (size_t index = 0; index < impl_->dspark_context_taps.size(); ++index) {
+            const NativeHiddenState::Impl::DSparkTap& tap = impl_->dspark_context_taps[index];
+            const std::string prefix = "dspark_context.tap_" + std::to_string(index);
+            payload_metadata[prefix + ".layer_id"] = std::to_string(tap.layer_id);
+            arrays.insert_or_assign(prefix + ".hidden", tap.hidden);
+            payload_metadata[prefix + ".hidden.shape"] = shape_metadata(tap.hidden);
+            eval_arrays.push_back(tap.hidden);
         }
 
         if (last_hidden != nullptr && last_hidden->impl_ != nullptr) {
@@ -2635,7 +2733,7 @@ bool NativeKvState::save_compressed_safetensors(
         uint64_t full_attention_tensor_count = 0;
         uint64_t sliding_attention_tensor_count = 0;
         std::vector<array> eval_arrays;
-        eval_arrays.reserve((impl_->layers.size() * 4) + 5);
+        eval_arrays.reserve((impl_->layers.size() * 4) + impl_->dspark_context_taps.size() + 5);
         for (size_t index = 0; index < impl_->layers.size(); ++index) {
             const NativeKvState::Impl::Layer& layer = impl_->layers[index];
             const std::string prefix = "kv.layer_" + std::to_string(index);
@@ -2680,6 +2778,15 @@ bool NativeKvState::save_compressed_safetensors(
         payload_metadata["compression.compressed_tensor_count"] = std::to_string(compressed_tensor_count);
         payload_metadata["compression.full_attention_tensor_count"] = std::to_string(full_attention_tensor_count);
         payload_metadata["compression.sliding_attention_tensor_count"] = std::to_string(sliding_attention_tensor_count);
+        payload_metadata["dspark_context_tap_count"] = std::to_string(impl_->dspark_context_taps.size());
+        for (size_t index = 0; index < impl_->dspark_context_taps.size(); ++index) {
+            const NativeHiddenState::Impl::DSparkTap& tap = impl_->dspark_context_taps[index];
+            const std::string prefix = "dspark_context.tap_" + std::to_string(index);
+            payload_metadata[prefix + ".layer_id"] = std::to_string(tap.layer_id);
+            arrays.insert_or_assign(prefix + ".hidden", tap.hidden);
+            payload_metadata[prefix + ".hidden.shape"] = shape_metadata(tap.hidden);
+            eval_arrays.push_back(tap.hidden);
+        }
 
         if (last_hidden != nullptr && last_hidden->impl_ != nullptr) {
             payload_metadata["hidden_present"] = "true";
@@ -2790,6 +2897,25 @@ bool NativeKvState::load_safetensors(
                 layer.value = decode_encoded_tensor(prefix + ".value", found->second, arrays, *metadata);
             }
         }
+        const uint64_t dspark_tap_count = metadata_u64(*metadata, "dspark_context_tap_count", 0);
+        if (dspark_tap_count > GEMMA4_DSPARK_TARGET_TAP_COUNT) {
+            *error = "native KV snapshot payload has too many DSpark context taps";
+            return false;
+        }
+        state->impl_->dspark_context_taps.clear();
+        state->impl_->dspark_context_taps.reserve(static_cast<size_t>(dspark_tap_count));
+        for (size_t index = 0; index < static_cast<size_t>(dspark_tap_count); ++index) {
+            const std::string prefix = "dspark_context.tap_" + std::to_string(index);
+            const auto found = arrays.find(prefix + ".hidden");
+            if (found == arrays.end()) {
+                *error = "native KV snapshot payload is missing " + prefix + ".hidden";
+                return false;
+            }
+            state->impl_->dspark_context_taps.push_back(NativeHiddenState::Impl::DSparkTap{
+                static_cast<uint32_t>(metadata_u64(*metadata, prefix + ".layer_id")),
+                found->second,
+            });
+        }
 
         if (metadata_bool(*metadata, "hidden_present")) {
             const auto hidden = arrays.find("hidden.last");
@@ -2809,14 +2935,15 @@ bool NativeKvState::load_safetensors(
                 return found->second;
             };
 
+            const uint64_t hidden_sequence_len = metadata_u64(*metadata, "hidden_sequence_len");
             std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
                 hidden->second,
                 optional_array("full_attention_key"),
                 optional_array("full_attention_value"),
                 optional_array("sliding_attention_key"),
                 optional_array("sliding_attention_value"),
-                {},
-                metadata_u64(*metadata, "hidden_sequence_len"),
+                last_token_from_dspark_context_taps(state->impl_->dspark_context_taps, hidden_sequence_len),
+                hidden_sequence_len,
                 static_cast<uint32_t>(metadata_u64(*metadata, "hidden_size")),
             });
             last_hidden->reset(new NativeHiddenState(std::move(hidden_impl)));
@@ -3960,6 +4087,8 @@ bool NativeDSparkModel::load(
     try {
         std::unique_ptr<NativeDSparkModel> model(new NativeDSparkModel());
         model->impl_->manifest_summary = manifest.summary();
+        model->impl_->block_size = manifest.block_size;
+        model->impl_->target_layer_ids = manifest.target_layer_ids;
 
         const std::vector<std::filesystem::path> files = safetensor_files(model_path);
         if (files.empty()) {
@@ -4024,6 +4153,123 @@ std::string NativeDSparkModel::summary() const {
         out << "; " << impl_->manifest_summary;
     }
     return out.str();
+}
+
+bool NativeDSparkModel::draft_block(
+    const NativeKvState& target_kv,
+    const NativeHiddenState& last_hidden,
+    const std::vector<int32_t>& context_tokens,
+    uint32_t block_size,
+    int32_t* out_tokens,
+    float* out_logits,
+    float* out_logit_margins,
+    float* out_confidence,
+    size_t* inout_count,
+    std::string* error) const {
+    if (out_tokens == nullptr || out_logits == nullptr || out_logit_margins == nullptr ||
+        out_confidence == nullptr || inout_count == nullptr || error == nullptr) {
+        return false;
+    }
+    error->clear();
+    const size_t capacity = *inout_count;
+    *inout_count = 0;
+    if (block_size == 0) {
+        *error = "native DSpark draft requires block_size > 0";
+        return false;
+    }
+    if (block_size > GEMMA4_DSPARK_MAX_DRAFT_TOKENS) {
+        std::ostringstream message;
+        message << "native DSpark draft supports block_size <= " << GEMMA4_DSPARK_MAX_DRAFT_TOKENS;
+        *error = message.str();
+        return false;
+    }
+    if (capacity < block_size) {
+        *error = "native DSpark draft output buffer is smaller than block_size";
+        return false;
+    }
+    if (context_tokens.empty()) {
+        *error = "native DSpark draft requires at least one context token";
+        return false;
+    }
+
+#ifndef GEMMA4D_MLX_AVAILABLE
+    (void)target_kv;
+    (void)last_hidden;
+    (void)context_tokens;
+    (void)out_tokens;
+    (void)out_logits;
+    (void)out_logit_margins;
+    (void)out_confidence;
+    *error = "native Gemma 4 DSpark drafter was requested, but gemma4_mlx was not built with MLX";
+    return false;
+#else
+    try {
+        if (impl_ == nullptr || impl_->dspark_tensor_count == 0) {
+            *error = "native Gemma 4 DSpark model state is not loaded";
+            return false;
+        }
+        if (impl_->block_size != GEMMA4_DSPARK_MAX_DRAFT_TOKENS) {
+            *error = "native Gemma 4 DSpark model is not the XR60 block-7 drafter";
+            return false;
+        }
+        if (target_kv.impl_ == nullptr || target_kv.impl_->sequence_len == 0) {
+            *error = "native DSpark draft requires a populated target KV state";
+            return false;
+        }
+        if (last_hidden.impl_ == nullptr || last_hidden.impl_->sequence_len == 0) {
+            *error = "native DSpark draft requires a populated target hidden state";
+            return false;
+        }
+        if (target_kv.impl_->sequence_len != context_tokens.size() ||
+            last_hidden.impl_->sequence_len != context_tokens.size()) {
+            *error = "native DSpark draft context tokens do not match the materialized target state";
+            return false;
+        }
+        if (impl_->target_layer_ids.size() != GEMMA4_DSPARK_TARGET_TAP_COUNT ||
+            target_kv.impl_->dspark_context_taps.size() != GEMMA4_DSPARK_TARGET_TAP_COUNT ||
+            last_hidden.impl_->dspark_taps.size() != GEMMA4_DSPARK_TARGET_TAP_COUNT) {
+            *error = "native DSpark draft requires cached target tap context for all XR60 layers";
+            return false;
+        }
+        for (size_t index = 0; index < GEMMA4_DSPARK_TARGET_TAP_COUNT; ++index) {
+            const uint32_t expected_layer = impl_->target_layer_ids[index];
+            const NativeHiddenState::Impl::DSparkTap& context_tap =
+                target_kv.impl_->dspark_context_taps[index];
+            const NativeHiddenState::Impl::DSparkTap& last_tap = last_hidden.impl_->dspark_taps[index];
+            if (context_tap.layer_id != expected_layer || last_tap.layer_id != expected_layer) {
+                *error = "native DSpark draft target tap layer ids do not match the loaded drafter";
+                return false;
+            }
+            const auto& context_shape = context_tap.hidden.shape();
+            if (context_shape.size() != 3 || context_shape[0] != 1 ||
+                context_shape[1] != static_cast<int>(context_tokens.size()) ||
+                context_shape[2] != kHiddenSize) {
+                std::ostringstream message;
+                message << "native DSpark cached tap context has invalid shape for layer "
+                        << expected_layer;
+                *error = message.str();
+                return false;
+            }
+            const auto& last_shape = last_tap.hidden.shape();
+            if (last_shape.size() != 3 || last_shape[0] != 1 || last_shape[1] != 1 ||
+                last_shape[2] != kHiddenSize) {
+                std::ostringstream message;
+                message << "native DSpark last tap has invalid shape for layer " << expected_layer;
+                *error = message.str();
+                return false;
+            }
+        }
+
+        *error = "native DSpark decoder math is not implemented yet";
+        return false;
+    } catch (const std::exception& ex) {
+        *error = std::string("native Gemma 4 DSpark draft failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        *error = "native Gemma 4 DSpark draft failed with an unknown exception";
+        return false;
+    }
+#endif
 }
 
 bool NativeMtpAssistantModel::draft_block(

@@ -2053,10 +2053,37 @@ Gemma4Status gemma4_dspark_draft_block(
             GEMMA4_ERR_ADAPTER,
             "gemma4_dspark_draft_block is disabled while a standard LoRA adapter is active");
     }
+    if (cache->native_kv_state == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires a native target KV state");
+    }
+    if (cache->native_tokens.empty()) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires native context tokens");
+    }
 
-    return fail(
-        GEMMA4_ERR_UNSUPPORTED_CONFIG,
-        "native DSpark draft execution is not implemented yet");
+    size_t produced = max_block_size;
+    std::string native_error;
+    const auto started = std::chrono::steady_clock::now();
+    if (!drafter->native_model->draft_block(
+            *cache->native_kv_state,
+            *cache->last_hidden,
+            cache->native_tokens,
+            max_block_size,
+            out->tokens,
+            out->logits,
+            out->logit_margins,
+            out->confidence,
+            &produced,
+            &native_error)) {
+        return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, native_error);
+    }
+    out->token_count = static_cast<uint32_t>(std::min<size_t>(produced, GEMMA4_DSPARK_MAX_DRAFT_TOKENS));
+    out->draft_ms = elapsed_ms(started);
+    out->scheduler_us = 0;
+    return ok();
 }
 
 Gemma4Status verify_tokens_impl(
