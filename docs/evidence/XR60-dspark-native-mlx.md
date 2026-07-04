@@ -191,6 +191,27 @@ checkpoint in a bounded native smoke. The current runtime evidence preserves
 exact target output only because `gemma4_verify_tokens` rejects every draft and
 commits the target fallback token.
 
+## Native Anchor-Context Alignment Slice
+
+Pinned DeepSpec source shows the DSpark attention mask excludes the anchor
+token from target context (`kv_idx < anchor_pos`) and supplies that anchor
+through the draft/noise stream. The native DSpark decoder now mirrors that
+contract for the current Helios verifier shape:
+
+- `NativeDSparkModel::draft_block` still anchors on the current context token,
+  because `gemma4_verify_tokens` expects draft token 0 to be the next target
+  token for the existing cache state.
+- `dspark_project_context` slices cached target taps to the prefix before that
+  anchor instead of projecting the full context including the anchor.
+- The prompt-length-1 case is allowed to draft with zero target-context keys and
+  the block-7 noise keys only.
+- DSpark q/noise RoPE positions still start at the anchor position, while target
+  context keys cover prefix positions `0..anchor_position-1`.
+
+This fixes a native/reference contract mismatch. It does not by itself make the
+released checkpoint a speedup candidate; acceptance remains zero in the updated
+bounded matrix below.
+
 ## Runtime Checkpoint Slice
 
 The released checkpoint was downloaded with:
@@ -314,6 +335,44 @@ mismatch on the smoke prompt. It does not replace the required DeepSpec/PyTorch
 fixture, but it gives the next parity pass concrete token/logit values to
 compare against reference DSpark output.
 
+After aligning native target context to exclude the anchor, the bounded matrix
+was rerun:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 2
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask/summary.json
+benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask/report.md
+benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask/blockers.md
+benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask/decision.md
+```
+
+Result:
+
+- decision: `keep_disabled_pending_broader_evidence`
+- exactness: passed for `hello_smoke` and `hello_reference_prefix` at block
+  sizes `1, 2, 4, 7`
+- accepted draft tokens: `0` for every record
+- `hello_smoke` first verify trace after the fix: DSpark draft `[9259]`,
+  target greedy `[236772, 236772]`, committed `[236772]`
+- `hello_reference_prefix` first verify trace after the fix: DSpark draft
+  `[236766]` or `[236766, 18252]` depending on scheduled length, target greedy
+  `[236761, 236779]`, committed `[236761]`
+- peak memory range: `13.565` to `13.567` GB
+- decode throughput range: `0.021` to `0.032` tok/s
+
+The local target artifact for these runs is
+`artifacts/models/gemma-4-12B-it-4bit`, whose config declares 4-bit affine
+quantization. The DSpark checkpoint config is BF16 and identifies the target as
+`gemma4_unified`. Hidden-tap parity must therefore check both native math and
+whether the 4-bit target tap distribution is compatible with the released
+DeepSpec drafter.
+
 ## Verification
 
 Commands run:
@@ -330,6 +389,10 @@ GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_m
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1,2,4,7 --max-new-tokens 2
 python3 tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures --prompt-token-ids 9259 --allow-blocked
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/trace-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
+GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/trace-anchor-mask --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/trace-anchor-mask-2tok --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 2
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 2
 ```
 
 Observed result:
@@ -356,6 +419,10 @@ Observed result:
   `benchmarks/out/XR60-dspark-native-mlx/trace-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
   Its first DSpark token was `236764`, target greedy was `236772`, accepted
   draft count was `0`, and the draft token was not in the target top-k trace.
+- The anchor-context rerun wrote
+  `benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
+  Exactness passed for both bounded workloads and all fixed block sizes, but
+  every record still had `accepted_draft_tokens = 0`.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
@@ -367,6 +434,9 @@ Observed result:
 - Hidden-tap parity against a revision-pinned DeepSpec fixture is not measured.
 - Native DSpark decoder math is not parity-verified against the released
   checkpoint.
+- The available native benchmark target is a 4-bit affine MLX artifact, while
+  the released DSpark checkpoint is BF16 and target-compatible only after hidden
+  tap parity is proven.
 - The first runtime evidence has zero draft acceptance and severe latency, so
   DSpark must remain default-off.
 - Broader real-context workload evidence is still missing.

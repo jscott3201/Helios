@@ -2118,13 +2118,24 @@ array dspark_project_context(
     const NativeDSparkModel::Impl& impl,
     const std::vector<NativeHiddenState::Impl::DSparkTap>& context_taps,
     int context_len) {
-    if (context_taps.size() != GEMMA4_DSPARK_TARGET_TAP_COUNT || context_len <= 0) {
+    if (context_taps.size() != GEMMA4_DSPARK_TARGET_TAP_COUNT || context_len < 0) {
         throw std::runtime_error("native DSpark context projection received invalid tap context");
+    }
+    if (context_len == 0) {
+        return model_dtype(mlx::core::zeros({1, 0, kHiddenSize}, mlx::core::float32));
     }
     std::vector<array> tap_arrays;
     tap_arrays.reserve(context_taps.size());
     for (const NativeHiddenState::Impl::DSparkTap& tap : context_taps) {
-        tap_arrays.push_back(tap.hidden);
+        const auto& tap_shape = tap.hidden.shape();
+        if (tap_shape.size() != 3 || tap_shape[0] != 1 || tap_shape[1] < context_len ||
+            tap_shape[2] != kHiddenSize) {
+            throw std::runtime_error("native DSpark context projection received malformed target tap");
+        }
+        tap_arrays.push_back(mlx::core::slice(
+            tap.hidden,
+            {0, 0, 0},
+            {1, context_len, kHiddenSize}));
     }
     array h = mlx::core::concatenate(std::move(tap_arrays), 2);
     const auto& shape = h.shape();
@@ -2157,18 +2168,6 @@ array dspark_attention_forward(
     queries = mlx::core::transpose(queries, {0, 2, 1, 3});
     queries = apply_rope(queries, true, kDSparkHeadDim, anchor_position);
 
-    array context_keys = dense_linear(impl, target_context, base + ".self_attn.k_proj");
-    context_keys = mlx::core::reshape(context_keys, {1, context_len, kDSparkKvHeads, kDSparkHeadDim});
-    array context_values = context_keys;
-    context_keys = model_dtype(mlx::core::fast::rms_norm(
-        context_keys,
-        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.k_norm.weight")),
-        1e-6f));
-    context_keys = mlx::core::transpose(context_keys, {0, 2, 1, 3});
-    context_keys = apply_rope(context_keys, true, kDSparkHeadDim, 0);
-    context_values = model_dtype(mlx::core::fast::rms_norm(context_values, std::nullopt, 1e-6f));
-    context_values = mlx::core::transpose(context_values, {0, 2, 1, 3});
-
     array noise_keys = dense_linear(impl, x, base + ".self_attn.k_proj");
     noise_keys = mlx::core::reshape(noise_keys, {1, block_len, kDSparkKvHeads, kDSparkHeadDim});
     array noise_values = noise_keys;
@@ -2182,8 +2181,24 @@ array dspark_attention_forward(
     noise_values = mlx::core::transpose(noise_values, {0, 2, 1, 3});
 
     const int attention_len = context_len + block_len;
-    array keys = mlx::core::concatenate({context_keys, noise_keys}, 2);
-    array values = mlx::core::concatenate({context_values, noise_values}, 2);
+    array keys = noise_keys;
+    array values = noise_values;
+    if (context_len > 0) {
+        array context_keys = dense_linear(impl, target_context, base + ".self_attn.k_proj");
+        context_keys = mlx::core::reshape(context_keys, {1, context_len, kDSparkKvHeads, kDSparkHeadDim});
+        array context_values = context_keys;
+        context_keys = model_dtype(mlx::core::fast::rms_norm(
+            context_keys,
+            std::optional<array>(tensor_or_throw(impl, base + ".self_attn.k_norm.weight")),
+            1e-6f));
+        context_keys = mlx::core::transpose(context_keys, {0, 2, 1, 3});
+        context_keys = apply_rope(context_keys, true, kDSparkHeadDim, 0);
+        context_values = model_dtype(mlx::core::fast::rms_norm(context_values, std::nullopt, 1e-6f));
+        context_values = mlx::core::transpose(context_values, {0, 2, 1, 3});
+
+        keys = mlx::core::concatenate({context_keys, noise_keys}, 2);
+        values = mlx::core::concatenate({context_values, noise_values}, 2);
+    }
     keys = mlx::core::broadcast_to(keys, {1, kDSparkNumHeads, attention_len, kDSparkHeadDim});
     values = mlx::core::broadcast_to(values, {1, kDSparkNumHeads, attention_len, kDSparkHeadDim});
 
@@ -2247,14 +2262,18 @@ array dspark_forward_hidden(
     if (block_len != GEMMA4_DSPARK_MAX_DRAFT_TOKENS) {
         throw std::runtime_error("native DSpark fixed-prefix path expects the released block-7 drafter");
     }
+    if (context_len <= 0) {
+        throw std::runtime_error("native DSpark fixed-prefix path requires at least one anchor token");
+    }
     const int anchor_position = context_len - 1;
+    const int target_context_len = anchor_position;
     std::vector<int32_t> draft_ids(static_cast<size_t>(block_len), static_cast<int32_t>(impl.mask_token_id));
     draft_ids[0] = anchor_token_id;
 
-    array target_context = dspark_project_context(impl, context_taps, context_len);
+    array target_context = dspark_project_context(impl, context_taps, target_context_len);
     array h = dspark_token_embedding(impl, draft_ids);
     for (uint32_t layer = 0; layer < kDSparkLayerCount; ++layer) {
-        h = dspark_layer_forward(impl, target_context, h, layer, context_len, block_len, anchor_position);
+        h = dspark_layer_forward(impl, target_context, h, layer, target_context_len, block_len, anchor_position);
     }
     return model_dtype(mlx::core::fast::rms_norm(
         h,
