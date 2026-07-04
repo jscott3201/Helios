@@ -958,17 +958,22 @@ fn render_report(summary: &Summary) -> String {
         summary.model_identity.safetensors_inventory_sha256
     ));
     out.push_str("## Load Residency\n\n");
-    out.push_str("| Backend | Requests | Model load count | Model load seconds | Resident loaded | Worker requests |\n");
-    out.push_str("|---|---:|---:|---:|---:|---:|\n");
-    for (name, metrics) in [
-        ("real_helper", summary.final_metrics.baseline.as_ref()),
+    out.push_str("| Role | Backend | Requests | Model load count | Model load seconds | Resident loaded | Worker requests |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|\n");
+    for (role, backend, metrics) in [
         (
-            "persistent_native",
+            "baseline",
+            summary.baseline_backend.as_str(),
+            summary.final_metrics.baseline.as_ref(),
+        ),
+        (
+            "candidate_default",
+            ServerBackend::PersistentNative.as_str(),
             summary.final_metrics.candidate.as_ref(),
         ),
     ] {
         out.push_str(&format!(
-            "| `{name}` | {} | {} | {} | {} | {} |\n",
+            "| `{role}` | `{backend}` | {} | {} | {} | {} | {} |\n",
             fmt_opt(metrics.and_then(|metrics| metrics.requests_total)),
             fmt_opt(metrics.and_then(|metrics| metrics.model_load_count)),
             fmt_opt(metrics.and_then(|metrics| metrics.model_load_seconds)),
