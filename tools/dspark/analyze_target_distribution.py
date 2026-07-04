@@ -223,8 +223,12 @@ def summarize_workload(workload: str, observations: list[dict[str, Any]]) -> dic
         "accepted_observation_rate": ratio(len(accepted), len(items)),
         "draft_in_target_top_k_count": len(in_top_k),
         "draft_in_target_top_k_rate": ratio(len(in_top_k), len(items)),
-        "unique_draft_tokens": sorted({obs.get("draft_token") for obs in items}),
-        "unique_target_tokens": sorted({obs.get("target_token") for obs in items}),
+        "unique_draft_tokens": sorted(
+            {obs.get("draft_token") for obs in items if obs.get("draft_token") is not None}
+        ),
+        "unique_target_tokens": sorted(
+            {obs.get("target_token") for obs in items if obs.get("target_token") is not None}
+        ),
         "outside_top_k_lower_bound_gap_min": min(lower_bounds, default=None),
         "outside_top_k_lower_bound_gap_median": median(lower_bounds),
         "outside_top_k_lower_bound_gap_max": max(lower_bounds, default=None),
@@ -310,7 +314,7 @@ def list_or_empty(value: Any) -> list[Any]:
 
 
 def value_at(value: list[Any], index: int) -> Any | None:
-    return value[index] if index < len(value) else None
+    return value[index] if 0 <= index < len(value) else None
 
 
 def float_at(value: list[Any], index: int) -> float | None:

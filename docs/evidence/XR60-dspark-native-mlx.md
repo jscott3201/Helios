@@ -763,6 +763,84 @@ prompt, while the chat-shaped 1K prompt still has zero accepted drafts. DSpark
 remains default-off because this is a narrow two-workload slice, latency is
 still severe, and code/4K/later-decode coverage is not yet measured.
 
+### 4K code/MTP follow-up
+
+The token-workload diagnosis was extended to one code-review workload and one
+4K MTP-shaped workload with `max_new_tokens=5`, fixed block sizes `1,2,4`, and
+target top-k tracing enabled. This gives later decode positions and a
+multi-position block-4 verify trace.
+
+Token export command:
+
+```text
+artifacts/envs/dspark-reference/bin/python tools/dspark/export_token_workloads.py --workloads code_review_rust_4k_001,mtp_candidate_4k_001 --out benchmarks/out/XR60-dspark-native-mlx/real-context-4k-token-workloads.jsonl
+```
+
+Benchmark command:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk --token-workloads benchmarks/out/XR60-dspark-native-mlx/real-context-4k-token-workloads.jsonl --workloads code_review_rust_4k_001,mtp_candidate_4k_001 --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2,4 --max-new-tokens 5
+```
+
+Analysis command:
+
+```text
+python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-4k-target-distribution
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-token-workloads.jsonl
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-token-workloads.manifest.json
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-token-workloads.blockers.md
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk/summary.json
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk/report.md
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-target-distribution/target_distribution_report.json
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-target-distribution/report.md
+benchmarks/out/XR60-dspark-native-mlx/real-context-4k-target-distribution/blockers.md
+```
+
+Result:
+
+- token export status: `passed`
+- token export workloads: `code_review_rust_4k_001`, `mtp_candidate_4k_001`
+- benchmark status: `passed`
+- benchmark decision: `keep_disabled_pending_broader_evidence`
+- measured records: `6`
+- exact records: `6`
+- scheduled lengths: `[1, 2, 4]`
+- diagnosis status: `passed`
+- diagnosis: `some_drafts_align_with_target_distribution`
+- observations: `26`
+- accepted observations: `18`
+- accepted observation rate: `0.6923076923076923`
+- draft-in-target-top-k count: `18`
+- draft-in-target-top-k rate: `0.6923076923076923`
+- outside-top-k lower-bound gap min/median/max:
+  `0.0` / `5.25` / `5.875`
+- `code_review_rust_4k_001`: `14` observations, `6` accepted, `6/14`
+  draft positions in target top-5
+- `mtp_candidate_4k_001`: `12` observations, `12` accepted, `12/12`
+  draft positions in target top-5
+- decode throughput stayed far below useful speed:
+  - `code_review_rust_4k_001`: `0.0278` to `0.0628` tok/s
+  - `mtp_candidate_4k_001`: `0.0253` to `0.0852` tok/s
+- peak memory reached `16.26557159423828` GB on measured 4K records
+- active KV bytes were `402735104`; hidden tap bytes were `38400`
+
+The analyzer also now tolerates missing target top-k rows on longer block-size
+traces. One block-size 4 code trace had four draft tokens but only three target
+top-k rows; missing rows are treated as unknown rank/gap instead of crashing.
+
+Interpretation: the released DSpark checkpoint has strong alignment on
+MTP-shaped 1K and 4K prompts, partial alignment on a 4K code-review prompt, and
+poor alignment on the chat-shaped prompt. This supports further scheduling and
+calibration investigation only as a default-off experimental path. It does not
+support promotion because throughput is orders of magnitude below the native
+target baseline and peak memory is already at the tiny16 edge.
+
 ## Verification
 
 Commands run:
@@ -807,6 +885,10 @@ cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
 artifacts/envs/dspark-reference/bin/python tools/dspark/export_token_workloads.py --workloads chat_short_1k_001,mtp_candidate_1k_001 --out benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-topk --token-workloads benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl --workloads chat_short_1k_001,mtp_candidate_1k_001 --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2 --max-new-tokens 3
 python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/real-context-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution
+artifacts/envs/dspark-reference/bin/python tools/dspark/export_token_workloads.py --workloads code_review_rust_4k_001,mtp_candidate_4k_001 --out benchmarks/out/XR60-dspark-native-mlx/real-context-4k-token-workloads.jsonl
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk --token-workloads benchmarks/out/XR60-dspark-native-mlx/real-context-4k-token-workloads.jsonl --workloads code_review_rust_4k_001,mtp_candidate_4k_001 --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2,4 --max-new-tokens 5
+python3 -m py_compile tools/dspark/analyze_target_distribution.py
+python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-4k-target-distribution
 ```
 
 Observed result:
@@ -880,6 +962,13 @@ Observed result:
   All 4 measured records were exact. `mtp_candidate_1k_001` accepted all 4
   observed draft positions, while `chat_short_1k_001` accepted 0/5 observed
   positions.
+- The 4K real-context target-distribution diagnosis wrote
+  `benchmarks/out/XR60-dspark-native-mlx/real-context-4k-topk/` and
+  `benchmarks/out/XR60-dspark-native-mlx/real-context-4k-target-distribution/`.
+  All 6 measured records were exact. `mtp_candidate_4k_001` accepted all 12
+  observed draft positions, while `code_review_rust_4k_001` accepted 6/14
+  observed positions. The analyzer records missing target top-k rows as unknown
+  instead of failing on long block-size traces.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
@@ -895,16 +984,19 @@ Observed result:
 - The available native benchmark target is a 4-bit affine MLX artifact, while
   the released DSpark checkpoint is BF16 and target-compatible only after hidden
   tap parity is proven.
-- The toy-prefix corpus still has zero draft acceptance, while the bounded
-  real-context pair is mixed. Severe latency and insufficient workload coverage
-  remain, so DSpark must remain default-off.
-- Broader code/4K/later-decode real-context workload evidence is still missing.
+- The toy-prefix corpus still has zero draft acceptance, while real-context
+  acceptance is domain-shaped: strong on MTP-shaped prompts, partial on code,
+  and poor on chat. Severe latency and incomplete workload coverage remain, so
+  DSpark must remain default-off.
+- 8K/16K memory and sustained decode evidence are still missing, and 4K peak
+  memory already reaches the tiny16 edge.
 
 ## Next Slice
 
-Broaden the token-workload diagnosis to `code_review_rust_4k_001`,
-`mtp_candidate_4k_001`, and later decode positions. If acceptance stays
-domain-shaped or unstable, compare a BF16 target reference or choose an operator
-decision between calibration, small-domain finetuning, or rejecting XR60 for the
-local 4-bit target. Keep DSpark default-off until acceptance and speed improve
-with exactness preserved.
+Run a targeted block-size 7 and/or confidence-scheduler experiment only on the
+high-acceptance MTP-shaped workload, plus a small code calibration probe. If
+stage timings remain dominated by draft/verify overhead, prepare a
+`reject_for_now` or `keep_experimental` decision with exactness, memory, and
+speed evidence. A BF16 target reference remains useful if the operator wants to
+separate target quantization effects from DSpark domain fit. Keep DSpark
+default-off until acceptance and speed improve with exactness preserved.
