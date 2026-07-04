@@ -38,6 +38,7 @@ public:
     uint64_t sequence_len() const;
     uint32_t hidden_size() const;
     bool has_shared_kv() const;
+    void fill_dspark_tap_info(Gemma4DSparkTapInfo* out) const;
     std::unique_ptr<NativeHiddenState> clone() const;
 
 private:
@@ -152,6 +153,7 @@ public:
     size_t tensor_count() const;
     std::string summary() const;
     void set_prefill_chunk_policy(const Gemma4PrefillChunkPolicy& policy);
+    void set_dspark_taps(const uint32_t* layer_ids, size_t layer_count);
     bool set_adapter(std::shared_ptr<const NativeLoraAdapter> adapter, std::string* error);
     void clear_adapter();
     bool has_adapter() const;

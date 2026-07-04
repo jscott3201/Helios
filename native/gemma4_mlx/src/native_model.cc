@@ -34,11 +34,16 @@ namespace gemma4d {
 
 struct NativeHiddenState::Impl {
 #ifdef GEMMA4D_MLX_AVAILABLE
+    struct DSparkTap {
+        uint32_t layer_id = 0;
+        mlx::core::array hidden;
+    };
     mlx::core::array hidden;
     std::optional<mlx::core::array> full_attention_key;
     std::optional<mlx::core::array> full_attention_value;
     std::optional<mlx::core::array> sliding_attention_key;
     std::optional<mlx::core::array> sliding_attention_value;
+    std::vector<DSparkTap> dspark_taps;
 #endif
     uint64_t sequence_len = 0;
     uint32_t hidden_size = 0;
@@ -92,6 +97,7 @@ struct NativeTextModel::Impl {
     size_t native_prefill_chunk_tokens = 0;
     bool native_prefill_policy_long_context_256 = false;
     bool experimental_skip_decode_peak_reset = false;
+    std::vector<uint32_t> dspark_tap_layer_ids;
 };
 
 struct NativeMtpAssistantModel::Impl {
@@ -1188,15 +1194,53 @@ void trace_hidden_stats(const char* label, const array& h, int sequence_len) {
     trace_feature_stats(label, h, sequence_len, 3840, trace_layer_stats_enabled());
 }
 
+struct DSparkHiddenTaps {
+    std::vector<NativeHiddenState::Impl::DSparkTap> taps;
+};
+
+bool should_capture_dspark_tap(const NativeTextModel::Impl& impl, uint32_t layer_id) {
+    return std::find(
+               impl.dspark_tap_layer_ids.begin(),
+               impl.dspark_tap_layer_ids.end(),
+               layer_id) != impl.dspark_tap_layer_ids.end();
+}
+
+void maybe_capture_dspark_tap(
+    const NativeTextModel::Impl& impl,
+    uint32_t layer_id,
+    const array& hidden,
+    DSparkHiddenTaps* taps) {
+    if (taps == nullptr || !should_capture_dspark_tap(impl, layer_id)) {
+        return;
+    }
+    taps->taps.push_back(NativeHiddenState::Impl::DSparkTap{layer_id, hidden});
+}
+
+DSparkHiddenTaps last_token_dspark_taps(DSparkHiddenTaps taps, int sequence_len) {
+    if (sequence_len <= 0) {
+        taps.taps.clear();
+        return taps;
+    }
+    for (NativeHiddenState::Impl::DSparkTap& tap : taps.taps) {
+        tap.hidden = mlx::core::slice(
+            tap.hidden,
+            {0, sequence_len - 1, 0},
+            {1, sequence_len, kHiddenSize});
+    }
+    return taps;
+}
+
 struct NativeHiddenArrays {
     array hidden;
     SharedKvArrays shared_kv;
+    DSparkHiddenTaps dspark_taps;
 };
 
 struct NativeForwardArrays {
     array logits;
     array last_hidden;
     SharedKvArrays shared_kv;
+    DSparkHiddenTaps dspark_taps;
     BlockPrefixSources prefix_sources;
 };
 
@@ -1224,6 +1268,7 @@ NativeHiddenArrays decode_block_hidden(
     array token_ids(ids.begin(), {1, block_len}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
+    DSparkHiddenTaps dspark_taps;
 
     for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
         h = target_layer_decode_block_forward(
@@ -1234,6 +1279,7 @@ NativeHiddenArrays decode_block_hidden(
             block_len,
             &target_kv->layers[layer],
             &shared_kv);
+        maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -1242,7 +1288,7 @@ NativeHiddenArrays decode_block_hidden(
     eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
     target_kv->sequence_len = previous_sequence_len + token_count;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
-    return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
+    return NativeHiddenArrays{std::move(h), std::move(shared_kv), std::move(dspark_taps)};
 }
 
 NativeHiddenArrays forward_hidden(
@@ -1260,6 +1306,7 @@ NativeHiddenArrays forward_hidden(
     array token_ids(tokens.begin(), {1, sequence_len}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
+    DSparkHiddenTaps dspark_taps;
     if (target_kv != nullptr) {
         target_kv->layers.clear();
         target_kv->layers.reserve(kTargetLayerCount);
@@ -1276,6 +1323,7 @@ NativeHiddenArrays forward_hidden(
             layer_kv = &target_kv->layers.back();
         }
         h = layer_forward(impl, h, layer, sequence_len, &shared_kv, layer_kv);
+        maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
         const std::string label = "layer" + std::to_string(layer);
         dump_hidden_tensor(label.c_str(), h);
         trace_hidden_stats(label.c_str(), h, sequence_len);
@@ -1292,7 +1340,7 @@ NativeHiddenArrays forward_hidden(
         target_kv->active_bytes = estimate_target_kv_bytes(tokens.size());
     }
 
-    return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
+    return NativeHiddenArrays{std::move(h), std::move(shared_kv), std::move(dspark_taps)};
 }
 
 array target_logits_for_hidden(const NativeTextModel::Impl& impl, const array& h) {
@@ -1318,7 +1366,12 @@ NativeForwardArrays last_logits_from_hidden(
     array logits = target_logits_for_hidden(impl, last_hidden);
     logits = mlx::core::reshape(logits, {262144});
     dump_hidden_tensor("logits", logits);
-    return NativeForwardArrays{std::move(logits), std::move(last_hidden), std::move(forward.shared_kv)};
+    return NativeForwardArrays{
+        std::move(logits),
+        std::move(last_hidden),
+        std::move(forward.shared_kv),
+        last_token_dspark_taps(std::move(forward.dspark_taps), sequence_len),
+        BlockPrefixSources{}};
 }
 
 NativeForwardArrays forward_last_logits(const NativeTextModel::Impl& impl, const std::vector<int32_t>& tokens) {
@@ -1372,6 +1425,7 @@ NativeForwardArrays decode_last_logits(
     array token_ids(ids.begin(), {1, 1}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
+    DSparkHiddenTaps dspark_taps;
 
     for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
         h = target_layer_decode_forward(
@@ -1381,6 +1435,7 @@ NativeForwardArrays decode_last_logits(
             previous_sequence_len,
             &target_kv->layers[layer],
             &shared_kv);
+        maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -1391,7 +1446,12 @@ NativeForwardArrays decode_last_logits(
     eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
     target_kv->sequence_len = previous_sequence_len + 1;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
-    return NativeForwardArrays{std::move(logits), std::move(h), std::move(shared_kv)};
+    return NativeForwardArrays{
+        std::move(logits),
+        std::move(h),
+        std::move(shared_kv),
+        std::move(dspark_taps),
+        BlockPrefixSources{}};
 }
 
 NativeHiddenArrays decode_last_hidden(
@@ -1410,6 +1470,7 @@ NativeHiddenArrays decode_last_hidden(
     array token_ids(ids.begin(), {1, 1}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
+    DSparkHiddenTaps dspark_taps;
 
     for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
         h = target_layer_decode_forward(
@@ -1419,6 +1480,7 @@ NativeHiddenArrays decode_last_hidden(
             previous_sequence_len,
             &target_kv->layers[layer],
             &shared_kv);
+        maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -1427,7 +1489,7 @@ NativeHiddenArrays decode_last_hidden(
     eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
     target_kv->sequence_len = previous_sequence_len + 1;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
-    return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
+    return NativeHiddenArrays{std::move(h), std::move(shared_kv), std::move(dspark_taps)};
 }
 
 NativeForwardArrays decode_block_logits(
@@ -1455,6 +1517,7 @@ NativeForwardArrays decode_block_logits(
     array token_ids(ids.begin(), {1, block_len}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
     SharedKvArrays shared_kv;
+    DSparkHiddenTaps dspark_taps;
     if (prefix_sources != nullptr) {
         prefix_sources->previous_sequence_len = previous_sequence_len;
         prefix_sources->token_count = token_count;
@@ -1477,6 +1540,7 @@ NativeForwardArrays decode_block_logits(
             &target_kv->layers[layer],
             &shared_kv,
             prefix_source_layer);
+        maybe_capture_dspark_tap(impl, layer, h, &dspark_taps);
     }
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
@@ -1496,6 +1560,7 @@ NativeForwardArrays decode_block_logits(
         std::move(logits),
         std::move(last_hidden),
         std::move(shared_kv),
+        last_token_dspark_taps(std::move(dspark_taps), block_len),
         std::move(captured_sources)};
 }
 
@@ -2256,6 +2321,33 @@ bool NativeHiddenState::has_shared_kv() const {
 #endif
 }
 
+void NativeHiddenState::fill_dspark_tap_info(Gemma4DSparkTapInfo* out) const {
+    if (out == nullptr) {
+        return;
+    }
+    std::memset(out, 0, sizeof(Gemma4DSparkTapInfo));
+    if (impl_ == nullptr) {
+        return;
+    }
+    out->has_last_hidden = true;
+#ifdef GEMMA4D_MLX_AVAILABLE
+    const size_t count = std::min<size_t>(impl_->dspark_taps.size(), GEMMA4_DSPARK_TARGET_TAP_COUNT);
+    out->layer_count = static_cast<uint32_t>(count);
+    for (size_t index = 0; index < count; ++index) {
+        const NativeHiddenState::Impl::DSparkTap& tap = impl_->dspark_taps[index];
+        out->layer_ids[index] = tap.layer_id;
+        const auto& shape = tap.hidden.shape();
+        const size_t rank = std::min<size_t>(shape.size(), GEMMA4_DSPARK_TAP_MAX_RANK);
+        out->tap_ranks[index] = static_cast<uint32_t>(rank);
+        for (size_t dim = 0; dim < rank; ++dim) {
+            out->tap_shapes[(index * GEMMA4_DSPARK_TAP_MAX_RANK) + dim] =
+                static_cast<uint64_t>(shape[dim]);
+        }
+        out->tap_bytes += static_cast<uint64_t>(tap.hidden.nbytes());
+    }
+#endif
+}
+
 std::unique_ptr<NativeHiddenState> NativeHiddenState::clone() const {
     if (impl_ == nullptr) {
         return nullptr;
@@ -2267,6 +2359,7 @@ std::unique_ptr<NativeHiddenState> NativeHiddenState::clone() const {
         impl_->full_attention_value,
         impl_->sliding_attention_key,
         impl_->sliding_attention_value,
+        impl_->dspark_taps,
         impl_->sequence_len,
         impl_->hidden_size,
     });
@@ -2705,6 +2798,7 @@ bool NativeKvState::load_safetensors(
                 optional_array("full_attention_value"),
                 optional_array("sliding_attention_key"),
                 optional_array("sliding_attention_value"),
+                {},
                 metadata_u64(*metadata, "hidden_sequence_len"),
                 static_cast<uint32_t>(metadata_u64(*metadata, "hidden_size")),
             });
@@ -3066,6 +3160,22 @@ void NativeTextModel::set_prefill_chunk_policy(const Gemma4PrefillChunkPolicy& p
 #endif
 }
 
+void NativeTextModel::set_dspark_taps(const uint32_t* layer_ids, size_t layer_count) {
+#ifdef GEMMA4D_MLX_AVAILABLE
+    if (impl_ == nullptr) {
+        return;
+    }
+    impl_->dspark_tap_layer_ids.clear();
+    if (layer_ids == nullptr || layer_count == 0) {
+        return;
+    }
+    impl_->dspark_tap_layer_ids.assign(layer_ids, layer_ids + layer_count);
+#else
+    (void)layer_ids;
+    (void)layer_count;
+#endif
+}
+
 bool NativeTextModel::set_adapter(std::shared_ptr<const NativeLoraAdapter> adapter, std::string* error) {
     if (error == nullptr) {
         return false;
@@ -3183,6 +3293,7 @@ bool NativeTextModel::forward_greedy(
                 std::move(forward.shared_kv.full_attention_value),
                 std::move(forward.shared_kv.sliding_attention_key),
                 std::move(forward.shared_kv.sliding_attention_value),
+                std::move(forward.dspark_taps.taps),
                 static_cast<uint64_t>(tokens.size()),
                 3840,
             });
@@ -3274,6 +3385,7 @@ bool NativeTextModel::prefill_incremental(
                 std::move(forward.shared_kv.full_attention_value),
                 std::move(forward.shared_kv.sliding_attention_key),
                 std::move(forward.shared_kv.sliding_attention_value),
+                std::move(forward.dspark_taps.taps),
                 static_cast<uint64_t>(tokens.size()),
                 kHiddenSize,
             });
@@ -3359,6 +3471,7 @@ bool NativeTextModel::decode_incremental(
                 std::move(forward.shared_kv.full_attention_value),
                 std::move(forward.shared_kv.sliding_attention_key),
                 std::move(forward.shared_kv.sliding_attention_value),
+                std::move(forward.dspark_taps.taps),
                 kv_state->sequence_len(),
                 kHiddenSize,
             });
@@ -3521,6 +3634,7 @@ bool NativeTextModel::decode_incremental_block(
                 std::move(forward.shared_kv.full_attention_value),
                 std::move(forward.shared_kv.sliding_attention_key),
                 std::move(forward.shared_kv.sliding_attention_value),
+                std::move(forward.dspark_taps.taps),
                 kv_state->sequence_len(),
                 kHiddenSize,
             });
@@ -3664,6 +3778,7 @@ bool NativeTextModel::decode_incremental_block_with_retroactive_prefix(
                 std::move(forward.shared_kv.full_attention_value),
                 std::move(forward.shared_kv.sliding_attention_key),
                 std::move(forward.shared_kv.sliding_attention_value),
+                std::move(forward.dspark_taps.taps),
                 kv_state->sequence_len(),
                 kHiddenSize,
             });

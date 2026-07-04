@@ -22,6 +22,7 @@ typedef enum Gemma4Status {
 
 typedef struct Gemma4Target Gemma4Target;
 typedef struct Gemma4Drafter Gemma4Drafter;
+typedef struct Gemma4DSparkDrafter Gemma4DSparkDrafter;
 typedef struct Gemma4KvCache Gemma4KvCache;
 typedef struct Gemma4KvSnapshot Gemma4KvSnapshot;
 typedef struct Gemma4Adapter Gemma4Adapter;
@@ -79,6 +80,35 @@ typedef struct Gemma4KvPolicy {
 #define GEMMA4_MTP_MAX_COMMITTED_TOKENS GEMMA4_MTP_TRACE_MAX_POSITIONS
 #define GEMMA4_MTP_TRACE_TOP_K 5
 #define GEMMA4_MTP_TRACE_MAX_RANK 4
+
+#define GEMMA4_DSPARK_TARGET_TAP_COUNT 5
+#define GEMMA4_DSPARK_MAX_DRAFT_TOKENS 7
+#define GEMMA4_DSPARK_TAP_MAX_RANK 4
+
+typedef struct Gemma4DSparkTapConfig {
+    bool enabled;
+    uint32_t layer_count;
+    uint32_t layer_ids[GEMMA4_DSPARK_TARGET_TAP_COUNT];
+} Gemma4DSparkTapConfig;
+
+typedef struct Gemma4DSparkTapInfo {
+    bool has_last_hidden;
+    uint32_t layer_count;
+    uint32_t layer_ids[GEMMA4_DSPARK_TARGET_TAP_COUNT];
+    uint32_t tap_ranks[GEMMA4_DSPARK_TARGET_TAP_COUNT];
+    uint64_t tap_shapes[GEMMA4_DSPARK_TARGET_TAP_COUNT * GEMMA4_DSPARK_TAP_MAX_RANK];
+    uint64_t tap_bytes;
+} Gemma4DSparkTapInfo;
+
+typedef struct Gemma4DSparkDraftResult {
+    uint32_t token_count;
+    int32_t tokens[GEMMA4_DSPARK_MAX_DRAFT_TOKENS];
+    float logits[GEMMA4_DSPARK_MAX_DRAFT_TOKENS];
+    float logit_margins[GEMMA4_DSPARK_MAX_DRAFT_TOKENS];
+    float confidence[GEMMA4_DSPARK_MAX_DRAFT_TOKENS];
+    double draft_ms;
+    uint64_t scheduler_us;
+} Gemma4DSparkDraftResult;
 
 typedef struct Gemma4MtpTraceInfo {
     uint32_t position_count;
@@ -161,6 +191,9 @@ Gemma4Status gemma4_free_target(Gemma4Target* target);
 Gemma4Status gemma4_target_set_prefill_chunk_policy(
     Gemma4Target* target,
     const Gemma4PrefillChunkPolicy* policy);
+Gemma4Status gemma4_target_set_dspark_taps(
+    Gemma4Target* target,
+    const Gemma4DSparkTapConfig* config);
 
 Gemma4Status gemma4_load_adapter(
     Gemma4Target* target,
@@ -175,6 +208,7 @@ Gemma4Status gemma4_kv_create(const Gemma4KvPolicy* policy, Gemma4KvCache** out)
 Gemma4Status gemma4_kv_free(Gemma4KvCache* cache);
 Gemma4Status gemma4_kv_reset(Gemma4KvCache* cache);
 Gemma4Status gemma4_kv_last_step(const Gemma4KvCache* cache, Gemma4StepResult* out);
+Gemma4Status gemma4_kv_dspark_tap_info(const Gemma4KvCache* cache, Gemma4DSparkTapInfo* out);
 Gemma4Status gemma4_kv_snapshot_export(const Gemma4KvCache* cache, Gemma4KvSnapshot** out);
 Gemma4Status gemma4_kv_snapshot_import(Gemma4KvCache* cache, const Gemma4KvSnapshot* snapshot);
 Gemma4Status gemma4_kv_snapshot_info(const Gemma4KvSnapshot* snapshot, Gemma4KvSnapshotInfo* out);
@@ -229,6 +263,16 @@ Gemma4Status gemma4_mtp_draft_block(
     float* out_logits,
     float* out_logit_margins,
     size_t* inout_count);
+Gemma4Status gemma4_load_dspark_drafter(
+    const Gemma4LoadConfig* config,
+    Gemma4Target* target,
+    Gemma4DSparkDrafter** out);
+Gemma4Status gemma4_free_dspark_drafter(Gemma4DSparkDrafter* drafter);
+Gemma4Status gemma4_dspark_draft_block(
+    Gemma4DSparkDrafter* drafter,
+    Gemma4KvCache* cache,
+    uint32_t max_block_size,
+    Gemma4DSparkDraftResult* out);
 Gemma4Status gemma4_verify_tokens(
     Gemma4Target* target,
     Gemma4KvCache* cache,
