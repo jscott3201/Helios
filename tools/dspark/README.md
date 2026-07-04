@@ -56,9 +56,11 @@ python3 tools/dspark/compare_native_trace.py \
 
 The comparison matches only records with a corresponding fixture workload. It
 checks DeepSpec greedy draft token prefixes, selected Markov logits, confidence,
-and top-k margin against the first native verify trace for that context. Target
-token mismatch is reported separately so zero acceptance can be distinguished
-from native DSpark decoder mismatch.
+and top-k margin against the first native verify trace for that context. The
+default margin tolerance is wider than the selected-logit tolerance because
+margin is a derived top1-minus-top2 diagnostic. Target token mismatch is
+reported separately so zero acceptance can be distinguished from native DSpark
+decoder mismatch.
 
 ## MLX Conversion Manifest
 

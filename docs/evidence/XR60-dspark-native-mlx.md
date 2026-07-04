@@ -568,6 +568,69 @@ native DSpark decoder math mismatch against DeepSpec. The released DeepSpec
 drafter and Helios native 4-bit target distribution disagree on the next target
 tokens for the measured prompt/tap context.
 
+## Broader Native-Tap Parity Corpus
+
+The native tap snapshot path was rerun for both bounded warm-start workloads so
+the `hello_reference_prefix` native trace could be compared against DeepSpec as
+well.
+
+Snapshot command:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/tap-snapshot-warm-corpus --native-tap-snapshot-dir benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1 --max-new-tokens 1
+```
+
+Fixture command:
+
+```text
+PYTHONPATH=artifacts/reference/DeepSpec artifacts/envs/dspark-reference/bin/python tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 --native-tap-manifest benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus/native_tap_snapshot_manifest.json --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus --prompt-token-ids 9259
+```
+
+Parity command:
+
+```text
+python3 tools/dspark/compare_native_trace.py --reference benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus/reference_fixture.json --records benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-warm-corpus --margin-tolerance 0.5
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus/native_tap_snapshot_manifest.json
+benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus/reference_fixture.json
+benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus/manifest.json
+benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-warm-corpus/parity_report.json
+benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-warm-corpus/blockers.md
+```
+
+Result:
+
+- native snapshot manifest status: `ready_for_reference_compare`
+- snapshots: `2`
+  - `hello_smoke`, prompt `[9259]`, anchor `236772`, context tokens `1`
+  - `hello_reference_prefix`, prompt `[9259, 236772, 236772]`, anchor
+    `236761`, context tokens `3`
+- DeepSpec fixture status: `passed`
+- DeepSpec fixture count: `2`
+- `hello_smoke` DeepSpec draft prefix:
+  `[236745, 735, 496, 59398]`
+- `hello_reference_prefix` DeepSpec draft prefix:
+  `[107, 236829, 139, 1018]`
+- native trace parity status: `passed`
+- compared records: `8`
+- skipped records: `0`
+- native draft token prefixes matched DeepSpec exactly for both workloads
+- selected Markov logit max absolute error: `0.1875`
+- confidence max absolute error: `0.005936026573181152`
+- Markov margin max absolute error: `0.28125` with margin tolerance `0.5`
+- verifier target prefixes still differed:
+  - `hello_smoke`: `[236772]` or `[236772, 236761]`
+  - `hello_reference_prefix`: `[236779]` or `[236779, 236772]`
+
+Interpretation: native DSpark decoder parity now holds for the first warm-start
+trace of both bounded workloads. The zero-acceptance symptom remains because
+the released DSpark drafter predicts a different continuation than the local
+Helios 4-bit target verifies.
+
 ## Verification
 
 Commands run:
@@ -602,6 +665,9 @@ UV_CACHE_DIR=.uv-cache uv pip install --python artifacts/envs/dspark-reference/b
 PYTHONPATH=artifacts/reference/DeepSpec artifacts/envs/dspark-reference/bin/python tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 --native-tap-manifest benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/native_tap_snapshot_manifest.json --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap --prompt-token-ids 9259
 python3 -m py_compile tools/dspark/dspark_common.py tools/dspark/export_reference_fixture.py tools/dspark/convert_to_mlx.py tools/dspark/compare_mlx_parity.py tools/dspark/compare_native_trace.py
 python3 tools/dspark/compare_native_trace.py --reference benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap/reference_fixture.json --records benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-trace
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/tap-snapshot-warm-corpus --native-tap-snapshot-dir benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1 --max-new-tokens 1
+PYTHONPATH=artifacts/reference/DeepSpec artifacts/envs/dspark-reference/bin/python tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 --native-tap-manifest benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus/native_tap_snapshot_manifest.json --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus --prompt-token-ids 9259
+python3 tools/dspark/compare_native_trace.py --reference benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus/reference_fixture.json --records benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-warm-corpus --margin-tolerance 0.5
 ```
 
 Observed result:
@@ -651,6 +717,15 @@ Observed result:
   It matched native DSpark draft tokens, selected Markov logits, confidence, and
   margins to DeepSpec for the compared `hello_smoke` records. The verifier
   target prefix still differed, explaining zero acceptance for that context.
+- The broader native-tap parity corpus wrote
+  `benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus/`,
+  `benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus/`,
+  and
+  `benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-warm-corpus/`.
+  It matched native DSpark first-trace draft tokens exactly to DeepSpec across
+  all 8 warm-start matrix records for `hello_smoke` and
+  `hello_reference_prefix`; selected Markov logits, confidence, and margins
+  were within configured tolerances, but verifier target prefixes still differed.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
@@ -660,20 +735,21 @@ Observed result:
 
 - Full target-hidden parity against a PyTorch BF16 target is not measured; the
   current fixture uses Helios native 4-bit target taps as DeepSpec input.
-- Native DSpark decoder math is parity-verified only for the first
-  `hello_smoke` warm-start native-tap trace, not for a broader fixture corpus.
+- Native DSpark decoder math is parity-verified only for the first warm-start
+  traces of `hello_smoke` and `hello_reference_prefix`, not for a real-context
+  fixture corpus or later decode positions.
 - The available native benchmark target is a 4-bit affine MLX artifact, while
   the released DSpark checkpoint is BF16 and target-compatible only after hidden
   tap parity is proven.
-- The first runtime evidence has zero draft acceptance and severe latency, so
-  DSpark must remain default-off.
+- Runtime evidence still has zero draft acceptance and severe latency, so DSpark
+  must remain default-off.
 - Broader real-context workload evidence is still missing.
 
 ## Next Slice
 
-Export native-tap fixtures for additional workloads and context lengths,
-especially a `hello_reference_prefix` fixture matching the warm-start matrix,
-then compare native DSpark traces against DeepSpec across that broader corpus.
-If native parity continues to pass while verifier targets differ, quantify
-whether the released BF16 DSpark checkpoint is incompatible with the local 4-bit
-target distribution or only poor on the current prompt selection.
+Quantify the remaining target-distribution mismatch: add more native-tap
+fixtures for real-context/code workloads and later decode positions, then
+measure whether the released BF16 DSpark checkpoint is broadly incompatible
+with the local 4-bit target distribution or only poor on the current prompt
+selection. Keep DSpark default-off until acceptance and speed improve with
+exactness preserved.

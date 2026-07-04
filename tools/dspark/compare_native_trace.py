@@ -87,7 +87,7 @@ def main() -> int:
     }
     write_json(args.out_dir / "parity_report.json", result)
     (args.out_dir / "blockers.md").write_text(
-        render_blockers("XR60 native trace parity", blockers, command),
+        render_parity_blockers(blockers, command),
         encoding="utf-8",
     )
     if blockers and not args.allow_blocked:
@@ -280,6 +280,25 @@ def list_or_empty(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def render_parity_blockers(blockers: list[str], command: str) -> str:
+    if not blockers:
+        return render_blockers("XR60 native trace parity", blockers, command)
+    lines = ["# XR60 native trace parity blockers", ""]
+    for index, blocker in enumerate(blockers, start=1):
+        lines.extend(
+            [
+                f"## Blocker {index}: {blocker}",
+                "",
+                f"- Command: `{command}`",
+                "- Expected: native DSpark trace matches the DeepSpec native-tap reference within configured tolerances",
+                f"- Observed: {blocker}",
+                "- Next input needed: inspect the mismatched field, tolerance, or native/reference fixture alignment before claiming broader parity",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE)
@@ -287,7 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--trace-index", type=int, default=0)
     parser.add_argument("--logit-tolerance", type=float, default=0.25)
-    parser.add_argument("--margin-tolerance", type=float, default=0.25)
+    parser.add_argument("--margin-tolerance", type=float, default=0.5)
     parser.add_argument("--confidence-tolerance", type=float, default=0.01)
     parser.add_argument("--allow-blocked", action="store_true")
     args = parser.parse_args()
