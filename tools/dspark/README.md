@@ -42,6 +42,24 @@ checkpoint hash, native tap manifest, and safetensors header, then writes
 `manifest.json` plus `blockers.md`. It does not claim fixture parity until the
 reference stack is available and `reference_fixture.json` is emitted.
 
+## Native Trace Parity
+
+After the native-tap fixture is emitted, compare it against Helios native trace
+records:
+
+```bash
+python3 tools/dspark/compare_native_trace.py \
+  --reference benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-tap/reference_fixture.json \
+  --records benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/records.jsonl \
+  --out-dir benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-trace
+```
+
+The comparison matches only records with a corresponding fixture workload. It
+checks DeepSpec greedy draft token prefixes, selected Markov logits, confidence,
+and top-k margin against the first native verify trace for that context. Target
+token mismatch is reported separately so zero acceptance can be distinguished
+from native DSpark decoder mismatch.
+
 ## MLX Conversion Manifest
 
 ```bash
