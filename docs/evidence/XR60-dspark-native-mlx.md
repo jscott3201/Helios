@@ -23,8 +23,16 @@ The DSpark draft directory was created locally at:
 artifacts/drafts/dspark-gemma4-12b-block7/
 ```
 
-Only `config.json` has been downloaded in this slice. The 6.86 GB
-`model.safetensors` file is intentionally not committed.
+`config.json` and the released `model.safetensors` are present locally. The
+checkpoint is intentionally not committed.
+
+- `model.safetensors` size: `6860897028` bytes
+- `model.safetensors` SHA-256:
+  `864d974efd2e4d636b946c88769a94fc5cb32b4a8ba5dec287ba6b0e4969685e`
+- draft artifact inventory SHA-256:
+  `da89117833a8ee34317fcdafa0d41c1c7228d7c3d8bace2f9fde88c0bd255aa5`
+- draft local artifact SHA-256:
+  `79bc9a537d13978b40adef51408a1431b312b427c9208e4952dfd142360dbcea`
 
 ## Upstream Config
 
@@ -178,8 +186,75 @@ fixed-prefix block-7 decoder path for the released DSpark checkpoint:
 
 The C ABI path `gemma4_dspark_draft_block` already routes into this native
 method and records native draft latency in `Gemma4DSparkDraftResult`. This code
-is build-verified against local MLX headers, but it has not been runtime-parity
-verified because the released `model.safetensors` file is not present locally.
+is build-verified against local MLX headers and has run through the released
+checkpoint in a bounded native smoke. The current runtime evidence preserves
+exact target output only because `gemma4_verify_tokens` rejects every draft and
+commits the target fallback token.
+
+## Runtime Checkpoint Slice
+
+The released checkpoint was downloaded with:
+
+```text
+hf download deepseek-ai/dspark_gemma4_12b_block7 model.safetensors --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 --local-dir artifacts/drafts/dspark-gemma4-12b-block7 --max-workers 1
+```
+
+A sandboxed Metal run failed as expected because the sandbox could not see a
+GPU device:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1 --max-new-tokens 1
+```
+
+Observed error:
+
+```text
+native Gemma 4 incremental prefill failed: [metal::load_device] No Metal device available. This typically occurs in headless, sandboxed, or virtualized macOS sessions where the GPU is not accessible.
+```
+
+The same command succeeded unsandboxed and wrote
+`benchmarks/out/XR60-dspark-native-mlx/smoke/`. The one-token smoke passed
+exactness for `hello_smoke` and `hello_reference_prefix`, but both records had
+`accepted_draft_tokens = 0`, `acceptance_rate = 0.0`, and rollback count `1`.
+
+The bounded fixed-prefix matrix was then run with shared target/drafter handles:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1,2,4,7 --max-new-tokens 2
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/matrix-smoke/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/matrix-smoke/summary.json
+benchmarks/out/XR60-dspark-native-mlx/matrix-smoke/report.md
+benchmarks/out/XR60-dspark-native-mlx/matrix-smoke/blockers.md
+benchmarks/out/XR60-dspark-native-mlx/matrix-smoke/decision.md
+```
+
+Result:
+
+- decision: `keep_disabled_pending_broader_evidence`
+- status: `passed` for exactness on this bounded workload
+- workload: `hello_smoke`
+- block sizes: `1, 2, 4, 7`
+- max new tokens: `2`
+- baseline/DSpark token sequence SHA-256:
+  `1070d9af5afdfd5c8555f50212ea73aace42e743e4261fa5463c6eb9ada04ea0`
+- accepted draft tokens: `0` for every block size
+- acceptance rate: `0.0` for every block size
+- rollback count: `2` for every block size
+- decode throughput range: `0.019` to `0.029` tok/s
+- draft time range: `22236.446` to `52406.151` ms
+- verify forward time range: `45249.832` to `52471.542` ms
+- peak memory: `13.565` GB
+- hidden tap bytes: `38400`
+
+This is not a speedup candidate. It is useful evidence that the native DSpark
+checkpoint path can execute and that the verifier preserves exact output, but
+the drafter output or decoder math still needs reference parity diagnosis before
+any promotion or broader benchmark claim.
 
 ## Verification
 
@@ -193,6 +268,8 @@ git diff --check
 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
 GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --lib --no-run
 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2,4,7 --max-new-tokens 32
+GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1,2,4,7 --max-new-tokens 2
 ```
 
 Observed result:
@@ -206,24 +283,29 @@ Observed result:
 - The fixed-prefix harness wrote
   `benchmarks/out/XR60-dspark-native-mlx/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`
   with decision `blocked`.
+- The bounded fixed-prefix harness wrote
+  `benchmarks/out/XR60-dspark-native-mlx/matrix-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`
+  with decision `keep_disabled_pending_broader_evidence`. Exactness passed on
+  `hello_smoke` for fixed-prefix block sizes `1,2,4,7`, but acceptance was `0.0`
+  and throughput was `0.019` to `0.029` tok/s.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
   `GEMMA4D_USE_NATIVE_GRAPH` are set.
 
-## Current Blockers
+## Current Blockers / Gated Work
 
-- DSpark weights are not present locally:
-  `artifacts/drafts/dspark-gemma4-12b-block7/model.safetensors`.
 - DeepSpec/PyTorch fixture code is not yet integrated.
-- Native DSpark draft execution has not yet been parity-verified against the
-  released checkpoint because the checkpoint weights are missing locally.
-- The benchmark example still emits fail-closed startup records; full workload
-  execution should be wired once the DSpark checkpoint is available.
+- Hidden-tap parity against a revision-pinned DeepSpec fixture is not measured.
+- Native DSpark decoder math is not parity-verified against the released
+  checkpoint.
+- The first runtime evidence has zero draft acceptance and severe latency, so
+  DSpark must remain default-off.
+- Broader real-context workload evidence is still missing.
 
 ## Next Slice
 
-Download or provide the released DSpark `model.safetensors`, run the native
-draft path against the captured tap arrays, compare against DeepSpec/PyTorch
-fixtures, and then wire the fixed-prefix benchmark workload through
-`gemma4_dspark_draft_block` and `gemma4_verify_tokens`.
+Generate a revision-pinned DeepSpec/PyTorch fixture for the released checkpoint,
+compare native hidden taps and draft logits/tokens against it, then diagnose
+whether zero acceptance comes from decoder math, checkpoint/target mismatch,
+prompt selection, or verifier overhead.

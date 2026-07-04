@@ -1,10 +1,15 @@
 use std::{
     env, fs,
+    num::NonZeroU32,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gemma4d_bench::{BuildProvenance, capture_build_provenance, manifest};
+use gemma4d_ffi::{
+    DSparkDraftBlock, DSparkDrafter, DSparkTapConfig, KvCache, KvPolicy, LoadConfig, Target,
+    decode_one, prefill, runtime_version, verify_tokens,
+};
 use gemma4d_tokenizer::{file_sha256, sha256_hex};
 use serde::Serialize;
 
@@ -15,6 +20,7 @@ const DEFAULT_MODEL: &str = "artifacts/models/gemma-4-12B-it-4bit";
 const DEFAULT_DRAFT: &str = "artifacts/drafts/dspark-gemma4-12b-block7";
 const EXPECTED_DSPARK_REVISION: &str = "2fa72e765eec2965fc4d86a8663ce6769eba6218";
 const EXPECTED_TARGET_LAYERS: &[u32] = &[5, 17, 29, 41, 46];
+const DEFAULT_WORKLOADS: &[&str] = &["hello_smoke", "hello_reference_prefix"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1))?;
@@ -32,21 +38,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let draft_identity =
         manifest::capture_artifact_identity(&args.draft_path, "GEMMA4D_DSPARK_REVISION");
     let draft_config = inspect_dspark_config(&args.draft_path);
-    let mut blockers = startup_blockers(&args, &draft_config);
-    if blockers.is_empty() {
-        blockers.push(
-            "XR60 fixed-prefix workload execution is not wired into this scaffold yet; invoke the native DSpark FFI draft path before making speed or exactness claims"
-                .to_owned(),
-        );
-    }
     let run_id = run_id();
-    let records = blocked_records(&args, &run_id, &blockers);
-    let decision = "blocked";
+    let mut blockers = startup_blockers(&args, &draft_config);
+    let mut records = Vec::new();
+    if blockers.is_empty() {
+        eprintln!("XR60 DSpark loading target: {}", args.model_path.display());
+        match Target::load(&target_config(&args)) {
+            Ok(mut target) => match target.set_dspark_taps(&DSparkTapConfig::xr60_default()) {
+                Ok(()) => {
+                    eprintln!("XR60 DSpark loading drafter: {}", args.draft_path.display());
+                    match DSparkDrafter::load(&dspark_config(&args), &target) {
+                        Ok(drafter) => {
+                            for probe in probes(args.max_new_tokens, &args.workload_ids) {
+                                eprintln!("XR60 DSpark baseline workload={}", probe.id);
+                                let baseline = match run_baseline(&target, &probe) {
+                                    Ok(baseline) => baseline,
+                                    Err(err) => {
+                                        blockers
+                                            .push(format!("{} baseline failed: {}", probe.id, err));
+                                        continue;
+                                    }
+                                };
+                                for block_size in &args.block_sizes {
+                                    eprintln!(
+                                        "XR60 DSpark record workload={} block_size={} max_new_tokens={}",
+                                        probe.id, block_size, probe.max_new_tokens
+                                    );
+                                    match run_record(
+                                        &target,
+                                        &drafter,
+                                        &run_id,
+                                        &probe,
+                                        *block_size,
+                                        &baseline,
+                                    ) {
+                                        Ok(record) => records.push(record),
+                                        Err(err) => blockers.push(format!(
+                                            "{} block_size={}: {}",
+                                            probe.id, block_size, err
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            blockers.push(format!("native DSpark drafter load failed: {err}"))
+                        }
+                    }
+                }
+                Err(err) => blockers.push(format!("native DSpark tap enable failed: {err}")),
+            },
+            Err(err) => blockers.push(format!("native DSpark target load failed: {err}")),
+        }
+    }
+    if records.is_empty() {
+        records = blocked_records(&args, &run_id, &blockers);
+    }
+    blockers.extend(
+        records
+            .iter()
+            .filter(|record| record.measured && !record.exact)
+            .map(|record| {
+                format!(
+                    "{} fixed-prefix {} did not match native greedy output",
+                    record.workload_id, record.scheduled_len
+                )
+            }),
+    );
+    let status =
+        if blockers.is_empty() && records.iter().all(|record| record.measured && record.exact) {
+            "passed"
+        } else if records.iter().any(|record| record.measured) {
+            "failed"
+        } else {
+            "blocked"
+        };
+    let decision = if status == "passed" {
+        "keep_disabled_pending_broader_evidence"
+    } else {
+        "blocked"
+    };
     let summary = Summary {
         schema_version: 1,
         goal: GOAL,
         mode: MODE,
-        status: "blocked",
+        status,
         decision,
         run_id,
         generated_at_unix_seconds: unix_now(),
@@ -61,17 +137,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         blockers_path: blockers_path.display().to_string(),
         decision_path: decision_path.display().to_string(),
         block_sizes: args.block_sizes.clone(),
+        workload_ids: args.workload_ids.clone(),
         max_new_tokens: args.max_new_tokens,
         target_layer_ids: EXPECTED_TARGET_LAYERS.to_vec(),
         records: records.clone(),
         blockers: blockers.clone(),
         measurement_notes: vec![
-            "This XR60 harness slice is fail-closed scaffolding. It emits the required artifact shape and blocks until startup dependencies and workload execution are available.",
-            "No DSpark benchmark speed or exactness claim is made by blocked records.",
+            "This XR60 harness uses native target prefill/decode as the baseline and native DSpark draft plus gemma4_verify_tokens for speculative records.",
+            "The DSpark path remains default-off regardless of this harness outcome; broader workload, parity, and memory gates are still required.",
             "The draft artifact is expected to be deepseek-ai/dspark_gemma4_12b_block7 at revision 2fa72e765eec2965fc4d86a8663ce6769eba6218.",
         ],
     };
 
+    fs::create_dir_all(&args.out_dir)?;
     write_jsonl(&records_path, &records)?;
     fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
     fs::write(&report_path, render_report(&summary))?;
@@ -93,7 +171,9 @@ struct Args {
     model_path: PathBuf,
     draft_path: PathBuf,
     block_sizes: Vec<usize>,
+    workload_ids: Vec<String>,
     max_new_tokens: usize,
+    max_context_tokens: usize,
 }
 
 impl Args {
@@ -105,7 +185,12 @@ impl Args {
         let mut model_path = PathBuf::from(DEFAULT_MODEL);
         let mut draft_path = PathBuf::from(DEFAULT_DRAFT);
         let mut block_sizes = vec![1, 2, 4, 7];
+        let mut workload_ids = DEFAULT_WORKLOADS
+            .iter()
+            .map(|workload| (*workload).to_owned())
+            .collect::<Vec<_>>();
         let mut max_new_tokens = 32;
+        let mut max_context_tokens = 8192;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -120,14 +205,22 @@ impl Args {
                 "--block-sizes" => {
                     block_sizes = parse_usize_list(&required_value(&mut args, "--block-sizes")?)?;
                 }
+                "--workloads" => {
+                    workload_ids = parse_string_list(&required_value(&mut args, "--workloads")?)?;
+                }
                 "--max-new-tokens" => {
                     max_new_tokens = required_value(&mut args, "--max-new-tokens")?
                         .parse()
                         .map_err(|_| "--max-new-tokens must be an integer")?;
                 }
+                "--max-context-tokens" => {
+                    max_context_tokens = required_value(&mut args, "--max-context-tokens")?
+                        .parse()
+                        .map_err(|_| "--max-context-tokens must be an integer")?;
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- [--out-dir PATH] [--model-path PATH] [--draft-path PATH] [--block-sizes 1,2,4,7] [--max-new-tokens N]"
+                        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- [--out-dir PATH] [--model-path PATH] [--draft-path PATH] [--block-sizes 1,2,4,7] [--workloads hello_smoke,hello_reference_prefix] [--max-new-tokens N] [--max-context-tokens N]"
                     );
                     std::process::exit(0);
                 }
@@ -143,15 +236,32 @@ impl Args {
         {
             return Err("XR60 fixed-prefix scaffold only accepts block sizes 1,2,4,7".into());
         }
+        if workload_ids.is_empty() {
+            return Err("--workloads must not be empty".into());
+        }
+        for workload_id in &workload_ids {
+            if !DEFAULT_WORKLOADS.contains(&workload_id.as_str()) {
+                return Err(format!(
+                    "unknown XR60 workload '{workload_id}'; expected one of {}",
+                    DEFAULT_WORKLOADS.join(",")
+                )
+                .into());
+            }
+        }
         if max_new_tokens == 0 {
             return Err("--max-new-tokens must be greater than zero".into());
+        }
+        if max_context_tokens == 0 {
+            return Err("--max-context-tokens must be greater than zero".into());
         }
         Ok(Self {
             out_dir,
             model_path,
             draft_path,
             block_sizes,
+            workload_ids,
             max_new_tokens,
+            max_context_tokens,
         })
     }
 }
@@ -176,6 +286,7 @@ struct Summary {
     blockers_path: String,
     decision_path: String,
     block_sizes: Vec<usize>,
+    workload_ids: Vec<String>,
     max_new_tokens: usize,
     target_layer_ids: Vec<u32>,
     records: Vec<Record>,
@@ -236,6 +347,38 @@ struct DsparkConfigInspection {
     dtype: Option<String>,
     checks_passed: bool,
     issues: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Probe {
+    id: &'static str,
+    prompt_tokens: Vec<i32>,
+    max_new_tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+struct NativeRun {
+    generated_tokens: Vec<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeDSparkRun {
+    generated_tokens: Vec<i32>,
+    draft_ms: f64,
+    scheduler_us: u64,
+    verify_stage_ms: f64,
+    verify_forward_ms: f64,
+    repair_ms: f64,
+    total_ms: f64,
+    attempted_draft_tokens: usize,
+    scheduled_draft_tokens: usize,
+    accepted_draft_tokens: usize,
+    target_verify_passes: usize,
+    rollback_count: usize,
+    peak_memory_gb: f32,
+    peak_rss_mb: f32,
+    active_kv_bytes: u64,
+    hidden_tap_bytes: u64,
 }
 
 fn inspect_dspark_config(draft_path: &Path) -> DsparkConfigInspection {
@@ -334,6 +477,17 @@ fn inspect_dspark_config(draft_path: &Path) -> DsparkConfigInspection {
 
 fn startup_blockers(args: &Args, draft_config: &DsparkConfigInspection) -> Vec<String> {
     let mut blockers = Vec::new();
+    if runtime_version()
+        .map(|version| version.backend_version == "m03-smoke-no-mlx")
+        .unwrap_or(true)
+    {
+        blockers.push(
+            "GEMMA4D_REQUIRE_MLX=1 is required at build time for XR60 native DSpark".to_owned(),
+        );
+    }
+    if env::var_os("GEMMA4D_USE_NATIVE_GRAPH").is_none() {
+        blockers.push("GEMMA4D_USE_NATIVE_GRAPH=1 is required for XR60 native DSpark".to_owned());
+    }
     if !args.model_path.exists() {
         blockers.push(format!(
             "missing target model path: {}",
@@ -362,6 +516,222 @@ fn startup_blockers(args: &Args, draft_config: &DsparkConfigInspection) -> Vec<S
         );
     }
     blockers
+}
+
+fn probes(max_new_tokens: usize, workload_ids: &[String]) -> Vec<Probe> {
+    let all = vec![
+        Probe {
+            id: "hello_smoke",
+            prompt_tokens: vec![9259],
+            max_new_tokens,
+        },
+        Probe {
+            id: "hello_reference_prefix",
+            prompt_tokens: vec![9259, 236772, 236772],
+            max_new_tokens,
+        },
+    ];
+    all.into_iter()
+        .filter(|probe| workload_ids.iter().any(|id| id == probe.id))
+        .collect()
+}
+
+fn run_record(
+    target: &Target,
+    drafter: &DSparkDrafter,
+    run_id: &str,
+    probe: &Probe,
+    block_size: usize,
+    baseline: &NativeRun,
+) -> Result<Record, Box<dyn std::error::Error>> {
+    let dspark = run_dspark(target, drafter, probe, block_size)?;
+    let exact = baseline.generated_tokens == dspark.generated_tokens;
+    Ok(Record {
+        schema_version: 1,
+        goal: GOAL,
+        mode: MODE,
+        run_id: run_id.to_owned(),
+        status: if exact { "passed" } else { "failed" },
+        measured: true,
+        exact,
+        workload_id: probe.id,
+        context_tokens: probe.prompt_tokens.len(),
+        max_new_tokens: probe.max_new_tokens,
+        scheduler: "fixed",
+        scheduled_len: block_size,
+        attempted_draft_tokens: dspark.attempted_draft_tokens,
+        scheduled_draft_tokens: dspark.scheduled_draft_tokens,
+        accepted_draft_tokens: dspark.accepted_draft_tokens,
+        accepted_tokens_per_verify: if dspark.target_verify_passes == 0 {
+            0.0
+        } else {
+            dspark.accepted_draft_tokens as f64 / dspark.target_verify_passes as f64
+        },
+        acceptance_rate: if dspark.attempted_draft_tokens == 0 {
+            0.0
+        } else {
+            dspark.accepted_draft_tokens as f64 / dspark.attempted_draft_tokens as f64
+        },
+        target_verify_passes: dspark.target_verify_passes,
+        rollback_count: dspark.rollback_count,
+        draft_ms: Some(dspark.draft_ms),
+        scheduler_us: Some(dspark.scheduler_us),
+        verify_stage_ms: Some(dspark.verify_stage_ms),
+        verify_forward_ms: Some(dspark.verify_forward_ms),
+        repair_ms: Some(dspark.repair_ms),
+        decode_tokens_per_second: Some(tps(probe.max_new_tokens, dspark.total_ms)),
+        decode_phase_ms: Some(dspark.total_ms),
+        peak_memory_gb: Some(dspark.peak_memory_gb as f64),
+        peak_rss_mb: Some(dspark.peak_rss_mb as f64),
+        active_kv_bytes: Some(dspark.active_kv_bytes),
+        hidden_tap_bytes: Some(dspark.hidden_tap_bytes),
+        draft_resident_bytes: None,
+        baseline_token_sequence_sha256: Some(checksum_tokens(&baseline.generated_tokens)),
+        dspark_token_sequence_sha256: Some(checksum_tokens(&dspark.generated_tokens)),
+        auto_disable_reason: if exact {
+            String::new()
+        } else {
+            format!(
+                "baseline tokens {:?} != dspark tokens {:?}",
+                baseline.generated_tokens, dspark.generated_tokens
+            )
+        },
+    })
+}
+
+fn run_baseline(target: &Target, probe: &Probe) -> Result<NativeRun, Box<dyn std::error::Error>> {
+    let mut cache = KvCache::create(&KvPolicy::default())?;
+    let first = prefill(target, &mut cache, &probe.prompt_tokens)?;
+    let mut generated = Vec::with_capacity(probe.max_new_tokens);
+    generated.push(first.greedy_token);
+
+    while generated.len() < probe.max_new_tokens {
+        let token = *generated.last().expect("generated has token");
+        let step = decode_one(target, &mut cache, token)?;
+        generated.push(step.greedy_token);
+    }
+
+    Ok(NativeRun {
+        generated_tokens: generated,
+    })
+}
+
+fn run_dspark(
+    target: &Target,
+    drafter: &DSparkDrafter,
+    probe: &Probe,
+    block_size: usize,
+) -> Result<NativeDSparkRun, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut cache = KvCache::create(&KvPolicy::default())?;
+
+    let prefill_started = Instant::now();
+    let first = prefill(target, &mut cache, &probe.prompt_tokens)?;
+    let _prefill_ms = duration_ms(prefill_started.elapsed());
+    let tap_info = cache.dspark_tap_info()?;
+    let hidden_tap_bytes = tap_info.tap_bytes;
+    let mut generated = Vec::with_capacity(probe.max_new_tokens);
+    let mut peak_memory_gb = first.peak_memory_gb;
+    let mut peak_rss_mb = first.peak_rss_mb;
+    let mut active_kv_bytes = first.active_kv_bytes;
+    let mut draft_ms = 0.0;
+    let mut scheduler_us = 0_u64;
+    let mut verify_stage_ms = 0.0;
+    let mut verify_forward_ms = 0.0;
+    let mut repair_ms = 0.0;
+    let mut attempted_draft_tokens = 0_usize;
+    let mut scheduled_draft_tokens = 0_usize;
+    let mut accepted_draft_tokens = 0_usize;
+    let mut target_verify_passes = 0_usize;
+    let mut rollback_count = 0_usize;
+
+    while generated.len() < probe.max_new_tokens {
+        let remaining = probe.max_new_tokens - generated.len();
+        let scheduled = block_size.min(remaining);
+        let draft = drafter.draft_block(
+            &mut cache,
+            NonZeroU32::new(scheduled as u32).expect("scheduled block is non-zero"),
+        )?;
+        let draft_tokens = dspark_tokens(&draft);
+        if draft_tokens.is_empty() {
+            return Err("native DSpark drafter returned no tokens".into());
+        }
+        draft_ms += draft.draft_ms;
+        scheduler_us = scheduler_us.saturating_add(draft.scheduler_us);
+        scheduled_draft_tokens += scheduled;
+        attempted_draft_tokens += draft_tokens.len();
+        target_verify_passes += 1;
+
+        let step = verify_tokens(target, &mut cache, &draft_tokens)?;
+        verify_stage_ms += step.verify_stage_ms;
+        verify_forward_ms += step.verify_forward_ms;
+        repair_ms += step.verify_repair_ms;
+        peak_memory_gb = peak_memory_gb.max(step.peak_memory_gb);
+        peak_rss_mb = peak_rss_mb.max(step.peak_rss_mb);
+        active_kv_bytes = active_kv_bytes.max(step.active_kv_bytes);
+        accepted_draft_tokens += usize::try_from(step.accepted_draft_count)
+            .unwrap_or(usize::MAX)
+            .min(draft_tokens.len());
+        if usize::try_from(step.accepted_draft_count).unwrap_or(usize::MAX) < draft_tokens.len() {
+            rollback_count += 1;
+        }
+        let committed = step.committed_tokens();
+        if committed.is_empty() {
+            return Err("gemma4_verify_tokens committed no tokens".into());
+        }
+        for token in committed {
+            if generated.len() < probe.max_new_tokens {
+                generated.push(*token);
+            }
+        }
+    }
+
+    Ok(NativeDSparkRun {
+        generated_tokens: generated,
+        draft_ms,
+        scheduler_us,
+        verify_stage_ms,
+        verify_forward_ms,
+        repair_ms,
+        total_ms: duration_ms(started.elapsed()),
+        attempted_draft_tokens,
+        scheduled_draft_tokens,
+        accepted_draft_tokens,
+        target_verify_passes,
+        rollback_count,
+        peak_memory_gb,
+        peak_rss_mb,
+        active_kv_bytes,
+        hidden_tap_bytes,
+    })
+}
+
+fn target_config(args: &Args) -> LoadConfig {
+    LoadConfig {
+        model_path: args.model_path.display().to_string(),
+        model_id: Some("mlx-community/gemma-4-12B-it-4bit".to_owned()),
+        model_revision: None,
+        expected_architecture: Some("gemma4".to_owned()),
+        max_context_tokens: NonZeroU32::new(args.max_context_tokens as u32)
+            .expect("max context is non-zero"),
+        allow_unsupported_config: false,
+    }
+}
+
+fn dspark_config(args: &Args) -> LoadConfig {
+    LoadConfig {
+        model_path: args.draft_path.display().to_string(),
+        model_id: Some("deepseek-ai/dspark_gemma4_12b_block7".to_owned()),
+        model_revision: Some(EXPECTED_DSPARK_REVISION.to_owned()),
+        expected_architecture: Some("Gemma4DSparkModel".to_owned()),
+        max_context_tokens: NonZeroU32::new(args.max_context_tokens as u32)
+            .expect("max context is non-zero"),
+        allow_unsupported_config: false,
+    }
+}
+
+fn dspark_tokens(draft: &DSparkDraftBlock) -> Vec<i32> {
+    draft.tokens.iter().map(|token| token.token).collect()
 }
 
 fn blocked_records(args: &Args, run_id: &str, blockers: &[String]) -> Vec<Record> {
@@ -423,6 +793,10 @@ fn render_report(summary: &Summary) -> String {
     ));
     out.push_str(&format!("- Mode: `{}`\n", summary.mode));
     out.push_str(&format!(
+        "- Workloads: `{}`\n",
+        escape_md(&summary.workload_ids.join(","))
+    ));
+    out.push_str(&format!(
         "- Draft path: `{}`\n",
         escape_md(&summary.draft_identity.path)
     ));
@@ -431,22 +805,47 @@ fn render_report(summary: &Summary) -> String {
     ));
     out.push_str("## What changed\n\n");
     out.push_str(
-        "This artifact was generated by the XR60 fixed-prefix harness scaffold. The native DSpark FFI draft path is present, but this scaffold did not produce workload records, so no speed claim is made.\n\n",
+        "This artifact was generated by the XR60 fixed-prefix harness. When startup gates pass, records use native DSpark draft blocks and `gemma4_verify_tokens` commit/rollback semantics.\n\n",
     );
     out.push_str("## Correctness results\n\n");
-    out.push_str("No DSpark exactness records were measured because startup blockers fired before native drafting.\n\n");
+    if summary.records.iter().any(|record| record.measured) {
+        for record in &summary.records {
+            out.push_str(&format!(
+                "- {} block_size={}: exact={} baseline_sha={} dspark_sha={}\n",
+                record.workload_id,
+                record.scheduled_len,
+                record.exact,
+                record
+                    .baseline_token_sequence_sha256
+                    .as_deref()
+                    .unwrap_or("n/a"),
+                record
+                    .dspark_token_sequence_sha256
+                    .as_deref()
+                    .unwrap_or("n/a")
+            ));
+        }
+        out.push('\n');
+    } else {
+        out.push_str("No DSpark exactness records were measured because startup blockers fired before native drafting.\n\n");
+    }
     out.push_str("## Benchmark summary\n\n");
-    out.push_str("| workload | scheduler | block/max | exact | decode tok/s | speedup | acceptance | accepted/verify | draft ms | verify ms | peak GB | active KV bytes |\n");
+    out.push_str("| workload | scheduler | block/max | exact | decode tok/s | speedup | acceptance | accepted/verify | draft ms | verify fwd ms | peak GB | active KV bytes |\n");
     out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for record in &summary.records {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | n/a | n/a | {:.3} | {:.3} | n/a | n/a | n/a | n/a |\n",
+            "| {} | {} | {} | {} | {} | n/a | {:.3} | {:.3} | {} | {} | {} | {} |\n",
             record.workload_id,
             record.scheduler,
             record.scheduled_len,
             record.exact,
+            fmt_f64(record.decode_tokens_per_second),
             record.acceptance_rate,
-            record.accepted_tokens_per_verify
+            record.accepted_tokens_per_verify,
+            fmt_f64(record.draft_ms),
+            fmt_f64(record.verify_forward_ms),
+            fmt_f64(record.peak_memory_gb),
+            fmt_u64(record.active_kv_bytes)
         ));
     }
     out.push_str("\n## Hidden tap parity\n\n");
@@ -512,6 +911,15 @@ fn parse_usize_list(value: &str) -> Result<Vec<usize>, Box<dyn std::error::Error
         .collect()
 }
 
+fn parse_string_list(value: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 fn run_id() -> String {
     format!("xr60-{}", unix_now())
 }
@@ -525,6 +933,30 @@ fn unix_now() -> u64 {
 
 fn escape_md(value: &str) -> String {
     value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn tps(tokens: usize, total_ms: f64) -> f64 {
+    if total_ms <= 0.0 {
+        0.0
+    } else {
+        tokens as f64 / (total_ms / 1000.0)
+    }
+}
+
+fn fmt_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn fmt_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 #[allow(dead_code)]
