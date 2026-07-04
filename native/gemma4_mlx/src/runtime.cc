@@ -180,6 +180,7 @@ void remember_last_step(NativeKvCache* cache, const Gemma4StepResult* step) {
     cache->last_step.repair_clone_ms = 0.0;
     cache->last_step.repair_forward_ms = 0.0;
     cache->last_step.repair_fallback_ms = 0.0;
+    cache->last_step.decode_profile = Gemma4DecodeProfileInfo{};
     cache->has_last_step = true;
 }
 
@@ -806,7 +807,7 @@ Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_runtime_version requires a non-null out pointer");
     }
 
-    out->abi_version = 4;
+    out->abi_version = 5;
     out->backend_name = "gemma4_mlx";
     out->backend_version = kBackendVersion;
     return ok();

@@ -108,6 +108,20 @@ typedef struct Gemma4MtpTraceInfo {
     uint64_t sliding_attention_value_shape[GEMMA4_MTP_TRACE_MAX_RANK];
 } Gemma4MtpTraceInfo;
 
+typedef struct Gemma4DecodeProfileInfo {
+    uint32_t enabled;
+    uint32_t reserved0;
+    double reset_peak_memory_ms;
+    double forward_graph_ms;
+    double greedy_select_ms;
+    double target_top_k_ms;
+    double eval_sync_ms;
+    double hidden_view_ms;
+    double output_read_ms;
+    double peak_memory_read_ms;
+    double total_native_decode_ms;
+} Gemma4DecodeProfileInfo;
+
 typedef struct Gemma4StepResult {
     int32_t greedy_token;
     float greedy_logit;
@@ -126,6 +140,8 @@ typedef struct Gemma4StepResult {
     int32_t committed_tokens[GEMMA4_MTP_MAX_COMMITTED_TOKENS];
     /* Opaque view owned by the KV cache; valid until cache reset/free or next cache-advancing call. */
     void* native_last_hidden;
+    /* Env-gated decode-stage timings; populated only when GEMMA4D_NATIVE_DECODE_PROFILE is enabled. */
+    Gemma4DecodeProfileInfo decode_profile;
     /* Trace diagnostics populated by MTP verification; native prefill/decode may carry one target top-k step. */
     Gemma4MtpTraceInfo mtp_trace;
 } Gemma4StepResult;

@@ -9,7 +9,7 @@ use std::{
 };
 
 use gemma4d_bench::{CliError, manifest, workload_corpus::WorkloadRecord};
-use gemma4d_ffi::{KvCache, KvPolicy, LoadConfig, Target, decode_one, prefill};
+use gemma4d_ffi::{DecodeProfileInfo, KvCache, KvPolicy, LoadConfig, Target, decode_one, prefill};
 use gemma4d_tokenizer::sha256_hex;
 use serde::Serialize;
 
@@ -40,6 +40,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_REQUIRE_MLX",
     "GEMMA4D_USE_NATIVE_GRAPH",
     "GEMMA4D_NATIVE_DECODE_KV_EVAL",
+    "GEMMA4D_NATIVE_DECODE_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
 ];
@@ -53,6 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report_path = options.out_dir.join("report.md");
     let blockers_path = options.out_dir.join("blockers.md");
     let decision_path = options.out_dir.join("decision.md");
+    let profile_json_path = options.out_dir.join("profile.json");
+    let profile_report_path = options.out_dir.join("profile.md");
 
     let run_id = run_id();
     let git_sha =
@@ -97,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     apply_correctness_gates(&mut records);
     let aggregates = build_aggregates(&records);
+    let decode_profile = build_decode_profile(&records);
     let comparisons = build_comparisons(&aggregates, &variants);
     let failed_hypotheses = failed_hypotheses(&comparisons, &records);
     blockers.extend(blockers_for_records(&records, &variants));
@@ -129,6 +133,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report_path: report_path.display().to_string(),
         blockers_path: blockers_path.display().to_string(),
         decision_path: decision_path.display().to_string(),
+        profile_json_path: profile_json_path.display().to_string(),
+        profile_report_path: profile_report_path.display().to_string(),
         requested_trials: options.trials,
         max_new_tokens: options.max_new_tokens,
         steady_warmup_samples: STEADY_WARMUP_SAMPLES,
@@ -151,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|record| record.status != "passed")
             .count(),
         aggregates,
+        decode_profile,
         comparisons,
         failed_hypotheses,
         blockers,
@@ -160,13 +167,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             report_path.display().to_string(),
             blockers_path.display().to_string(),
             decision_path.display().to_string(),
+            profile_json_path.display().to_string(),
+            profile_report_path.display().to_string(),
         ],
         measurement_notes: vec![
             "all variants use the native graph with GEMMA4D_REQUIRE_MLX=1 and GEMMA4D_USE_NATIVE_GRAPH=1 before target load".to_owned(),
-            "decode_token_traces records the committed input token, output greedy token, position before/after decode_one, latency, active KV bytes, peak MLX memory, and eval-policy markers".to_owned(),
+            "decode_token_traces records the committed input token, output greedy token, position before/after decode_one, latency, active KV bytes, peak MLX memory, eval-policy markers, and optional GEMMA4D_NATIVE_DECODE_PROFILE stage timings".to_owned(),
             "baseline is native_decode_eval_per_layer, matching current native per-layer KV eval behavior".to_owned(),
             "steady decode statistics discard the first four decode_one samples when available, while raw p50/p95/p99 keep every decode sample".to_owned(),
             "acceptance requires candidate-wide correctness, memory below the cliff, reproduced baseline tail latency on the workload, p95 or p99 improvement, and no p50 regression over the goal gate".to_owned(),
+            "decode profile forward_graph_ms includes MLX graph construction plus decode KV append/cache mutation; rust_ffi_overhead_ms is host decode_one latency minus native total, clamped at zero".to_owned(),
         ],
     };
 
@@ -175,6 +185,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&report_path, render_report(&summary))?;
     fs::write(&blockers_path, render_blockers(&summary))?;
     fs::write(&decision_path, render_decision(&summary))?;
+    fs::write(
+        &profile_json_path,
+        serde_json::to_vec_pretty(&summary.decode_profile)?,
+    )?;
+    fs::write(&profile_report_path, render_profile_report(&summary))?;
 
     println!("XR06 native decode tail-latency A/B: {}", summary.decision);
     println!("records: {}", records_path.display());
@@ -182,6 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("report: {}", report_path.display());
     println!("blockers: {}", blockers_path.display());
     println!("decision: {}", decision_path.display());
+    println!("profile: {}", profile_report_path.display());
 
     if summary.decision == "blocked_with_evidence" {
         Err("XR06 benchmark blocked; see blockers.md".into())
@@ -302,6 +318,8 @@ struct Summary {
     report_path: String,
     blockers_path: String,
     decision_path: String,
+    profile_json_path: String,
+    profile_report_path: String,
     requested_trials: usize,
     max_new_tokens: usize,
     steady_warmup_samples: usize,
@@ -318,6 +336,7 @@ struct Summary {
     passed_records: usize,
     failed_records: usize,
     aggregates: Vec<Aggregate>,
+    decode_profile: DecodeProfileSummary,
     comparisons: Vec<Comparison>,
     failed_hypotheses: Vec<String>,
     blockers: Vec<String>,
@@ -448,6 +467,53 @@ struct TokenTrace {
     grouped_end_kv_eval_count: usize,
     logits_sync_after_decode: bool,
     mlx_synchronization_marker: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decode_profile: Option<DecodeProfileTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DecodeProfileTrace {
+    reset_peak_memory_ms: f64,
+    forward_graph_ms: f64,
+    greedy_select_ms: f64,
+    target_top_k_ms: f64,
+    eval_sync_ms: f64,
+    hidden_view_ms: f64,
+    output_read_ms: f64,
+    peak_memory_read_ms: f64,
+    total_native_decode_ms: f64,
+    rust_ffi_overhead_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DecodeProfileSummary {
+    schema_version: u32,
+    profile_env_key: String,
+    enabled_samples: usize,
+    total_decode_samples: usize,
+    aggregates: Vec<DecodeProfileAggregate>,
+    stage_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DecodeProfileAggregate {
+    variant: String,
+    workload_id: String,
+    sample_count: usize,
+    enabled_sample_count: usize,
+    latency_ms: Option<LatencyStats>,
+    reset_peak_memory_ms: Option<LatencyStats>,
+    forward_graph_ms: Option<LatencyStats>,
+    greedy_select_ms: Option<LatencyStats>,
+    target_top_k_ms: Option<LatencyStats>,
+    eval_sync_ms: Option<LatencyStats>,
+    hidden_view_ms: Option<LatencyStats>,
+    output_read_ms: Option<LatencyStats>,
+    peak_memory_read_ms: Option<LatencyStats>,
+    total_native_decode_ms: Option<LatencyStats>,
+    rust_ffi_overhead_ms: Option<LatencyStats>,
+    largest_stage_by_mean: Option<String>,
+    largest_stage_mean_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -640,6 +706,12 @@ fn native_variant_with_extra_env<const N: usize>(
         "GEMMA4D_NATIVE_DECODE_KV_EVAL".to_owned(),
         eval_policy.to_owned(),
     );
+    if let Ok(value) = std::env::var("GEMMA4D_NATIVE_DECODE_PROFILE") {
+        if !value.is_empty() {
+            config.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value.clone());
+            env.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value);
+        }
+    }
     for (key, value) in extra_env {
         config.insert(key.to_owned(), value.to_owned());
         env.insert(key.to_owned(), value.to_owned());
@@ -782,6 +854,7 @@ fn run_decode_record(
             Ok(next_step) => {
                 let latency_ms = duration_ms(token_started.elapsed());
                 step = next_step;
+                let decode_profile = decode_profile_trace(&step.decode_profile, latency_ms);
                 peak_mlx_gb = peak_mlx_gb.max(f64::from(step.peak_memory_gb));
                 rss_mb = rss_mb.max(f64::from(step.peak_rss_mb));
                 active_kv_bytes = active_kv_bytes.max(step.active_kv_bytes);
@@ -800,6 +873,7 @@ fn run_decode_record(
                     grouped_end_kv_eval_count: variant.grouped_end_kv_eval_count,
                     logits_sync_after_decode: variant.logits_sync_after_decode,
                     mlx_synchronization_marker: "decode_one_step_result_eval".to_owned(),
+                    decode_profile,
                 });
             }
             Err(error) => {
@@ -1151,6 +1225,152 @@ fn build_aggregates(records: &[Record]) -> Vec<Aggregate> {
         });
     }
     out
+}
+
+fn decode_profile_trace(
+    profile: &DecodeProfileInfo,
+    latency_ms: f64,
+) -> Option<DecodeProfileTrace> {
+    if !profile.enabled {
+        return None;
+    }
+    Some(DecodeProfileTrace {
+        reset_peak_memory_ms: profile.reset_peak_memory_ms,
+        forward_graph_ms: profile.forward_graph_ms,
+        greedy_select_ms: profile.greedy_select_ms,
+        target_top_k_ms: profile.target_top_k_ms,
+        eval_sync_ms: profile.eval_sync_ms,
+        hidden_view_ms: profile.hidden_view_ms,
+        output_read_ms: profile.output_read_ms,
+        peak_memory_read_ms: profile.peak_memory_read_ms,
+        total_native_decode_ms: profile.total_native_decode_ms,
+        rust_ffi_overhead_ms: (latency_ms - profile.total_native_decode_ms).max(0.0),
+    })
+}
+
+fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
+    let total_decode_samples = records
+        .iter()
+        .map(|record| record.decode_token_traces.len())
+        .sum::<usize>();
+    let enabled_samples = records
+        .iter()
+        .flat_map(|record| &record.decode_token_traces)
+        .filter(|trace| trace.decode_profile.is_some())
+        .count();
+    let keys = records
+        .iter()
+        .map(|record| (record.variant.clone(), record.workload_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut aggregates = Vec::new();
+    for (variant, workload_id) in keys {
+        let traces = records
+            .iter()
+            .filter(|record| record.variant == variant && record.workload_id == workload_id)
+            .flat_map(|record| record.decode_token_traces.iter())
+            .collect::<Vec<_>>();
+        let profiles = traces
+            .iter()
+            .filter_map(|trace| trace.decode_profile.as_ref())
+            .collect::<Vec<_>>();
+
+        let reset_peak_memory_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.reset_peak_memory_ms
+        }));
+        let forward_graph_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.forward_graph_ms
+        }));
+        let greedy_select_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.greedy_select_ms
+        }));
+        let target_top_k_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.target_top_k_ms
+        }));
+        let eval_sync_ms =
+            latency_stats(&profile_values(&profiles, |profile| profile.eval_sync_ms));
+        let hidden_view_ms =
+            latency_stats(&profile_values(&profiles, |profile| profile.hidden_view_ms));
+        let output_read_ms =
+            latency_stats(&profile_values(&profiles, |profile| profile.output_read_ms));
+        let peak_memory_read_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.peak_memory_read_ms
+        }));
+        let total_native_decode_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.total_native_decode_ms
+        }));
+        let rust_ffi_overhead_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.rust_ffi_overhead_ms
+        }));
+        let (largest_stage_by_mean, largest_stage_mean_ms) = largest_profile_stage_by_mean([
+            ("reset_peak_memory_ms", &reset_peak_memory_ms),
+            ("forward_graph_ms", &forward_graph_ms),
+            ("greedy_select_ms", &greedy_select_ms),
+            ("target_top_k_ms", &target_top_k_ms),
+            ("eval_sync_ms", &eval_sync_ms),
+            ("hidden_view_ms", &hidden_view_ms),
+            ("output_read_ms", &output_read_ms),
+            ("peak_memory_read_ms", &peak_memory_read_ms),
+            ("rust_ffi_overhead_ms", &rust_ffi_overhead_ms),
+        ]);
+
+        aggregates.push(DecodeProfileAggregate {
+            variant,
+            workload_id,
+            sample_count: traces.len(),
+            enabled_sample_count: profiles.len(),
+            latency_ms: latency_stats(
+                &traces
+                    .iter()
+                    .map(|trace| trace.latency_ms)
+                    .collect::<Vec<_>>(),
+            ),
+            reset_peak_memory_ms,
+            forward_graph_ms,
+            greedy_select_ms,
+            target_top_k_ms,
+            eval_sync_ms,
+            hidden_view_ms,
+            output_read_ms,
+            peak_memory_read_ms,
+            total_native_decode_ms,
+            rust_ffi_overhead_ms,
+            largest_stage_by_mean,
+            largest_stage_mean_ms,
+        });
+    }
+
+    DecodeProfileSummary {
+        schema_version: 1,
+        profile_env_key: "GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(),
+        enabled_samples,
+        total_decode_samples,
+        aggregates,
+        stage_notes: vec![
+            "forward_graph_ms includes decode_last_logits graph construction, layer execution setup, and KV append/cache mutation inside the native graph path".to_owned(),
+            "eval_sync_ms is the explicit MLX eval call on greedy token and max-logit arrays".to_owned(),
+            "output_read_ms covers scalar item reads for greedy token and greedy logit".to_owned(),
+            "rust_ffi_overhead_ms is host decode_one latency minus total_native_decode_ms, clamped at zero".to_owned(),
+            "profile timings are emitted only when GEMMA4D_NATIVE_DECODE_PROFILE is enabled before native target load".to_owned(),
+        ],
+    }
+}
+
+fn profile_values<F>(profiles: &[&DecodeProfileTrace], field: F) -> Vec<f64>
+where
+    F: Fn(&DecodeProfileTrace) -> f64,
+{
+    profiles.iter().map(|profile| field(profile)).collect()
+}
+
+fn largest_profile_stage_by_mean(
+    stages: [(&str, &Option<LatencyStats>); 9],
+) -> (Option<String>, Option<f64>) {
+    stages
+        .into_iter()
+        .filter_map(|(name, stats)| stats.as_ref().map(|stats| (name, stats.mean_ms)))
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(name, mean)| (Some(name.to_owned()), Some(mean)))
+        .unwrap_or((None, None))
 }
 
 fn build_comparisons(aggregates: &[Aggregate], variants: &[Variant]) -> Vec<Comparison> {
@@ -1650,6 +1870,10 @@ fn render_report(summary: &Summary) -> String {
         summary.max_p50_regression_percent,
         summary.memory_cliff_gb
     ));
+    out.push_str(&format!(
+        "- Decode profile samples: `{}` enabled of `{}` decode samples\n\n",
+        summary.decode_profile.enabled_samples, summary.decode_profile.total_decode_samples
+    ));
 
     out.push_str("## Aggregates\n\n");
     out.push_str("| Workload | Variant | Trials | Correct | Raw p50 | Raw p95 | Raw p99 | Raw max | Steady p50 | Peak MLX GB | Tail Reproduced | Low N |\n");
@@ -1691,6 +1915,49 @@ fn render_report(summary: &Summary) -> String {
             comparison.accepted,
             comparison.reason
         ));
+    }
+    out
+}
+
+fn render_profile_report(summary: &Summary) -> String {
+    let mut out = String::new();
+    out.push_str("# XR06 Native Decode Stage Profile\n\n");
+    out.push_str(&format!(
+        "- Profile env: `{}`\n",
+        summary.decode_profile.profile_env_key
+    ));
+    out.push_str(&format!(
+        "- Enabled samples: `{}` / `{}`\n",
+        summary.decode_profile.enabled_samples, summary.decode_profile.total_decode_samples
+    ));
+    out.push_str(&format!("- Records: `{}`\n\n", summary.record_count));
+
+    out.push_str("## Stage Aggregates\n\n");
+    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Eval sync mean | Greedy select mean | Hidden view mean | Output read mean | Peak read mean | Rust/FFI overhead mean | Largest stage |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    for aggregate in &summary.decode_profile.aggregates {
+        out.push_str(&format!(
+            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+            aggregate.workload_id,
+            aggregate.variant,
+            aggregate.enabled_sample_count,
+            aggregate.sample_count,
+            fmt_stats_mean(&aggregate.latency_ms),
+            fmt_stats_mean(&aggregate.total_native_decode_ms),
+            fmt_stats_mean(&aggregate.forward_graph_ms),
+            fmt_stats_mean(&aggregate.eval_sync_ms),
+            fmt_stats_mean(&aggregate.greedy_select_ms),
+            fmt_stats_mean(&aggregate.hidden_view_ms),
+            fmt_stats_mean(&aggregate.output_read_ms),
+            fmt_stats_mean(&aggregate.peak_memory_read_ms),
+            fmt_stats_mean(&aggregate.rust_ffi_overhead_ms),
+            aggregate.largest_stage_by_mean.as_deref().unwrap_or("n/a")
+        ));
+    }
+
+    out.push_str("\n## Notes\n\n");
+    for note in &summary.decode_profile.stage_notes {
+        out.push_str(&format!("- {note}\n"));
     }
     out
 }
@@ -1957,6 +2224,10 @@ fn fmt_opt(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.3}"))
         .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn fmt_stats_mean(stats: &Option<LatencyStats>) -> String {
+    fmt_opt(stats.as_ref().map(|stats| stats.mean_ms))
 }
 
 fn parse_csv(value: &str) -> Vec<String> {

@@ -92,6 +92,7 @@ struct NativeTextModel::Impl {
     size_t native_prefill_chunk_tokens = 0;
     bool native_prefill_policy_long_context_256 = false;
     bool experimental_skip_decode_peak_reset = false;
+    bool native_decode_profile = false;
 };
 
 struct NativeMtpAssistantModel::Impl {
@@ -136,6 +137,18 @@ bool experimental_mtp_real_margins_enabled() {
             std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
     }();
     return enabled;
+}
+
+bool native_decode_profile_env_enabled() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_DECODE_PROFILE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+        std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
+double profile_elapsed_ms(std::chrono::steady_clock::time_point started) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
 }
 
 #ifdef GEMMA4D_MLX_AVAILABLE
@@ -2973,6 +2986,7 @@ bool NativeTextModel::load(
         model->impl_->native_prefill_chunk_tokens = native_prefill_chunk_tokens_env();
         model->impl_->native_prefill_policy_long_context_256 =
             native_prefill_policy_long_context_256_env_enabled();
+        model->impl_->native_decode_profile = native_decode_profile_env_enabled();
         model->impl_->experimental_skip_decode_peak_reset =
             experimental_skip_decode_peak_reset_env_enabled();
 
@@ -3337,22 +3351,57 @@ bool NativeTextModel::decode_incremental(
             return false;
         }
 
-        if (!impl_->experimental_skip_decode_peak_reset) {
-            mlx::core::reset_peak_memory();
+        Gemma4DecodeProfileInfo decode_profile{};
+        const bool profile_enabled = impl_->native_decode_profile;
+        std::chrono::steady_clock::time_point profile_started;
+        if (profile_enabled) {
+            decode_profile.enabled = 1;
+            profile_started = std::chrono::steady_clock::now();
         }
+        if (!impl_->experimental_skip_decode_peak_reset) {
+            const auto reset_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point{};
+            mlx::core::reset_peak_memory();
+            if (profile_enabled) {
+                decode_profile.reset_peak_memory_ms = profile_elapsed_ms(reset_started);
+            }
+        }
+        const auto forward_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
         NativeForwardArrays forward = decode_last_logits(*impl_, token, kv_state->impl_.get());
+        if (profile_enabled) {
+            decode_profile.forward_graph_ms = profile_elapsed_ms(forward_started);
+        }
         array logits = std::move(forward.logits);
+        const auto select_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
         array greedy = mlx::core::argmax(logits);
         array max_logit =
             greedy_logit_for_vector_logits(logits, greedy, impl_->experimental_gather_greedy_logit);
+        if (profile_enabled) {
+            decode_profile.greedy_select_ms = profile_elapsed_ms(select_started);
+        }
         const bool real_margins = experimental_mtp_real_margins_enabled();
-        NativeTopKEntries computed_top_k = real_margins
-            ? top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K, true)
-            : empty_top_k_entries();
+        NativeTopKEntries computed_top_k = empty_top_k_entries();
+        if (real_margins) {
+            const auto top_k_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point{};
+            computed_top_k = top_k_for_flat_logits(logits, GEMMA4_MTP_TRACE_TOP_K, true);
+            if (profile_enabled) {
+                decode_profile.target_top_k_ms = profile_elapsed_ms(top_k_started);
+            }
+        }
+        const auto eval_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         mlx::core::eval({greedy, max_logit});
+        if (profile_enabled) {
+            decode_profile.eval_sync_ms = profile_elapsed_ms(eval_started);
+        }
 
         std::unique_ptr<NativeHiddenState> hidden;
         if (last_hidden != nullptr) {
+            const auto hidden_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                        : std::chrono::steady_clock::time_point{};
             std::unique_ptr<NativeHiddenState::Impl> hidden_impl(new NativeHiddenState::Impl{
                 std::move(forward.last_hidden),
                 std::move(forward.shared_kv.full_attention_key),
@@ -3363,13 +3412,26 @@ bool NativeTextModel::decode_incremental(
                 kHiddenSize,
             });
             hidden.reset(new NativeHiddenState(std::move(hidden_impl)));
+            if (profile_enabled) {
+                decode_profile.hidden_view_ms = profile_elapsed_ms(hidden_started);
+            }
         }
 
+        const auto output_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
         out->greedy_token = greedy.item<int>();
         out->greedy_logit = max_logit.item<float>();
+        if (profile_enabled) {
+            decode_profile.output_read_ms = profile_elapsed_ms(output_started);
+        }
         out->sequence_len = kv_state->sequence_len();
         out->active_kv_bytes = kv_state->active_bytes();
+        const auto peak_started = profile_enabled ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         out->peak_memory_gb = static_cast<float>(mlx::core::get_peak_memory()) / 1'000'000'000.0f;
+        if (profile_enabled) {
+            decode_profile.peak_memory_read_ms = profile_elapsed_ms(peak_started);
+        }
         out->peak_rss_mb = 0.0f;
         out->native_last_hidden = hidden.get();
         if (!real_margins) {
@@ -3381,6 +3443,10 @@ bool NativeTextModel::decode_incremental(
         }
         if (last_hidden != nullptr) {
             *last_hidden = std::move(hidden);
+        }
+        if (profile_enabled) {
+            decode_profile.total_native_decode_ms = profile_elapsed_ms(profile_started);
+            out->decode_profile = decode_profile;
         }
         return true;
     } catch (const std::exception& ex) {
