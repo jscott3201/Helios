@@ -113,6 +113,11 @@ typedef struct Gemma4DecodeProfileInfo {
     uint32_t reserved0;
     double reset_peak_memory_ms;
     double forward_graph_ms;
+    double decode_embedding_ms;
+    double layer_graph_ms;
+    double attention_kv_mutation_ms;
+    double deferred_kv_eval_ms;
+    double lm_head_ms;
     double greedy_select_ms;
     double target_top_k_ms;
     double eval_sync_ms;

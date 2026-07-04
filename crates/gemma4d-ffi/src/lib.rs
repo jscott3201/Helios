@@ -161,6 +161,11 @@ mod raw {
         pub reserved0: u32,
         pub reset_peak_memory_ms: f64,
         pub forward_graph_ms: f64,
+        pub decode_embedding_ms: f64,
+        pub layer_graph_ms: f64,
+        pub attention_kv_mutation_ms: f64,
+        pub deferred_kv_eval_ms: f64,
+        pub lm_head_ms: f64,
         pub greedy_select_ms: f64,
         pub target_top_k_ms: f64,
         pub eval_sync_ms: f64,
@@ -935,6 +940,11 @@ pub struct DecodeProfileInfo {
     pub enabled: bool,
     pub reset_peak_memory_ms: f64,
     pub forward_graph_ms: f64,
+    pub decode_embedding_ms: f64,
+    pub layer_graph_ms: f64,
+    pub attention_kv_mutation_ms: f64,
+    pub deferred_kv_eval_ms: f64,
+    pub lm_head_ms: f64,
     pub greedy_select_ms: f64,
     pub target_top_k_ms: f64,
     pub eval_sync_ms: f64,
@@ -950,6 +960,11 @@ impl DecodeProfileInfo {
             enabled: false,
             reset_peak_memory_ms: 0.0,
             forward_graph_ms: 0.0,
+            decode_embedding_ms: 0.0,
+            layer_graph_ms: 0.0,
+            attention_kv_mutation_ms: 0.0,
+            deferred_kv_eval_ms: 0.0,
+            lm_head_ms: 0.0,
             greedy_select_ms: 0.0,
             target_top_k_ms: 0.0,
             eval_sync_ms: 0.0,
@@ -1026,6 +1041,11 @@ fn decode_profile_from_raw(raw: &raw::Gemma4DecodeProfileInfo) -> DecodeProfileI
         enabled: true,
         reset_peak_memory_ms: raw.reset_peak_memory_ms,
         forward_graph_ms: raw.forward_graph_ms,
+        decode_embedding_ms: raw.decode_embedding_ms,
+        layer_graph_ms: raw.layer_graph_ms,
+        attention_kv_mutation_ms: raw.attention_kv_mutation_ms,
+        deferred_kv_eval_ms: raw.deferred_kv_eval_ms,
+        lm_head_ms: raw.lm_head_ms,
         greedy_select_ms: raw.greedy_select_ms,
         target_top_k_ms: raw.target_top_k_ms,
         eval_sync_ms: raw.eval_sync_ms,
@@ -1348,7 +1368,7 @@ mod tests {
     #[test]
     fn runtime_version_reports_smoke_backend() {
         let version = runtime_version().expect("runtime version should be available");
-        assert_eq!(version.abi_version, 5);
+        assert_eq!(version.abi_version, 6);
         assert_eq!(version.backend_name, "gemma4_mlx");
         assert!(version.backend_version.starts_with("m03-"));
     }
@@ -1361,13 +1381,13 @@ mod tests {
 
     #[test]
     fn decode_profile_raw_layout_stays_pinned() {
-        assert_eq!(std::mem::size_of::<raw::Gemma4DecodeProfileInfo>(), 80);
+        assert_eq!(std::mem::size_of::<raw::Gemma4DecodeProfileInfo>(), 120);
         assert_eq!(std::mem::align_of::<raw::Gemma4DecodeProfileInfo>(), 8);
     }
 
     #[test]
     fn step_result_raw_layout_stays_pinned() {
-        assert_eq!(std::mem::size_of::<raw::Gemma4StepResult>(), 1568);
+        assert_eq!(std::mem::size_of::<raw::Gemma4StepResult>(), 1608);
         assert_eq!(std::mem::align_of::<raw::Gemma4StepResult>(), 8);
         assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, greedy_token), 0);
         assert_eq!(
@@ -1390,7 +1410,7 @@ mod tests {
             std::mem::offset_of!(raw::Gemma4StepResult, decode_profile),
             160
         );
-        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, mtp_trace), 240);
+        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, mtp_trace), 280);
     }
 
     #[test]

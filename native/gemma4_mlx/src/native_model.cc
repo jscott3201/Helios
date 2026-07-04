@@ -502,8 +502,10 @@ bool eval_prefill_kv_at_end(PrefillKvEvalMode mode, bool full_attention) {
 
 DecodeKvEvalMode decode_kv_eval_mode() {
     const char* value = std::getenv("GEMMA4D_NATIVE_DECODE_KV_EVAL");
-    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "current") == 0 ||
-        std::strcmp(value, "per_layer") == 0) {
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "default") == 0) {
+        return DecodeKvEvalMode::EndOfDecode;
+    }
+    if (std::strcmp(value, "current") == 0 || std::strcmp(value, "per_layer") == 0) {
         return DecodeKvEvalMode::PerLayer;
     }
     if (std::strcmp(value, "end") == 0 || std::strcmp(value, "end_of_decode") == 0 ||
@@ -518,7 +520,7 @@ DecodeKvEvalMode decode_kv_eval_mode() {
         std::strcmp(value, "logits") == 0) {
         return DecodeKvEvalMode::DeferToLogits;
     }
-    return DecodeKvEvalMode::PerLayer;
+    return DecodeKvEvalMode::EndOfDecode;
 }
 
 bool eval_decode_kv_when_stored(DecodeKvEvalMode mode, bool full_attention) {
@@ -804,7 +806,8 @@ array target_attention_decode_forward(
     uint32_t layer_idx,
     uint64_t previous_sequence_len,
     NativeKvState::Impl::Layer* target_kv,
-    SharedKvArrays* shared_kv) {
+    SharedKvArrays* shared_kv,
+    Gemma4DecodeProfileInfo* decode_profile = nullptr) {
     if (target_kv == nullptr || !target_kv->key.has_value() || !target_kv->value.has_value()) {
         throw std::runtime_error("native incremental decode requires materialized per-layer KV state");
     }
@@ -823,6 +826,9 @@ array target_attention_decode_forward(
     queries = mlx::core::transpose(queries, {0, 2, 1, 3});
     queries = apply_rope(queries, full_attention, head_dim, static_cast<int>(previous_sequence_len));
 
+    const auto kv_mutation_started = decode_profile != nullptr
+                                         ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
     array keys = quantized_linear(impl, x, base + ".self_attn.k_proj");
     keys = mlx::core::reshape(keys, {1, 1, n_kv_heads, head_dim});
     array values = keys;
@@ -861,6 +867,9 @@ array target_attention_decode_forward(
         mlx::core::eval({*target_kv->key, *target_kv->value});
     }
     capture_shared_kv(shared_kv, layer_idx, full_attention, *target_kv->key, *target_kv->value);
+    if (decode_profile != nullptr) {
+        decode_profile->attention_kv_mutation_ms += profile_elapsed_ms(kv_mutation_started);
+    }
 
     array output = mlx::core::fast::scaled_dot_product_attention(
         queries,
@@ -988,7 +997,8 @@ array target_layer_decode_forward(
     uint32_t layer_idx,
     uint64_t previous_sequence_len,
     NativeKvState::Impl::Layer* target_kv,
-    SharedKvArrays* shared_kv) {
+    SharedKvArrays* shared_kv,
+    Gemma4DecodeProfileInfo* decode_profile = nullptr) {
     const std::string base = "language_model.model.layers." + std::to_string(layer_idx);
     const array residual = x;
 
@@ -996,7 +1006,14 @@ array target_layer_decode_forward(
         x,
         std::optional<array>(tensor_or_throw(impl, base + ".input_layernorm.weight")),
         1e-6f));
-    h = target_attention_decode_forward(impl, h, layer_idx, previous_sequence_len, target_kv, shared_kv);
+    h = target_attention_decode_forward(
+        impl,
+        h,
+        layer_idx,
+        previous_sequence_len,
+        target_kv,
+        shared_kv,
+        decode_profile);
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
@@ -1372,7 +1389,8 @@ NativeForwardArrays prefill_chunked_last_logits(
 NativeForwardArrays decode_last_logits(
     const NativeTextModel::Impl& impl,
     int32_t token,
-    NativeKvState::Impl* target_kv) {
+    NativeKvState::Impl* target_kv,
+    Gemma4DecodeProfileInfo* decode_profile = nullptr) {
     if (target_kv == nullptr || target_kv->sequence_len == 0 || target_kv->layers.size() != kTargetLayerCount) {
         throw std::runtime_error("native incremental decode requires a populated target KV cache");
     }
@@ -1382,10 +1400,19 @@ NativeForwardArrays decode_last_logits(
 
     const uint64_t previous_sequence_len = target_kv->sequence_len;
     std::vector<int32_t> ids = {token};
+    const auto embedding_started = decode_profile != nullptr
+                                       ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
     array token_ids(ids.begin(), {1, 1}, mlx::core::int32);
     array h = model_dtype(quantized_embedding(impl, token_ids) * model_scalar(std::sqrt(3840.0f)));
+    if (decode_profile != nullptr) {
+        decode_profile->decode_embedding_ms = profile_elapsed_ms(embedding_started);
+    }
     SharedKvArrays shared_kv;
 
+    const auto layers_started = decode_profile != nullptr
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
     for (uint32_t layer = 0; layer < kTargetLayerCount; ++layer) {
         h = target_layer_decode_forward(
             impl,
@@ -1393,15 +1420,31 @@ NativeForwardArrays decode_last_logits(
             layer,
             previous_sequence_len,
             &target_kv->layers[layer],
-            &shared_kv);
+            &shared_kv,
+            decode_profile);
     }
+    if (decode_profile != nullptr) {
+        decode_profile->layer_graph_ms = profile_elapsed_ms(layers_started);
+    }
+    const auto lm_head_started = decode_profile != nullptr
+                                     ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
     h = model_dtype(mlx::core::fast::rms_norm(
         h,
         std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
         1e-6f));
     array logits = target_logits_for_hidden(impl, h);
     logits = mlx::core::reshape(logits, {262144});
+    if (decode_profile != nullptr) {
+        decode_profile->lm_head_ms = profile_elapsed_ms(lm_head_started);
+    }
+    const auto deferred_kv_started = decode_profile != nullptr
+                                         ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
     eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    if (decode_profile != nullptr) {
+        decode_profile->deferred_kv_eval_ms = profile_elapsed_ms(deferred_kv_started);
+    }
     target_kv->sequence_len = previous_sequence_len + 1;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
     return NativeForwardArrays{std::move(logits), std::move(h), std::move(shared_kv)};
@@ -3368,7 +3411,11 @@ bool NativeTextModel::decode_incremental(
         }
         const auto forward_started = profile_enabled ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
-        NativeForwardArrays forward = decode_last_logits(*impl_, token, kv_state->impl_.get());
+        NativeForwardArrays forward = decode_last_logits(
+            *impl_,
+            token,
+            kv_state->impl_.get(),
+            profile_enabled ? &decode_profile : nullptr);
         if (profile_enabled) {
             decode_profile.forward_graph_ms = profile_elapsed_ms(forward_started);
         }

@@ -173,10 +173,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         measurement_notes: vec![
             "all variants use the native graph with GEMMA4D_REQUIRE_MLX=1 and GEMMA4D_USE_NATIVE_GRAPH=1 before target load".to_owned(),
             "decode_token_traces records the committed input token, output greedy token, position before/after decode_one, latency, active KV bytes, peak MLX memory, eval-policy markers, and optional GEMMA4D_NATIVE_DECODE_PROFILE stage timings".to_owned(),
-            "baseline is native_decode_eval_per_layer, matching current native per-layer KV eval behavior".to_owned(),
+            "baseline is explicit native_decode_eval_per_layer; native_decode_runtime_default leaves GEMMA4D_NATIVE_DECODE_KV_EVAL unset".to_owned(),
             "steady decode statistics discard the first four decode_one samples when available, while raw p50/p95/p99 keep every decode sample".to_owned(),
             "acceptance requires candidate-wide correctness, memory below the cliff, reproduced baseline tail latency on the workload, p95 or p99 improvement, and no p50 regression over the goal gate".to_owned(),
-            "decode profile forward_graph_ms includes MLX graph construction plus decode KV append/cache mutation; rust_ffi_overhead_ms is host decode_one latency minus native total, clamped at zero".to_owned(),
+            "decode profile forward_graph_ms is split into attention_kv_mutation_ms, deferred_kv_eval_ms, and derived non_kv_forward_graph_ms; rust_ffi_overhead_ms is host decode_one latency minus native total, clamped at zero".to_owned(),
         ],
     };
 
@@ -475,6 +475,12 @@ struct TokenTrace {
 struct DecodeProfileTrace {
     reset_peak_memory_ms: f64,
     forward_graph_ms: f64,
+    decode_embedding_ms: f64,
+    layer_graph_ms: f64,
+    attention_kv_mutation_ms: f64,
+    deferred_kv_eval_ms: f64,
+    lm_head_ms: f64,
+    non_kv_forward_graph_ms: f64,
     greedy_select_ms: f64,
     target_top_k_ms: f64,
     eval_sync_ms: f64,
@@ -504,6 +510,12 @@ struct DecodeProfileAggregate {
     latency_ms: Option<LatencyStats>,
     reset_peak_memory_ms: Option<LatencyStats>,
     forward_graph_ms: Option<LatencyStats>,
+    decode_embedding_ms: Option<LatencyStats>,
+    layer_graph_ms: Option<LatencyStats>,
+    attention_kv_mutation_ms: Option<LatencyStats>,
+    deferred_kv_eval_ms: Option<LatencyStats>,
+    lm_head_ms: Option<LatencyStats>,
+    non_kv_forward_graph_ms: Option<LatencyStats>,
     greedy_select_ms: Option<LatencyStats>,
     target_top_k_ms: Option<LatencyStats>,
     eval_sync_ms: Option<LatencyStats>,
@@ -610,6 +622,12 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             0,
             48,
         ),
+        native_default_variant(
+            "native_decode_runtime_default",
+            Some("native_decode_eval_per_layer"),
+            0,
+            48,
+        ),
         native_variant(
             "native_decode_eval_selective_full_attention",
             "selective_full_attention",
@@ -678,6 +696,43 @@ fn native_variant(
         grouped_end_kv_eval_count,
         [],
     )
+}
+
+fn native_default_variant(
+    name: &str,
+    baseline_variant: Option<&str>,
+    immediate_layer_kv_eval_count: usize,
+    grouped_end_kv_eval_count: usize,
+) -> Variant {
+    let mut config = BTreeMap::new();
+    config.insert("decode_kv_eval".to_owned(), "runtime_default".to_owned());
+    config.insert(
+        "immediate_layer_kv_eval_count".to_owned(),
+        immediate_layer_kv_eval_count.to_string(),
+    );
+    config.insert(
+        "grouped_end_kv_eval_count".to_owned(),
+        grouped_end_kv_eval_count.to_string(),
+    );
+    config.insert("logits_sync_after_decode".to_owned(), "true".to_owned());
+    let mut env = BTreeMap::new();
+    env.insert("GEMMA4D_REQUIRE_MLX".to_owned(), "1".to_owned());
+    env.insert("GEMMA4D_USE_NATIVE_GRAPH".to_owned(), "1".to_owned());
+    if let Ok(value) = std::env::var("GEMMA4D_NATIVE_DECODE_PROFILE")
+        && !value.is_empty()
+    {
+        config.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value.clone());
+        env.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value);
+    }
+    Variant {
+        name: name.to_owned(),
+        config,
+        env,
+        baseline_variant: baseline_variant.map(str::to_owned),
+        immediate_layer_kv_eval_count,
+        grouped_end_kv_eval_count,
+        logits_sync_after_decode: true,
+    }
 }
 
 fn native_variant_with_extra_env<const N: usize>(
@@ -1234,9 +1289,18 @@ fn decode_profile_trace(
     if !profile.enabled {
         return None;
     }
+    let non_kv_forward_graph_ms =
+        (profile.forward_graph_ms - profile.attention_kv_mutation_ms - profile.deferred_kv_eval_ms)
+            .max(0.0);
     Some(DecodeProfileTrace {
         reset_peak_memory_ms: profile.reset_peak_memory_ms,
         forward_graph_ms: profile.forward_graph_ms,
+        decode_embedding_ms: profile.decode_embedding_ms,
+        layer_graph_ms: profile.layer_graph_ms,
+        attention_kv_mutation_ms: profile.attention_kv_mutation_ms,
+        deferred_kv_eval_ms: profile.deferred_kv_eval_ms,
+        lm_head_ms: profile.lm_head_ms,
+        non_kv_forward_graph_ms,
         greedy_select_ms: profile.greedy_select_ms,
         target_top_k_ms: profile.target_top_k_ms,
         eval_sync_ms: profile.eval_sync_ms,
@@ -1280,6 +1344,21 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
         let forward_graph_ms = latency_stats(&profile_values(&profiles, |profile| {
             profile.forward_graph_ms
         }));
+        let decode_embedding_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.decode_embedding_ms
+        }));
+        let layer_graph_ms =
+            latency_stats(&profile_values(&profiles, |profile| profile.layer_graph_ms));
+        let attention_kv_mutation_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.attention_kv_mutation_ms
+        }));
+        let deferred_kv_eval_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.deferred_kv_eval_ms
+        }));
+        let lm_head_ms = latency_stats(&profile_values(&profiles, |profile| profile.lm_head_ms));
+        let non_kv_forward_graph_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.non_kv_forward_graph_ms
+        }));
         let greedy_select_ms = latency_stats(&profile_values(&profiles, |profile| {
             profile.greedy_select_ms
         }));
@@ -1303,7 +1382,11 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
         }));
         let (largest_stage_by_mean, largest_stage_mean_ms) = largest_profile_stage_by_mean([
             ("reset_peak_memory_ms", &reset_peak_memory_ms),
-            ("forward_graph_ms", &forward_graph_ms),
+            ("non_kv_forward_graph_ms", &non_kv_forward_graph_ms),
+            ("attention_kv_mutation_ms", &attention_kv_mutation_ms),
+            ("deferred_kv_eval_ms", &deferred_kv_eval_ms),
+            ("lm_head_ms", &lm_head_ms),
+            ("decode_embedding_ms", &decode_embedding_ms),
             ("greedy_select_ms", &greedy_select_ms),
             ("target_top_k_ms", &target_top_k_ms),
             ("eval_sync_ms", &eval_sync_ms),
@@ -1326,6 +1409,12 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             ),
             reset_peak_memory_ms,
             forward_graph_ms,
+            decode_embedding_ms,
+            layer_graph_ms,
+            attention_kv_mutation_ms,
+            deferred_kv_eval_ms,
+            lm_head_ms,
+            non_kv_forward_graph_ms,
             greedy_select_ms,
             target_top_k_ms,
             eval_sync_ms,
@@ -1346,7 +1435,11 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
         total_decode_samples,
         aggregates,
         stage_notes: vec![
-            "forward_graph_ms includes decode_last_logits graph construction, layer execution setup, and KV append/cache mutation inside the native graph path".to_owned(),
+            "forward_graph_ms is the parent native decode_last_logits bucket and should not be treated as a patch lane by itself".to_owned(),
+            "attention_kv_mutation_ms accumulates per-layer decode K/V projection, append/concat, sliding-window slice, target KV store, optional immediate KV eval, and shared-KV capture before attention".to_owned(),
+            "non_kv_forward_graph_ms is derived as forward_graph_ms - attention_kv_mutation_ms - deferred_kv_eval_ms and represents the remaining graph lane: embedding, non-KV layer work, final norm/LM head, and small native book-keeping".to_owned(),
+            "layer_graph_ms includes the full per-layer decode loop, including attention KV mutation and non-KV attention/MLP work".to_owned(),
+            "deferred_kv_eval_ms is the grouped end-of-decode KV eval path when the selected KV eval mode defers layer KV synchronization".to_owned(),
             "eval_sync_ms is the explicit MLX eval call on greedy token and max-logit arrays".to_owned(),
             "output_read_ms covers scalar item reads for greedy token and greedy logit".to_owned(),
             "rust_ffi_overhead_ms is host decode_one latency minus total_native_decode_ms, clamped at zero".to_owned(),
@@ -1362,8 +1455,8 @@ where
     profiles.iter().map(|profile| field(profile)).collect()
 }
 
-fn largest_profile_stage_by_mean(
-    stages: [(&str, &Option<LatencyStats>); 9],
+fn largest_profile_stage_by_mean<const N: usize>(
+    stages: [(&str, &Option<LatencyStats>); N],
 ) -> (Option<String>, Option<f64>) {
     stages
         .into_iter()
@@ -1933,11 +2026,11 @@ fn render_profile_report(summary: &Summary) -> String {
     out.push_str(&format!("- Records: `{}`\n\n", summary.record_count));
 
     out.push_str("## Stage Aggregates\n\n");
-    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Eval sync mean | Greedy select mean | Hidden view mean | Output read mean | Peak read mean | Rust/FFI overhead mean | Largest stage |\n");
-    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Non-KV graph mean | KV mutation mean | Deferred KV eval mean | LM head mean | Eval sync mean | Greedy select mean | Rust/FFI overhead mean | Largest stage |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for aggregate in &summary.decode_profile.aggregates {
         out.push_str(&format!(
-            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
             aggregate.workload_id,
             aggregate.variant,
             aggregate.enabled_sample_count,
@@ -1945,11 +2038,12 @@ fn render_profile_report(summary: &Summary) -> String {
             fmt_stats_mean(&aggregate.latency_ms),
             fmt_stats_mean(&aggregate.total_native_decode_ms),
             fmt_stats_mean(&aggregate.forward_graph_ms),
+            fmt_stats_mean(&aggregate.non_kv_forward_graph_ms),
+            fmt_stats_mean(&aggregate.attention_kv_mutation_ms),
+            fmt_stats_mean(&aggregate.deferred_kv_eval_ms),
+            fmt_stats_mean(&aggregate.lm_head_ms),
             fmt_stats_mean(&aggregate.eval_sync_ms),
             fmt_stats_mean(&aggregate.greedy_select_ms),
-            fmt_stats_mean(&aggregate.hidden_view_ms),
-            fmt_stats_mean(&aggregate.output_read_ms),
-            fmt_stats_mean(&aggregate.peak_memory_read_ms),
             fmt_stats_mean(&aggregate.rust_ffi_overhead_ms),
             aggregate.largest_stage_by_mean.as_deref().unwrap_or("n/a")
         ));

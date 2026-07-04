@@ -807,7 +807,7 @@ Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_runtime_version requires a non-null out pointer");
     }
 
-    out->abi_version = 5;
+    out->abi_version = 6;
     out->backend_name = "gemma4_mlx";
     out->backend_version = kBackendVersion;
     return ok();
