@@ -9,6 +9,7 @@ when XR57 real-margin/top-k records are provided.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import statistics
@@ -50,6 +51,18 @@ def load_jsonl(path: Path, *, required: bool) -> list[dict[str, Any]]:
     if required and not records:
         raise SystemExit(f"{path}: no records found")
     return records
+
+
+def expand_globs(patterns: list[str]) -> tuple[list[str], list[str]]:
+    paths: list[str] = []
+    missing: list[str] = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            missing.append(pattern)
+            continue
+        paths.extend(matches)
+    return paths, missing
 
 
 def parse_csv_ints(raw: str) -> list[int]:
@@ -609,6 +622,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-records", default=DEFAULT_CANDIDATE_RECORDS)
     parser.add_argument("--real-margin-records", action="append", default=[])
+    parser.add_argument("--real-margin-records-glob", action="append", default=[])
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
     parser.add_argument("--expected-blocks", default=",".join(str(v) for v in DEFAULT_BLOCKS))
     parser.add_argument(
@@ -633,13 +647,16 @@ def main() -> None:
     candidate_records = load_jsonl(candidate_path, required=True)
     real_margin_records: list[dict[str, Any]] = []
     missing_real_margin_paths: list[str] = []
-    for raw_path in args.real_margin_records:
+    glob_paths, missing_globs = expand_globs(args.real_margin_records_glob)
+    real_margin_paths = list(dict.fromkeys([*args.real_margin_records, *glob_paths]))
+    for raw_path in real_margin_paths:
         path = Path(raw_path)
         rows = load_jsonl(path, required=False)
         if rows:
             real_margin_records.extend(rows)
         else:
             missing_real_margin_paths.append(str(path))
+    missing_real_margin_paths.extend(f"glob did not match: {pattern}" for pattern in missing_globs)
 
     candidate_events = event_rows(candidate_records, "candidate")
     real_margin_events = event_rows(real_margin_records, "real_margin")
@@ -719,7 +736,8 @@ def main() -> None:
         "phase": "xr61_policy_search",
         "inputs": {
             "candidate_records": str(candidate_path),
-            "real_margin_records": args.real_margin_records,
+            "real_margin_records": real_margin_paths,
+            "real_margin_records_glob": args.real_margin_records_glob,
             "expected_blocks": blocks,
             "expected_real_margin_workloads": expected_real_margin_workloads,
             "min_real_margin_measured_records": args.min_real_margin_measured_records,
