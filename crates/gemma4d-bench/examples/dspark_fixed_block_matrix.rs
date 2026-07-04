@@ -7,8 +7,8 @@ use std::{
 
 use gemma4d_bench::{BuildProvenance, capture_build_provenance, manifest};
 use gemma4d_ffi::{
-    DSparkDraftBlock, DSparkDrafter, DSparkTapConfig, KvCache, KvPolicy, LoadConfig, Target,
-    decode_one, prefill, runtime_version, verify_tokens,
+    DSparkDraftBlock, DSparkDrafter, DSparkTapConfig, KvCache, KvPolicy, LoadConfig, StepResult,
+    Target, decode_one, prefill, runtime_version, verify_tokens,
 };
 use gemma4d_tokenizer::{file_sha256, sha256_hex};
 use serde::Serialize;
@@ -329,7 +329,26 @@ struct Record {
     draft_resident_bytes: Option<u64>,
     baseline_token_sequence_sha256: Option<String>,
     dspark_token_sequence_sha256: Option<String>,
+    verify_trace: Vec<VerifyTraceRecord>,
     auto_disable_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VerifyTraceRecord {
+    verify_index: usize,
+    scheduled_len: usize,
+    draft_tokens: Vec<i32>,
+    draft_logits: Vec<f32>,
+    draft_margins: Vec<f32>,
+    draft_confidence: Vec<f32>,
+    accepted_draft_count: u32,
+    committed_tokens: Vec<i32>,
+    target_tokens: Vec<i32>,
+    target_logits: Vec<f32>,
+    position_offsets: Vec<u64>,
+    draft_in_top_k: Vec<bool>,
+    target_top_token_ids: Vec<Vec<i32>>,
+    target_top_logits: Vec<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -379,6 +398,7 @@ struct NativeDSparkRun {
     peak_rss_mb: f32,
     active_kv_bytes: u64,
     hidden_tap_bytes: u64,
+    verify_trace: Vec<VerifyTraceRecord>,
 }
 
 fn inspect_dspark_config(draft_path: &Path) -> DsparkConfigInspection {
@@ -588,6 +608,7 @@ fn run_record(
         draft_resident_bytes: None,
         baseline_token_sequence_sha256: Some(checksum_tokens(&baseline.generated_tokens)),
         dspark_token_sequence_sha256: Some(checksum_tokens(&dspark.generated_tokens)),
+        verify_trace: dspark.verify_trace,
         auto_disable_reason: if exact {
             String::new()
         } else {
@@ -644,6 +665,7 @@ fn run_dspark(
     let mut accepted_draft_tokens = 0_usize;
     let mut target_verify_passes = 0_usize;
     let mut rollback_count = 0_usize;
+    let mut verify_trace = Vec::new();
 
     while generated.len() < probe.max_new_tokens {
         let remaining = probe.max_new_tokens - generated.len();
@@ -675,6 +697,12 @@ fn run_dspark(
         if usize::try_from(step.accepted_draft_count).unwrap_or(usize::MAX) < draft_tokens.len() {
             rollback_count += 1;
         }
+        verify_trace.push(verify_trace_record(
+            target_verify_passes - 1,
+            scheduled,
+            &draft,
+            &step,
+        ));
         let committed = step.committed_tokens();
         if committed.is_empty() {
             return Err("gemma4_verify_tokens committed no tokens".into());
@@ -703,6 +731,7 @@ fn run_dspark(
         peak_rss_mb,
         active_kv_bytes,
         hidden_tap_bytes,
+        verify_trace,
     })
 }
 
@@ -772,9 +801,34 @@ fn blocked_records(args: &Args, run_id: &str, blockers: &[String]) -> Vec<Record
             draft_resident_bytes: None,
             baseline_token_sequence_sha256: None,
             dspark_token_sequence_sha256: None,
+            verify_trace: Vec::new(),
             auto_disable_reason: reason.clone(),
         })
         .collect()
+}
+
+fn verify_trace_record(
+    verify_index: usize,
+    scheduled_len: usize,
+    draft: &DSparkDraftBlock,
+    step: &StepResult,
+) -> VerifyTraceRecord {
+    VerifyTraceRecord {
+        verify_index,
+        scheduled_len,
+        draft_tokens: draft.tokens.iter().map(|token| token.token).collect(),
+        draft_logits: draft.tokens.iter().map(|token| token.logit).collect(),
+        draft_margins: draft.tokens.iter().map(|token| token.margin).collect(),
+        draft_confidence: draft.tokens.iter().map(|token| token.confidence).collect(),
+        accepted_draft_count: step.accepted_draft_count,
+        committed_tokens: step.committed_tokens().to_vec(),
+        target_tokens: step.mtp_trace.target_tokens.clone(),
+        target_logits: step.mtp_trace.target_logits.clone(),
+        position_offsets: step.mtp_trace.position_offsets.clone(),
+        draft_in_top_k: step.mtp_trace.draft_in_top_k.clone(),
+        target_top_token_ids: step.mtp_trace.top_token_ids.clone(),
+        target_top_logits: step.mtp_trace.top_logits.clone(),
+    }
 }
 
 fn render_report(summary: &Summary) -> String {
@@ -847,6 +901,29 @@ fn render_report(summary: &Summary) -> String {
             fmt_f64(record.peak_memory_gb),
             fmt_u64(record.active_kv_bytes)
         ));
+    }
+    out.push_str("\n## Verify trace\n\n");
+    if summary
+        .records
+        .iter()
+        .any(|record| !record.verify_trace.is_empty())
+    {
+        for record in &summary.records {
+            if let Some(first_trace) = record.verify_trace.first() {
+                out.push_str(&format!(
+                    "- {} block_size={}: first_draft={:?} target={:?} committed={:?} draft_in_top_k={:?}\n",
+                    record.workload_id,
+                    record.scheduled_len,
+                    first_trace.draft_tokens,
+                    first_trace.target_tokens,
+                    first_trace.committed_tokens,
+                    first_trace.draft_in_top_k
+                ));
+            }
+        }
+        out.push('\n');
+    } else {
+        out.push_str("No verifier trace records were emitted.\n\n");
     }
     out.push_str("\n## Hidden tap parity\n\n");
     out.push_str("Not measured. Required target tap ids are `[5, 17, 29, 41, 46]`.\n\n");

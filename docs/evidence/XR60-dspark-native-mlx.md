@@ -256,6 +256,64 @@ checkpoint path can execute and that the verifier preserves exact output, but
 the drafter output or decoder math still needs reference parity diagnosis before
 any promotion or broader benchmark claim.
 
+## Native Verify Trace Slice
+
+The PyTorch/DeepSpec fixture path was rerun with the checkpoint present:
+
+```text
+python3 tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures --prompt-token-ids 9259 --allow-blocked
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/manifest.json
+benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/blockers.md
+```
+
+The manifest confirms the DSpark checkpoint and config are present and valid,
+but the local Python environment is missing `torch`, `safetensors`,
+`transformers`, and an importable `deepspec` package. The DeepSpec/PyTorch
+reference fixture remains blocked on those dependencies.
+
+To make progress while that external fixture is gated, the native benchmark
+record schema now includes `verify_trace` entries with DSpark draft
+tokens/logits/margins/confidence and the verifier target tokens/top-k/committed
+tokens. A one-token trace smoke was run:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/trace-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/trace-smoke/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/trace-smoke/summary.json
+benchmarks/out/XR60-dspark-native-mlx/trace-smoke/report.md
+benchmarks/out/XR60-dspark-native-mlx/trace-smoke/blockers.md
+benchmarks/out/XR60-dspark-native-mlx/trace-smoke/decision.md
+```
+
+Result:
+
+- decision: `keep_disabled_pending_broader_evidence`
+- exactness: passed through verifier fallback
+- DSpark draft token: `236764`
+- DSpark draft logit/margin/confidence: `14.375`, `1.1875`, `0.3828125`
+- target greedy token: `236772`
+- committed token: `236772`
+- accepted draft count: `0`
+- draft in target top-k trace: `false`
+- draft time: `6401.496` ms
+- verify forward time: `18763.262` ms
+- peak memory: `13.564` GB
+
+This local trace narrows the zero-acceptance symptom to a first-token draft
+mismatch on the smoke prompt. It does not replace the required DeepSpec/PyTorch
+fixture, but it gives the next parity pass concrete token/logit values to
+compare against reference DSpark output.
+
 ## Verification
 
 Commands run:
@@ -270,6 +328,8 @@ GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --lib --no-run
 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2,4,7 --max-new-tokens 32
 GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1,2,4,7 --max-new-tokens 2
+python3 tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures --prompt-token-ids 9259 --allow-blocked
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/trace-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
 ```
 
 Observed result:
@@ -288,6 +348,14 @@ Observed result:
   with decision `keep_disabled_pending_broader_evidence`. Exactness passed on
   `hello_smoke` for fixed-prefix block sizes `1,2,4,7`, but acceptance was `0.0`
   and throughput was `0.019` to `0.029` tok/s.
+- The reference fixture command wrote blocked artifacts under
+  `benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/` with valid
+  checkpoint/config identity and blockers for missing `torch`, `safetensors`,
+  `transformers`, and `deepspec`.
+- The trace smoke wrote
+  `benchmarks/out/XR60-dspark-native-mlx/trace-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
+  Its first DSpark token was `236764`, target greedy was `236772`, accepted
+  draft count was `0`, and the draft token was not in the target top-k trace.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
