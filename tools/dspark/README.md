@@ -62,6 +62,33 @@ margin is a derived top1-minus-top2 diagnostic. Target token mismatch is
 reported separately so zero acceptance can be distinguished from native DSpark
 decoder mismatch.
 
+## Target Distribution Diagnosis
+
+Run the fixed-prefix benchmark with target top-k tracing enabled, then summarize
+whether DSpark draft tokens appear in the verifier target distribution:
+
+```bash
+GEMMA4D_REQUIRE_MLX=1 \
+GEMMA4D_USE_NATIVE_GRAPH=1 \
+GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 \
+cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- \
+  --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk \
+  --model-path artifacts/models/gemma-4-12B-it-4bit \
+  --draft-path artifacts/drafts/dspark-gemma4-12b-block7 \
+  --workloads hello_smoke,hello_reference_prefix \
+  --block-sizes 1,2,4,7 \
+  --max-new-tokens 3
+
+python3 tools/dspark/analyze_target_distribution.py \
+  --records benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/records.jsonl \
+  --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis
+```
+
+This writes `target_distribution_report.json`, `report.md`, and `blockers.md`.
+When draft tokens are outside target top-k, the report records a conservative
+lower bound on the target top-1-to-draft logit gap using the lowest observed
+top-k logit.
+
 ## MLX Conversion Manifest
 
 ```bash

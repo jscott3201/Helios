@@ -67,6 +67,7 @@ DeepSpec semantics from the pinned source:
 - `tools/dspark/convert_to_mlx.py`
 - `tools/dspark/compare_mlx_parity.py`
 - `tools/dspark/compare_native_trace.py`
+- `tools/dspark/analyze_target_distribution.py`
 - `tools/dspark/README.md`
 - `crates/gemma4d-bench/examples/dspark_fixed_block_matrix.rs`
 
@@ -631,6 +632,67 @@ trace of both bounded workloads. The zero-acceptance symptom remains because
 the released DSpark drafter predicts a different continuation than the local
 Helios 4-bit target verifies.
 
+## Target Distribution Diagnosis
+
+The warm-start matrix was rerun with target top-k tracing enabled to quantify
+how far DSpark drafts are from the verifier target distribution.
+
+Benchmark command:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 3
+```
+
+Analysis command:
+
+```text
+python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/summary.json
+benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/report.md
+benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis/target_distribution_report.json
+benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis/report.md
+benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis/blockers.md
+```
+
+Result:
+
+- benchmark status: `passed`
+- benchmark decision: `keep_disabled_pending_broader_evidence`
+- diagnosis status: `passed`
+- diagnosis:
+  `released_dspark_drafts_outside_target_top_k_on_measured_corpus`
+- measured records: `8`
+- target top-k width: `5`
+- observations: `22`
+- accepted observations: `0`
+- draft-in-target-top-k count: `0`
+- draft-in-target-top-k rate: `0.0`
+- outside-top-k lower-bound gap min/median/max:
+  `2.625` / `2.6875` / `4.3125`
+- draft confidence min/median/max:
+  `0.14453125` / `0.21875` / `0.64453125`
+- `hello_smoke` unique draft tokens: `[735, 236745, 236766]`
+- `hello_smoke` unique target tokens: `[236761, 236772]`
+- `hello_reference_prefix` unique draft tokens: `[107, 602, 236829]`
+- `hello_reference_prefix` unique target tokens: `[236772, 236779]`
+
+The lower-bound gap uses the target top-1 logit minus the lowest observed
+target top-5 logit when the DSpark draft token is not in target top-5. This is a
+conservative lower bound: the draft token's actual target-rank logit is lower
+than the top-5 floor.
+
+Interpretation: for the measured bounded corpus, zero acceptance is explained
+by DSpark drafts landing outside the local 4-bit target's top-5 distribution,
+not by native DSpark decoder mismatch against DeepSpec. This supports keeping
+DSpark default-off and shifts the next experiment toward broader prompt/context
+selection or BF16-vs-4-bit target distribution comparison.
+
 ## Verification
 
 Commands run:
@@ -668,6 +730,8 @@ python3 tools/dspark/compare_native_trace.py --reference benchmarks/out/XR60-dsp
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/tap-snapshot-warm-corpus --native-tap-snapshot-dir benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1 --max-new-tokens 1
 PYTHONPATH=artifacts/reference/DeepSpec artifacts/envs/dspark-reference/bin/python tools/dspark/export_reference_fixture.py --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --revision 2fa72e765eec2965fc4d86a8663ce6769eba6218 --native-tap-manifest benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-warm-corpus/native_tap_snapshot_manifest.json --out-dir benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus --prompt-token-ids 9259
 python3 tools/dspark/compare_native_trace.py --reference benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus/reference_fixture.json --records benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-warm-corpus --margin-tolerance 0.5
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 3
+python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis
 ```
 
 Observed result:
@@ -726,6 +790,11 @@ Observed result:
   all 8 warm-start matrix records for `hello_smoke` and
   `hello_reference_prefix`; selected Markov logits, confidence, and margins
   were within configured tolerances, but verifier target prefixes still differed.
+- The target-distribution diagnosis wrote
+  `benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/` and
+  `benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis/`.
+  With target top-5 tracing enabled, all 22 observed DSpark draft positions were
+  outside the verifier target top-5 and accepted draft count stayed at zero.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
@@ -741,15 +810,15 @@ Observed result:
 - The available native benchmark target is a 4-bit affine MLX artifact, while
   the released DSpark checkpoint is BF16 and target-compatible only after hidden
   tap parity is proven.
-- Runtime evidence still has zero draft acceptance and severe latency, so DSpark
-  must remain default-off.
+- Runtime evidence still has zero draft acceptance, draft tokens are outside the
+  verifier target top-5 on the bounded corpus, and severe latency remains, so
+  DSpark must remain default-off.
 - Broader real-context workload evidence is still missing.
 
 ## Next Slice
 
-Quantify the remaining target-distribution mismatch: add more native-tap
-fixtures for real-context/code workloads and later decode positions, then
-measure whether the released BF16 DSpark checkpoint is broadly incompatible
-with the local 4-bit target distribution or only poor on the current prompt
-selection. Keep DSpark default-off until acceptance and speed improve with
-exactness preserved.
+Broaden the target-distribution diagnosis to real-context/code workloads and
+later decode positions. If DSpark drafts stay outside target top-k, compare a
+BF16 target reference or choose an operator decision between calibration,
+small-domain finetuning, or rejecting XR60 for the local 4-bit target. Keep
+DSpark default-off until acceptance and speed improve with exactness preserved.
