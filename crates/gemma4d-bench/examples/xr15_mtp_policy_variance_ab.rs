@@ -126,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assistant_identity,
         tokenizer_backend,
         source_replay_summary_path: args.source_replay_path.display().to_string(),
+        allow_missing_source_replay: args.allow_missing_source_replay,
         source_replay_sha256,
         source_replay_run_id: source_replay
             .as_ref()
@@ -210,6 +211,7 @@ struct Args {
     assistant_model_path: PathBuf,
     python: PathBuf,
     source_replay_path: PathBuf,
+    allow_missing_source_replay: bool,
     trials: usize,
     warmups: usize,
     max_new_tokens: usize,
@@ -238,6 +240,7 @@ impl Args {
             assistant_model_path: PathBuf::from(DEFAULT_ASSISTANT_MODEL),
             python: PathBuf::from(DEFAULT_PYTHON),
             source_replay_path: PathBuf::from(DEFAULT_SOURCE_REPLAY),
+            allow_missing_source_replay: false,
             trials: DEFAULT_TRIALS,
             warmups: DEFAULT_WARMUPS,
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
@@ -274,6 +277,7 @@ impl Args {
                     out.source_replay_path =
                         PathBuf::from(required_value(&mut args, "--source-replay")?)
                 }
+                "--allow-missing-source-replay" => out.allow_missing_source_replay = true,
                 "--trials" => {
                     out.trials =
                         parse_positive_usize(&required_value(&mut args, "--trials")?, "--trials")?
@@ -412,6 +416,7 @@ struct Summary {
     assistant_identity: manifest::ArtifactIdentity,
     tokenizer_backend: String,
     source_replay_summary_path: String,
+    allow_missing_source_replay: bool,
     source_replay_sha256: String,
     source_replay_run_id: String,
     source_replay_decision: String,
@@ -1832,13 +1837,13 @@ fn startup_blockers(args: &Args, source_replay: &Option<SourceReplaySummary>) ->
             args.python.display()
         ));
     }
-    if !args.source_replay_path.exists() {
+    if !args.source_replay_path.exists() && !args.allow_missing_source_replay {
         blockers.push(format!(
             "source replay summary does not exist: {}",
             args.source_replay_path.display()
         ));
     }
-    if source_replay.is_none() {
+    if source_replay.is_none() && !args.allow_missing_source_replay {
         blockers.push("source replay summary could not be parsed".to_owned());
     }
     if env::var_os("GEMMA4D_USE_NATIVE_GRAPH").is_none() {
@@ -1930,6 +1935,10 @@ fn render_report(summary: &Summary) -> String {
     out.push_str(&format!(
         "| Source replay | `{}` (`{}`) |\n",
         summary.source_replay_run_id, summary.source_replay_decision
+    ));
+    out.push_str(&format!(
+        "| Allow missing source replay | `{}` |\n",
+        summary.allow_missing_source_replay
     ));
     out.push_str(&format!("| Records | `{}` |\n", summary.record_count));
     out.push_str(&format!(
@@ -2135,7 +2144,7 @@ where
 
 fn usage() -> String {
     format!(
-        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-policy xr61-real-margin-v1] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
+        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--allow-missing-source-replay] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-policy xr61-real-margin-v1] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
     )
 }
 
