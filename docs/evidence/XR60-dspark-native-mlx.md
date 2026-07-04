@@ -693,6 +693,76 @@ not by native DSpark decoder mismatch against DeepSpec. This supports keeping
 DSpark default-off and shifts the next experiment toward broader prompt/context
 selection or BF16-vs-4-bit target distribution comparison.
 
+## Real-Context Target Distribution Diagnosis
+
+The target-distribution diagnosis now has a real-context token workload path.
+`tools/dspark/export_token_workloads.py` validates prompt SHA-256 and local
+Gemma tokenizer counts against `benchmarks/workloads/real-contexts/workloads.jsonl`,
+then writes JSONL token records consumed directly by the Rust fixed-prefix
+harness through `--token-workloads`.
+
+Token export command:
+
+```text
+artifacts/envs/dspark-reference/bin/python tools/dspark/export_token_workloads.py --workloads chat_short_1k_001,mtp_candidate_1k_001 --out benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl
+```
+
+Benchmark command:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-topk --token-workloads benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl --workloads chat_short_1k_001,mtp_candidate_1k_001 --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2 --max-new-tokens 3
+```
+
+Analysis command:
+
+```text
+python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/real-context-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl
+benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.manifest.json
+benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.blockers.md
+benchmarks/out/XR60-dspark-native-mlx/real-context-topk/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/real-context-topk/summary.json
+benchmarks/out/XR60-dspark-native-mlx/real-context-topk/report.md
+benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution/target_distribution_report.json
+benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution/report.md
+benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution/blockers.md
+```
+
+Result:
+
+- token export status: `passed`
+- token export workloads: `chat_short_1k_001`, `mtp_candidate_1k_001`
+- benchmark status: `passed`
+- benchmark decision: `keep_disabled_pending_broader_evidence`
+- measured records: `4`
+- exact records: `4`
+- scheduled lengths: `[1, 2]`
+- diagnosis status: `passed`
+- diagnosis: `some_drafts_align_with_target_distribution`
+- observations: `9`
+- accepted observations: `4`
+- accepted observation rate: `0.4444444444444444`
+- draft-in-target-top-k count: `8`
+- draft-in-target-top-k rate: `0.8888888888888888`
+- outside-top-k lower-bound gap min/median/max:
+  `7.375` / `7.375` / `7.375`
+- `chat_short_1k_001`: `5` observations, `0` accepted, `4/5` draft
+  positions in target top-5
+- `mtp_candidate_1k_001`: `4` observations, `4` accepted, `4/4` draft
+  positions in target top-5
+
+Interpretation: the real-context pair does not support the earlier blanket
+"outside target top-k" finding from the bounded toy prefixes. The released
+DSpark checkpoint aligns with the local 4-bit target on the MTP-shaped 1K
+prompt, while the chat-shaped 1K prompt still has zero accepted drafts. DSpark
+remains default-off because this is a narrow two-workload slice, latency is
+still severe, and code/4K/later-decode coverage is not yet measured.
+
 ## Verification
 
 Commands run:
@@ -732,6 +802,11 @@ PYTHONPATH=artifacts/reference/DeepSpec artifacts/envs/dspark-reference/bin/pyth
 python3 tools/dspark/compare_native_trace.py --reference benchmarks/out/XR60-dspark-native-mlx/01-reference-fixtures/native-warm-corpus/reference_fixture.json --records benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/03-mlx-parity/native-warm-corpus --margin-tolerance 0.5
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 3
 python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/target-distribution-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis
+python3 -m py_compile tools/dspark/export_token_workloads.py
+cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
+artifacts/envs/dspark-reference/bin/python tools/dspark/export_token_workloads.py --workloads chat_short_1k_001,mtp_candidate_1k_001 --out benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-topk --token-workloads benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl --workloads chat_short_1k_001,mtp_candidate_1k_001 --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2 --max-new-tokens 3
+python3 tools/dspark/analyze_target_distribution.py --records benchmarks/out/XR60-dspark-native-mlx/real-context-topk/records.jsonl --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution
 ```
 
 Observed result:
@@ -795,6 +870,16 @@ Observed result:
   `benchmarks/out/XR60-dspark-native-mlx/target-distribution-diagnosis/`.
   With target top-5 tracing enabled, all 22 observed DSpark draft positions were
   outside the verifier target top-5 and accepted draft count stayed at zero.
+- The real-context token workload export wrote
+  `benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl`
+  plus a passed manifest/blockers pair for `chat_short_1k_001` and
+  `mtp_candidate_1k_001`.
+- The real-context target-distribution diagnosis wrote
+  `benchmarks/out/XR60-dspark-native-mlx/real-context-topk/` and
+  `benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution/`.
+  All 4 measured records were exact. `mtp_candidate_1k_001` accepted all 4
+  observed draft positions, while `chat_short_1k_001` accepted 0/5 observed
+  positions.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
@@ -805,20 +890,21 @@ Observed result:
 - Full target-hidden parity against a PyTorch BF16 target is not measured; the
   current fixture uses Helios native 4-bit target taps as DeepSpec input.
 - Native DSpark decoder math is parity-verified only for the first warm-start
-  traces of `hello_smoke` and `hello_reference_prefix`, not for a real-context
-  fixture corpus or later decode positions.
+  traces of `hello_smoke` and `hello_reference_prefix`, not for a broad
+  real-context fixture corpus or later decode positions.
 - The available native benchmark target is a 4-bit affine MLX artifact, while
   the released DSpark checkpoint is BF16 and target-compatible only after hidden
   tap parity is proven.
-- Runtime evidence still has zero draft acceptance, draft tokens are outside the
-  verifier target top-5 on the bounded corpus, and severe latency remains, so
-  DSpark must remain default-off.
-- Broader real-context workload evidence is still missing.
+- The toy-prefix corpus still has zero draft acceptance, while the bounded
+  real-context pair is mixed. Severe latency and insufficient workload coverage
+  remain, so DSpark must remain default-off.
+- Broader code/4K/later-decode real-context workload evidence is still missing.
 
 ## Next Slice
 
-Broaden the target-distribution diagnosis to real-context/code workloads and
-later decode positions. If DSpark drafts stay outside target top-k, compare a
-BF16 target reference or choose an operator decision between calibration,
-small-domain finetuning, or rejecting XR60 for the local 4-bit target. Keep
-DSpark default-off until acceptance and speed improve with exactness preserved.
+Broaden the token-workload diagnosis to `code_review_rust_4k_001`,
+`mtp_candidate_4k_001`, and later decode positions. If acceptance stays
+domain-shaped or unstable, compare a BF16 target reference or choose an operator
+decision between calibration, small-domain finetuning, or rejecting XR60 for the
+local 4-bit target. Keep DSpark default-off until acceptance and speed improve
+with exactness preserved.

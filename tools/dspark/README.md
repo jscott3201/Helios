@@ -89,6 +89,35 @@ When draft tokens are outside target top-k, the report records a conservative
 lower bound on the target top-1-to-draft logit gap using the lowest observed
 top-k logit.
 
+For real-context workloads, export tokenizer IDs from the repo workload
+manifest first, then pass the generated JSONL to the same Rust harness:
+
+```bash
+artifacts/envs/dspark-reference/bin/python tools/dspark/export_token_workloads.py \
+  --workloads chat_short_1k_001,mtp_candidate_1k_001 \
+  --out benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl
+
+GEMMA4D_REQUIRE_MLX=1 \
+GEMMA4D_USE_NATIVE_GRAPH=1 \
+GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 \
+cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- \
+  --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-topk \
+  --token-workloads benchmarks/out/XR60-dspark-native-mlx/real-context-token-workloads.jsonl \
+  --workloads chat_short_1k_001,mtp_candidate_1k_001 \
+  --model-path artifacts/models/gemma-4-12B-it-4bit \
+  --draft-path artifacts/drafts/dspark-gemma4-12b-block7 \
+  --block-sizes 1,2 \
+  --max-new-tokens 3
+
+python3 tools/dspark/analyze_target_distribution.py \
+  --records benchmarks/out/XR60-dspark-native-mlx/real-context-topk/records.jsonl \
+  --out-dir benchmarks/out/XR60-dspark-native-mlx/real-context-target-distribution
+```
+
+The token exporter fails closed on prompt SHA-256 and token-count mismatches
+against `benchmarks/workloads/real-contexts/workloads.jsonl`, unless
+`--allow-mismatch` is set for diagnostic-only output.
+
 ## MLX Conversion Manifest
 
 ```bash

@@ -11,7 +11,7 @@ use gemma4d_ffi::{
     Target, decode_one, prefill, runtime_version, verify_tokens,
 };
 use gemma4d_tokenizer::{file_sha256, sha256_hex};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const GOAL: &str = "XR60-dspark-native-mlx";
 const MODE: &str = "native_dspark_fixed_block_matrix";
@@ -42,6 +42,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut blockers = startup_blockers(&args, &draft_config);
     let mut records = Vec::new();
     let mut native_tap_snapshots = Vec::new();
+    let probes = match probes(&args) {
+        Ok(probes) => probes,
+        Err(err) => {
+            blockers.push(format!("XR60 workload loading failed: {err}"));
+            Vec::new()
+        }
+    };
+    let selected_workload_ids = if args.workload_ids.is_empty() {
+        probes.iter().map(|probe| probe.id.clone()).collect()
+    } else {
+        args.workload_ids.clone()
+    };
     if blockers.is_empty() {
         eprintln!("XR60 DSpark loading target: {}", args.model_path.display());
         match Target::load(&target_config(&args)) {
@@ -50,10 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("XR60 DSpark loading drafter: {}", args.draft_path.display());
                     match DSparkDrafter::load(&dspark_config(&args), &target) {
                         Ok(drafter) => {
-                            for probe in probes(args.max_new_tokens, &args.workload_ids) {
+                            for probe in &probes {
                                 if args.native_tap_snapshot_dir.is_some() {
-                                    match dump_native_tap_snapshot(&target, &args, &run_id, &probe)
-                                    {
+                                    match dump_native_tap_snapshot(&target, &args, &run_id, probe) {
                                         Ok(snapshot) => native_tap_snapshots.push(snapshot),
                                         Err(err) => blockers.push(format!(
                                             "{} native tap snapshot failed: {}",
@@ -62,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 eprintln!("XR60 DSpark baseline workload={}", probe.id);
-                                let baseline = match run_baseline(&target, &probe) {
+                                let baseline = match run_baseline(&target, probe) {
                                     Ok(baseline) => baseline,
                                     Err(err) => {
                                         blockers
@@ -79,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &target,
                                         &drafter,
                                         &run_id,
-                                        &probe,
+                                        probe,
                                         *block_size,
                                         &baseline,
                                     ) {
@@ -149,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         decision_path: decision_path.display().to_string(),
         native_tap_snapshot_manifest_path: native_tap_snapshot_manifest_path(&args),
         block_sizes: args.block_sizes.clone(),
-        workload_ids: args.workload_ids.clone(),
+        workload_ids: selected_workload_ids,
         max_new_tokens: args.max_new_tokens,
         target_layer_ids: EXPECTED_TARGET_LAYERS.to_vec(),
         native_tap_snapshots: native_tap_snapshots.clone(),
@@ -199,6 +210,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenWorkloadRecord {
+    workload_id: String,
+    token_ids: Vec<i32>,
+    #[serde(default)]
+    max_new_tokens: Option<usize>,
+    #[serde(default)]
+    actual_context_tokens: Option<usize>,
+    #[serde(default)]
+    prompt_sha256: Option<String>,
+}
+
 #[derive(Debug)]
 struct Args {
     out_dir: PathBuf,
@@ -209,6 +232,7 @@ struct Args {
     max_new_tokens: usize,
     max_context_tokens: usize,
     native_tap_snapshot_dir: Option<PathBuf>,
+    token_workload_path: Option<PathBuf>,
 }
 
 impl Args {
@@ -224,9 +248,11 @@ impl Args {
             .iter()
             .map(|workload| (*workload).to_owned())
             .collect::<Vec<_>>();
+        let mut workload_filter_explicit = false;
         let mut max_new_tokens = 32;
         let mut max_context_tokens = 8192;
         let mut native_tap_snapshot_dir = None;
+        let mut token_workload_path = None;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -242,6 +268,7 @@ impl Args {
                     block_sizes = parse_usize_list(&required_value(&mut args, "--block-sizes")?)?;
                 }
                 "--workloads" => {
+                    workload_filter_explicit = true;
                     workload_ids = parse_string_list(&required_value(&mut args, "--workloads")?)?;
                 }
                 "--max-new-tokens" => {
@@ -260,9 +287,15 @@ impl Args {
                         "--native-tap-snapshot-dir",
                     )?));
                 }
+                "--token-workloads" => {
+                    token_workload_path = Some(PathBuf::from(required_value(
+                        &mut args,
+                        "--token-workloads",
+                    )?));
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- [--out-dir PATH] [--model-path PATH] [--draft-path PATH] [--block-sizes 1,2,4,7] [--workloads hello_smoke,hello_reference_prefix] [--max-new-tokens N] [--max-context-tokens N] [--native-tap-snapshot-dir PATH]"
+                        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- [--out-dir PATH] [--model-path PATH] [--draft-path PATH] [--block-sizes 1,2,4,7] [--workloads hello_smoke,hello_reference_prefix] [--token-workloads PATH] [--max-new-tokens N] [--max-context-tokens N] [--native-tap-snapshot-dir PATH]"
                     );
                     std::process::exit(0);
                 }
@@ -278,17 +311,22 @@ impl Args {
         {
             return Err("XR60 fixed-prefix scaffold only accepts block sizes 1,2,4,7".into());
         }
-        if workload_ids.is_empty() {
+        if workload_ids.is_empty() && token_workload_path.is_none() {
             return Err("--workloads must not be empty".into());
         }
-        for workload_id in &workload_ids {
-            if !DEFAULT_WORKLOADS.contains(&workload_id.as_str()) {
-                return Err(format!(
-                    "unknown XR60 workload '{workload_id}'; expected one of {}",
-                    DEFAULT_WORKLOADS.join(",")
-                )
-                .into());
+        if token_workload_path.is_none() {
+            for workload_id in &workload_ids {
+                if !DEFAULT_WORKLOADS.contains(&workload_id.as_str()) {
+                    return Err(format!(
+                        "unknown XR60 workload '{workload_id}'; expected one of {}",
+                        DEFAULT_WORKLOADS.join(",")
+                    )
+                    .into());
+                }
             }
+        }
+        if token_workload_path.is_some() && !workload_filter_explicit {
+            workload_ids.clear();
         }
         if max_new_tokens == 0 {
             return Err("--max-new-tokens must be greater than zero".into());
@@ -305,6 +343,7 @@ impl Args {
             max_new_tokens,
             max_context_tokens,
             native_tap_snapshot_dir,
+            token_workload_path,
         })
     }
 }
@@ -355,7 +394,7 @@ struct NativeTapSnapshotManifest {
 
 #[derive(Debug, Clone, Serialize)]
 struct NativeTapSnapshot {
-    workload_id: &'static str,
+    workload_id: String,
     prompt_tokens: Vec<i32>,
     prompt_sha256: String,
     snapshot_path: String,
@@ -378,7 +417,7 @@ struct Record {
     status: &'static str,
     measured: bool,
     exact: bool,
-    workload_id: &'static str,
+    workload_id: String,
     context_tokens: usize,
     max_new_tokens: usize,
     scheduler: &'static str,
@@ -446,7 +485,7 @@ struct DsparkConfigInspection {
 
 #[derive(Debug, Clone)]
 struct Probe {
-    id: &'static str,
+    id: String,
     prompt_tokens: Vec<i32>,
     max_new_tokens: usize,
 }
@@ -615,22 +654,132 @@ fn startup_blockers(args: &Args, draft_config: &DsparkConfigInspection) -> Vec<S
     blockers
 }
 
-fn probes(max_new_tokens: usize, workload_ids: &[String]) -> Vec<Probe> {
+fn probes(args: &Args) -> Result<Vec<Probe>, Box<dyn std::error::Error>> {
+    if let Some(path) = &args.token_workload_path {
+        load_token_workload_probes(path, args)
+    } else {
+        Ok(builtin_probes(args.max_new_tokens, &args.workload_ids))
+    }
+}
+
+fn builtin_probes(max_new_tokens: usize, workload_ids: &[String]) -> Vec<Probe> {
     let all = vec![
         Probe {
-            id: "hello_smoke",
+            id: "hello_smoke".to_owned(),
             prompt_tokens: vec![9259],
             max_new_tokens,
         },
         Probe {
-            id: "hello_reference_prefix",
+            id: "hello_reference_prefix".to_owned(),
             prompt_tokens: vec![9259, 236772, 236772],
             max_new_tokens,
         },
     ];
     all.into_iter()
-        .filter(|probe| workload_ids.iter().any(|id| id == probe.id))
+        .filter(|probe| workload_ids.iter().any(|id| id == &probe.id))
         .collect()
+}
+
+fn load_token_workload_probes(
+    path: &Path,
+    args: &Args,
+) -> Result<Vec<Probe>, Box<dyn std::error::Error>> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("could not read token workloads {}: {err}", path.display()))?;
+    let mut probes = Vec::new();
+    for (line_index, line) in body.lines().enumerate() {
+        let line_number = line_index + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: TokenWorkloadRecord = serde_json::from_str(line)
+            .map_err(|err| format!("could not parse {}:{line_number}: {err}", path.display()))?;
+        if !args.workload_ids.is_empty()
+            && !args
+                .workload_ids
+                .iter()
+                .any(|workload_id| workload_id == &record.workload_id)
+        {
+            continue;
+        }
+        if record.token_ids.is_empty() {
+            return Err(format!(
+                "{}:{line_number} workload {} has no token_ids",
+                path.display(),
+                record.workload_id
+            )
+            .into());
+        }
+        if record.token_ids.iter().any(|token| *token < 0) {
+            return Err(format!(
+                "{}:{line_number} workload {} contains a negative token id",
+                path.display(),
+                record.workload_id
+            )
+            .into());
+        }
+        if let Some(actual_context_tokens) = record.actual_context_tokens {
+            if actual_context_tokens != record.token_ids.len() {
+                return Err(format!(
+                    "{}:{line_number} workload {} actual_context_tokens={} but token_ids has {} entries",
+                    path.display(),
+                    record.workload_id,
+                    actual_context_tokens,
+                    record.token_ids.len()
+                )
+                .into());
+            }
+        }
+        if record.token_ids.len() > args.max_context_tokens {
+            return Err(format!(
+                "{}:{line_number} workload {} has {} prompt tokens, exceeding --max-context-tokens {}",
+                path.display(),
+                record.workload_id,
+                record.token_ids.len(),
+                args.max_context_tokens
+            )
+            .into());
+        }
+        if matches!(record.prompt_sha256.as_deref(), Some("")) {
+            return Err(format!(
+                "{}:{line_number} workload {} has an empty prompt_sha256",
+                path.display(),
+                record.workload_id
+            )
+            .into());
+        }
+        let max_new_tokens = record
+            .max_new_tokens
+            .unwrap_or(args.max_new_tokens)
+            .min(args.max_new_tokens);
+        if max_new_tokens == 0 {
+            return Err(format!(
+                "{}:{line_number} workload {} resolves to zero max_new_tokens",
+                path.display(),
+                record.workload_id
+            )
+            .into());
+        }
+        probes.push(Probe {
+            id: record.workload_id,
+            prompt_tokens: record.token_ids,
+            max_new_tokens,
+        });
+    }
+    if probes.is_empty() {
+        let filter = if args.workload_ids.is_empty() {
+            "<all>".to_owned()
+        } else {
+            args.workload_ids.join(",")
+        };
+        return Err(format!(
+            "no token workload records selected from {} with filter {}",
+            path.display(),
+            filter
+        )
+        .into());
+    }
+    Ok(probes)
 }
 
 fn run_record(
@@ -651,7 +800,7 @@ fn run_record(
         status: if exact { "passed" } else { "failed" },
         measured: true,
         exact,
-        workload_id: probe.id,
+        workload_id: probe.id.clone(),
         context_tokens: probe.prompt_tokens.len(),
         max_new_tokens: probe.max_new_tokens,
         scheduler: "fixed",
@@ -735,7 +884,7 @@ fn dump_native_tap_snapshot(
     snapshot.save_to_path(&snapshot_path)?;
 
     Ok(NativeTapSnapshot {
-        workload_id: probe.id,
+        workload_id: probe.id.clone(),
         prompt_tokens: probe.prompt_tokens.clone(),
         prompt_sha256: checksum_tokens(&probe.prompt_tokens),
         snapshot_path: snapshot_path.display().to_string(),
@@ -898,7 +1047,7 @@ fn blocked_records(args: &Args, run_id: &str, blockers: &[String]) -> Vec<Record
             status: "blocked",
             measured: false,
             exact: false,
-            workload_id: "startup",
+            workload_id: "startup".to_owned(),
             context_tokens: 0,
             max_new_tokens: args.max_new_tokens,
             scheduler: "fixed",
