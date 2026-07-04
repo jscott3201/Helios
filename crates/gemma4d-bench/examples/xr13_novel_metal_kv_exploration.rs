@@ -659,6 +659,7 @@ mod xr13 {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_case(
         case: &Xr09Case,
         xr09_reference: Xr09Reference,
@@ -880,9 +881,8 @@ mod xr13 {
     ) -> Vec<f32> {
         let clamp = if bits == 8 { 127.0 } else { 7.0 };
         let mut scores = Vec::with_capacity(context_tokens);
-        for token_index in 0..context_tokens {
+        for (token_index, scale) in scales.iter().copied().enumerate().take(context_tokens) {
             let start = token_index * head_dim;
-            let scale = scales[token_index];
             let mut sum = 0.0f32;
             for dim in 0..head_dim {
                 let dequant = (values[start + dim] as f32).clamp(-clamp, clamp) * scale;
@@ -941,9 +941,8 @@ mod xr13 {
         projection_dim: usize,
     ) -> Vec<f32> {
         let mut scores = Vec::with_capacity(context_tokens);
-        for token_index in 0..context_tokens {
+        for (token_index, scale) in scales.iter().copied().enumerate().take(context_tokens) {
             let start = token_index * projection_dim;
-            let scale = scales[token_index];
             let mut sum = 0.0f32;
             for dim in 0..projection_dim {
                 sum += values[start + dim] as f32 * scale * projected_query[dim];
@@ -1636,7 +1635,7 @@ mod xr13 {
     }
 
     fn q4_k_bytes(context_tokens: usize, head_dim: usize) -> u64 {
-        let packed_values = (context_tokens * head_dim + 1) / 2;
+        let packed_values = (context_tokens * head_dim).div_ceil(2);
         (packed_values + context_tokens * std::mem::size_of::<f32>()) as u64
     }
 

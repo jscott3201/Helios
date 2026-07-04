@@ -180,6 +180,7 @@ void remember_last_step(NativeKvCache* cache, const Gemma4StepResult* step) {
     cache->last_step.repair_clone_ms = 0.0;
     cache->last_step.repair_forward_ms = 0.0;
     cache->last_step.repair_fallback_ms = 0.0;
+    cache->last_step.decode_profile = Gemma4DecodeProfileInfo{};
     cache->has_last_step = true;
 }
 
@@ -806,7 +807,7 @@ Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
         return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_runtime_version requires a non-null out pointer");
     }
 
-    out->abi_version = 4;
+    out->abi_version = 6;
     out->backend_name = "gemma4_mlx";
     out->backend_version = kBackendVersion;
     return ok();
@@ -1916,9 +1917,12 @@ Gemma4Status verify_tokens_impl(
         // fallback if the next draft is rejected. For N>2, later partial
         // accepts use serial repair rather than truncating post-block KV, which
         // is not exact for sliding-window layers near the window boundary.
-        if (terminal_commit_count == 0 &&
+        if ((terminal_commit_count == 0 || terminal_commit_count == draft_count) &&
             env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_ROLLBACK") && draft_count >= 2 &&
             draft_tokens[0] == cache->last_step.greedy_token) {
+            const bool terminal_no_lookahead_requested = terminal_commit_count == draft_count;
+            const size_t verify_forward_count =
+                terminal_no_lookahead_requested ? draft_count - 1 : draft_count;
             const bool serial_state_repair =
                 env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_SERIAL_STATE_REPAIR");
             const bool partial_only_repair_full_accept =
@@ -1946,7 +1950,7 @@ Gemma4Status verify_tokens_impl(
             gemma4d::arm_xr57_target_logits_anchor();
             if (!target->native_model->decode_incremental_block_with_retroactive_prefix(
                     draft_tokens,
-                    draft_count,
+                    verify_forward_count,
                     block_kv.get(),
                     prefix_kv.get(),
                     &retroactive_prefix_count,
@@ -1959,8 +1963,9 @@ Gemma4Status verify_tokens_impl(
                 return fail(GEMMA4_ERR_RUNTIME, native_error);
             }
             verify_forward_ms += elapsed_ms(forward_started);
-            if (block_greedy_tokens.size() < draft_count || block_greedy_logits.size() < draft_count ||
-                block_target_top_k.size() < draft_count) {
+            if (block_greedy_tokens.size() < verify_forward_count ||
+                block_greedy_logits.size() < verify_forward_count ||
+                block_target_top_k.size() < verify_forward_count) {
                 return fail(GEMMA4_ERR_RUNTIME, "native MTP block-prefix verify returned incomplete target logits");
             }
 
@@ -1972,7 +1977,9 @@ Gemma4Status verify_tokens_impl(
                 ++accepted_prefix_count;
             }
             const bool full_block_accepted = accepted_prefix_count == draft_count;
-            if (retroactive_prefix_count != accepted_prefix_count) {
+            const size_t expected_retroactive_prefix_count =
+                std::min(accepted_prefix_count, verify_forward_count);
+            if (retroactive_prefix_count != expected_retroactive_prefix_count) {
                 return fail(
                     GEMMA4_ERR_RUNTIME,
                     "native MTP block-prefix retroactive prefix count disagreed with verifier comparison");
@@ -1998,6 +2005,50 @@ Gemma4Status verify_tokens_impl(
                 record_mtp_target_step(&trace, index, context_sequence_len, target_step, &block_target_top_k[index - 1]);
                 record_mtp_draft_score(&trace, index, draft_tokens[index], draft_score_for(index, draft_tokens[index]));
             }
+
+            auto commit_terminal_no_lookahead =
+                [&](const std::vector<int32_t>& committed_tokens, uint32_t accepted_count) -> Gemma4Status {
+                if (!terminal_no_lookahead_requested || committed_tokens.size() < terminal_commit_count) {
+                    return fail(
+                        GEMMA4_ERR_RUNTIME,
+                        "native MTP terminal no-lookahead called before terminal budget was satisfied");
+                }
+                if (committed_tokens.size() < 2) {
+                    return fail(
+                        GEMMA4_ERR_RUNTIME,
+                        "native MTP block-prefix terminal no-lookahead requires a block-prefix target step");
+                }
+                const size_t final_target_index = committed_tokens.size() - 2;
+                if (final_target_index >= block_greedy_tokens.size() ||
+                    final_target_index >= block_greedy_logits.size()) {
+                    return fail(
+                        GEMMA4_ERR_RUNTIME,
+                        "native MTP block-prefix terminal no-lookahead missing final target token");
+                }
+
+                Gemma4StepResult terminal_step{};
+                terminal_step.greedy_token = committed_tokens.back();
+                terminal_step.greedy_logit = block_greedy_logits[final_target_index];
+                terminal_step.sequence_len = context_sequence_len + committed_tokens.size();
+                terminal_step.peak_memory_gb =
+                    std::max(block_step.peak_memory_gb, cache->last_step.peak_memory_gb);
+                terminal_step.active_kv_bytes =
+                    std::max(block_step.active_kv_bytes, cache->last_step.active_kv_bytes);
+                terminal_step.accepted_draft_count = accepted_count;
+                terminal_step.committed_count = static_cast<uint32_t>(committed_tokens.size());
+                for (size_t index = 0;
+                     index < committed_tokens.size() && index < GEMMA4_MTP_MAX_COMMITTED_TOKENS;
+                     ++index) {
+                    terminal_step.committed_tokens[index] = committed_tokens[index];
+                }
+                terminal_step.mtp_trace = trace;
+                attach_verify_timings(&terminal_step);
+
+                *out = terminal_step;
+                out->native_last_hidden = nullptr;
+                target->sequence_len = out->sequence_len;
+                return ok();
+            };
 
             auto commit_serial_repaired_state =
                 [&](const std::vector<int32_t>& committed_tokens, uint32_t accepted_count) -> Gemma4Status {
@@ -2135,6 +2186,11 @@ Gemma4Status verify_tokens_impl(
 
             if (full_block_accepted) {
                 std::vector<int32_t> committed_tokens(draft_tokens, draft_tokens + draft_count);
+                if (terminal_no_lookahead_requested) {
+                    return commit_terminal_no_lookahead(
+                        committed_tokens,
+                        static_cast<uint32_t>(draft_count));
+                }
                 if (serial_state_repair || partial_only_repair_full_accept) {
                     return commit_serial_repaired_state(
                         committed_tokens,
@@ -2183,6 +2239,11 @@ Gemma4Status verify_tokens_impl(
                 committed_tokens.push_back(draft_tokens[index]);
             }
             committed_tokens.push_back(fallback_token);
+            if (terminal_no_lookahead_requested && committed_tokens.size() >= terminal_commit_count) {
+                return commit_terminal_no_lookahead(
+                    committed_tokens,
+                    static_cast<uint32_t>(accepted_prefix_count));
+            }
             if (serial_state_repair || partial_reject_serial_repair) {
                 return commit_serial_repaired_state(
                     committed_tokens,

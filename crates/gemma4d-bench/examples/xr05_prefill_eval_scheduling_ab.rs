@@ -732,24 +732,24 @@ fn run_variant_trial(
             return Ok(());
         }
     };
-    if let Some(policy) = variant.prefill_chunk_policy {
-        if let Err(error) = target.set_prefill_chunk_policy(policy) {
-            for workload in workload_inputs {
-                records.push(failed_record(
-                    run_id,
-                    git_sha,
-                    git_status_short,
-                    command,
-                    model_identity,
-                    variant,
-                    trial_index,
-                    workload,
-                    model_load,
-                    format!("prefill chunk policy setter failed: {error}"),
-                ));
-            }
-            return Ok(());
+    if let Some(policy) = variant.prefill_chunk_policy
+        && let Err(error) = target.set_prefill_chunk_policy(policy)
+    {
+        for workload in workload_inputs {
+            records.push(failed_record(
+                run_id,
+                git_sha,
+                git_status_short,
+                command,
+                model_identity,
+                variant,
+                trial_index,
+                workload,
+                model_load,
+                format!("prefill chunk policy setter failed: {error}"),
+            ));
         }
+        return Ok(());
     }
 
     for workload in workload_inputs {
@@ -1252,11 +1252,6 @@ fn decision_for(blockers: &[String], comparisons: &[Comparison], records: &[Reco
         "blocked_with_evidence".to_owned()
     } else if comparisons.iter().any(|comparison| comparison.accepted) {
         "accept_candidate".to_owned()
-    } else if records
-        .iter()
-        .any(|record| record.correctness.status != "passed")
-    {
-        "reject_candidate".to_owned()
     } else {
         "reject_candidate".to_owned()
     }

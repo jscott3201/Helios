@@ -354,6 +354,7 @@ struct Record {
     blocker: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_record(
     args: &Args,
     target: &Target,

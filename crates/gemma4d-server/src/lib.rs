@@ -85,9 +85,10 @@ impl ResidentTarget {
 
     pub(crate) fn apply_native_server_default_prefill_chunk_policy(
         &mut self,
-    ) -> Result<Option<PrefillChunkPolicy>, CliError> {
-        let Some(policy) = native_server_default_prefill_chunk_policy() else {
-            return Ok(None);
+    ) -> Result<NativeServerDefaultPrefillChunkPolicySelection, CliError> {
+        let selection = native_server_default_prefill_chunk_policy_selection();
+        let NativeServerDefaultPrefillChunkPolicySelection::Apply(policy) = selection else {
+            return Ok(selection);
         };
         self.target
             .set_prefill_chunk_policy(policy)
@@ -96,7 +97,7 @@ impl ResidentTarget {
                     "failed to set native server prefill chunk policy: {error}"
                 ))
             })?;
-        Ok(Some(policy))
+        Ok(selection)
     }
 
     pub fn generate_prompt(
@@ -117,23 +118,63 @@ impl ResidentTarget {
 }
 
 pub(crate) fn native_server_default_prefill_chunk_policy() -> Option<PrefillChunkPolicy> {
-    let native_graph = env::var_os(NATIVE_GRAPH_ENV);
-    native_server_default_prefill_chunk_policy_from_env(
-        native_graph.as_deref(),
+    native_server_default_prefill_chunk_policy_selection().policy()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeServerDefaultPrefillChunkPolicySelection {
+    Apply(PrefillChunkPolicy),
+    SkipNativeGraphDisabled,
+    SkipExplicitEnvOverride,
+}
+
+impl NativeServerDefaultPrefillChunkPolicySelection {
+    pub(crate) fn policy(self) -> Option<PrefillChunkPolicy> {
+        match self {
+            Self::Apply(policy) => Some(policy),
+            Self::SkipNativeGraphDisabled | Self::SkipExplicitEnvOverride => None,
+        }
+    }
+
+    pub(crate) fn policy_name(self) -> Option<&'static str> {
+        match self {
+            Self::Apply(PrefillChunkPolicy::LongContext256) => Some("long_context_256"),
+            Self::Apply(PrefillChunkPolicy::Disabled) => Some("disabled"),
+            Self::Apply(PrefillChunkPolicy::FixedTokens(_)) => Some("fixed_tokens"),
+            Self::SkipNativeGraphDisabled | Self::SkipExplicitEnvOverride => None,
+        }
+    }
+
+    pub(crate) fn skip_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Apply(_) => None,
+            Self::SkipNativeGraphDisabled => Some("native graph env is disabled"),
+            Self::SkipExplicitEnvOverride => Some("explicit native prefill env override is set"),
+        }
+    }
+}
+
+pub(crate) fn native_server_default_prefill_chunk_policy_selection()
+-> NativeServerDefaultPrefillChunkPolicySelection {
+    native_server_default_prefill_chunk_policy_selection_from_env(
+        env::var_os(NATIVE_GRAPH_ENV).as_deref(),
         env::var_os(NATIVE_PREFILL_CHUNK_TOKENS_ENV).is_some(),
         env::var_os(NATIVE_PREFILL_CHUNK_POLICY_ENV).is_some(),
     )
 }
 
-fn native_server_default_prefill_chunk_policy_from_env(
+fn native_server_default_prefill_chunk_policy_selection_from_env(
     native_graph: Option<&std::ffi::OsStr>,
     chunk_tokens_env_set: bool,
     chunk_policy_env_set: bool,
-) -> Option<PrefillChunkPolicy> {
-    if !native_graph_env_enabled(native_graph) || chunk_tokens_env_set || chunk_policy_env_set {
-        return None;
+) -> NativeServerDefaultPrefillChunkPolicySelection {
+    if !native_graph_env_enabled(native_graph) {
+        return NativeServerDefaultPrefillChunkPolicySelection::SkipNativeGraphDisabled;
     }
-    Some(PrefillChunkPolicy::LongContext256)
+    if chunk_tokens_env_set || chunk_policy_env_set {
+        return NativeServerDefaultPrefillChunkPolicySelection::SkipExplicitEnvOverride;
+    }
+    NativeServerDefaultPrefillChunkPolicySelection::Apply(PrefillChunkPolicy::LongContext256)
 }
 
 fn native_graph_env_enabled(value: Option<&std::ffi::OsStr>) -> bool {
@@ -1150,40 +1191,50 @@ mod tests {
     #[test]
     fn native_prefill_default_policy_is_long_context_256_when_env_absent() {
         assert_eq!(
-            native_server_default_prefill_chunk_policy_from_env(
+            native_server_default_prefill_chunk_policy_selection_from_env(
                 Some(OsStr::new("1")),
                 false,
                 false
             ),
-            Some(PrefillChunkPolicy::LongContext256)
+            NativeServerDefaultPrefillChunkPolicySelection::Apply(
+                PrefillChunkPolicy::LongContext256
+            )
         );
     }
 
     #[test]
     fn native_prefill_default_policy_does_not_override_explicit_env() {
         assert_eq!(
-            native_server_default_prefill_chunk_policy_from_env(Some(OsStr::new("1")), true, false),
-            None
+            native_server_default_prefill_chunk_policy_selection_from_env(
+                Some(OsStr::new("1")),
+                true,
+                false
+            ),
+            NativeServerDefaultPrefillChunkPolicySelection::SkipExplicitEnvOverride
         );
         assert_eq!(
-            native_server_default_prefill_chunk_policy_from_env(Some(OsStr::new("1")), false, true),
-            None
+            native_server_default_prefill_chunk_policy_selection_from_env(
+                Some(OsStr::new("1")),
+                false,
+                true
+            ),
+            NativeServerDefaultPrefillChunkPolicySelection::SkipExplicitEnvOverride
         );
     }
 
     #[test]
     fn native_prefill_default_policy_skips_helper_path() {
         assert_eq!(
-            native_server_default_prefill_chunk_policy_from_env(None, false, false),
-            None
+            native_server_default_prefill_chunk_policy_selection_from_env(None, false, false),
+            NativeServerDefaultPrefillChunkPolicySelection::SkipNativeGraphDisabled
         );
         assert_eq!(
-            native_server_default_prefill_chunk_policy_from_env(
+            native_server_default_prefill_chunk_policy_selection_from_env(
                 Some(OsStr::new("0")),
                 false,
                 false
             ),
-            None
+            NativeServerDefaultPrefillChunkPolicySelection::SkipNativeGraphDisabled
         );
     }
 
@@ -1191,12 +1242,12 @@ mod tests {
     fn native_prefill_default_policy_matches_native_false_values() {
         for value in ["", "false", "FALSE", "off", "OFF"] {
             assert_eq!(
-                native_server_default_prefill_chunk_policy_from_env(
+                native_server_default_prefill_chunk_policy_selection_from_env(
                     Some(OsStr::new(value)),
                     false,
                     false
                 ),
-                None,
+                NativeServerDefaultPrefillChunkPolicySelection::SkipNativeGraphDisabled,
                 "{value} should disable native graph policy"
             );
         }

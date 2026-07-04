@@ -1033,6 +1033,7 @@ fn run_continued_decode(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn failed_record(
     run_id: &str,
     git_sha: &str,

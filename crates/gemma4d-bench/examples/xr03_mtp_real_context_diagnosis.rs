@@ -491,6 +491,7 @@ struct FixHypothesis {
     evidence: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_record(
     options: &Options,
     run_id: &str,
@@ -709,11 +710,16 @@ fn event_from_step(
     tokenizer: &mut TokenizerHelper,
 ) -> Result<MtpEvent, Box<dyn std::error::Error>> {
     let mut per_draft_token = Vec::new();
-    for index in 0..draft_tokens.len().min(trace.target_tokens.len()) {
+    for (index, draft_token) in draft_tokens
+        .iter()
+        .copied()
+        .enumerate()
+        .take(draft_tokens.len().min(trace.target_tokens.len()))
+    {
         per_draft_token.push(DraftTokenTrace {
             draft_index: index,
             position_offset: trace.position_offsets.get(index).copied().unwrap_or(0),
-            draft: token_text(draft_tokens[index], tokenizer)?,
+            draft: token_text(draft_token, tokenizer)?,
             target_greedy: token_text(trace.target_tokens[index], tokenizer)?,
             target_greedy_logit: trace.target_logits.get(index).copied().unwrap_or(0.0),
             draft_logit: trace.draft_logits.get(index).copied().unwrap_or(0.0),
@@ -1139,11 +1145,11 @@ fn failed_hypotheses(records: &[Record], assessment: &RootCauseAssessment) -> Ve
 }
 
 fn decision_for(blockers: &[String], records: &[Record], acceptance: &AcceptanceSummary) -> String {
-    if !blockers.is_empty() || records.is_empty() {
-        "blocked_with_evidence".to_owned()
-    } else if records
-        .iter()
-        .any(|record| !record.comparison.byte_identical)
+    if !blockers.is_empty()
+        || records.is_empty()
+        || records
+            .iter()
+            .any(|record| !record.comparison.byte_identical)
     {
         "blocked_with_evidence".to_owned()
     } else if acceptance.attempted_draft_tokens > 0 {
@@ -1591,10 +1597,10 @@ for line in sys.stdin:
     }
 
     fn decode(&mut self, ids: &[i32]) -> Result<String, CliError> {
-        if ids.len() == 1 {
-            if let Some(text) = self.decode_cache.get(&ids[0]) {
-                return Ok(text.clone());
-            }
+        if ids.len() == 1
+            && let Some(text) = self.decode_cache.get(&ids[0])
+        {
+            return Ok(text.clone());
         }
         let value = self.request(&serde_json::json!({"cmd":"decode","ids":ids}))?;
         let text = value

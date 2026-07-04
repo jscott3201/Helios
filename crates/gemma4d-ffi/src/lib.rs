@@ -156,6 +156,27 @@ mod raw {
 
     #[repr(C)]
     #[derive(Default)]
+    pub struct Gemma4DecodeProfileInfo {
+        pub enabled: u32,
+        pub reserved0: u32,
+        pub reset_peak_memory_ms: f64,
+        pub forward_graph_ms: f64,
+        pub decode_embedding_ms: f64,
+        pub layer_graph_ms: f64,
+        pub attention_kv_mutation_ms: f64,
+        pub deferred_kv_eval_ms: f64,
+        pub lm_head_ms: f64,
+        pub greedy_select_ms: f64,
+        pub target_top_k_ms: f64,
+        pub eval_sync_ms: f64,
+        pub hidden_view_ms: f64,
+        pub output_read_ms: f64,
+        pub peak_memory_read_ms: f64,
+        pub total_native_decode_ms: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
     pub struct Gemma4StepResult {
         pub greedy_token: i32,
         pub greedy_logit: f32,
@@ -173,6 +194,7 @@ mod raw {
         pub committed_count: u32,
         pub committed_tokens: [i32; GEMMA4_MTP_MAX_COMMITTED_TOKENS],
         pub native_last_hidden: *mut std::ffi::c_void,
+        pub decode_profile: Gemma4DecodeProfileInfo,
         pub mtp_trace: Gemma4MtpTraceInfo,
     }
 
@@ -914,6 +936,47 @@ impl MtpTraceInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DecodeProfileInfo {
+    pub enabled: bool,
+    pub reset_peak_memory_ms: f64,
+    pub forward_graph_ms: f64,
+    pub decode_embedding_ms: f64,
+    pub layer_graph_ms: f64,
+    pub attention_kv_mutation_ms: f64,
+    pub deferred_kv_eval_ms: f64,
+    pub lm_head_ms: f64,
+    pub greedy_select_ms: f64,
+    pub target_top_k_ms: f64,
+    pub eval_sync_ms: f64,
+    pub hidden_view_ms: f64,
+    pub output_read_ms: f64,
+    pub peak_memory_read_ms: f64,
+    pub total_native_decode_ms: f64,
+}
+
+impl DecodeProfileInfo {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            reset_peak_memory_ms: 0.0,
+            forward_graph_ms: 0.0,
+            decode_embedding_ms: 0.0,
+            layer_graph_ms: 0.0,
+            attention_kv_mutation_ms: 0.0,
+            deferred_kv_eval_ms: 0.0,
+            lm_head_ms: 0.0,
+            greedy_select_ms: 0.0,
+            target_top_k_ms: 0.0,
+            eval_sync_ms: 0.0,
+            hidden_view_ms: 0.0,
+            output_read_ms: 0.0,
+            peak_memory_read_ms: 0.0,
+            total_native_decode_ms: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StepResult {
     pub greedy_token: i32,
     pub greedy_logit: f32,
@@ -931,6 +994,7 @@ pub struct StepResult {
     pub committed_count: u32,
     pub committed_tokens: [i32; raw::GEMMA4_MTP_MAX_COMMITTED_TOKENS],
     pub native_last_hidden: Option<NativeLastHiddenView>,
+    pub decode_profile: DecodeProfileInfo,
     pub mtp_trace: MtpTraceInfo,
 }
 
@@ -963,8 +1027,32 @@ impl From<raw::Gemma4StepResult> for StepResult {
             committed_tokens: value.committed_tokens,
             native_last_hidden: NonNull::new(value.native_last_hidden)
                 .map(|ptr| NativeLastHiddenView { ptr }),
+            decode_profile: decode_profile_from_raw(&value.decode_profile),
             mtp_trace: mtp_trace_from_raw(&value.mtp_trace),
         }
+    }
+}
+
+fn decode_profile_from_raw(raw: &raw::Gemma4DecodeProfileInfo) -> DecodeProfileInfo {
+    if raw.enabled == 0 {
+        return DecodeProfileInfo::disabled();
+    }
+    DecodeProfileInfo {
+        enabled: true,
+        reset_peak_memory_ms: raw.reset_peak_memory_ms,
+        forward_graph_ms: raw.forward_graph_ms,
+        decode_embedding_ms: raw.decode_embedding_ms,
+        layer_graph_ms: raw.layer_graph_ms,
+        attention_kv_mutation_ms: raw.attention_kv_mutation_ms,
+        deferred_kv_eval_ms: raw.deferred_kv_eval_ms,
+        lm_head_ms: raw.lm_head_ms,
+        greedy_select_ms: raw.greedy_select_ms,
+        target_top_k_ms: raw.target_top_k_ms,
+        eval_sync_ms: raw.eval_sync_ms,
+        hidden_view_ms: raw.hidden_view_ms,
+        output_read_ms: raw.output_read_ms,
+        peak_memory_read_ms: raw.peak_memory_read_ms,
+        total_native_decode_ms: raw.total_native_decode_ms,
     }
 }
 
@@ -1280,7 +1368,7 @@ mod tests {
     #[test]
     fn runtime_version_reports_smoke_backend() {
         let version = runtime_version().expect("runtime version should be available");
-        assert_eq!(version.abi_version, 4);
+        assert_eq!(version.abi_version, 6);
         assert_eq!(version.backend_name, "gemma4_mlx");
         assert!(version.backend_version.starts_with("m03-"));
     }
@@ -1289,6 +1377,40 @@ mod tests {
     fn mtp_trace_raw_layout_stays_pinned() {
         assert_eq!(std::mem::size_of::<raw::Gemma4MtpTraceInfo>(), 1328);
         assert_eq!(std::mem::align_of::<raw::Gemma4MtpTraceInfo>(), 8);
+    }
+
+    #[test]
+    fn decode_profile_raw_layout_stays_pinned() {
+        assert_eq!(std::mem::size_of::<raw::Gemma4DecodeProfileInfo>(), 120);
+        assert_eq!(std::mem::align_of::<raw::Gemma4DecodeProfileInfo>(), 8);
+    }
+
+    #[test]
+    fn step_result_raw_layout_stays_pinned() {
+        assert_eq!(std::mem::size_of::<raw::Gemma4StepResult>(), 1608);
+        assert_eq!(std::mem::align_of::<raw::Gemma4StepResult>(), 8);
+        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, greedy_token), 0);
+        assert_eq!(
+            std::mem::offset_of!(raw::Gemma4StepResult, active_kv_bytes),
+            24
+        );
+        assert_eq!(
+            std::mem::offset_of!(raw::Gemma4StepResult, verify_stage_ms),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(raw::Gemma4StepResult, committed_tokens),
+            88
+        );
+        assert_eq!(
+            std::mem::offset_of!(raw::Gemma4StepResult, native_last_hidden),
+            152
+        );
+        assert_eq!(
+            std::mem::offset_of!(raw::Gemma4StepResult, decode_profile),
+            160
+        );
+        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, mtp_trace), 280);
     }
 
     #[test]

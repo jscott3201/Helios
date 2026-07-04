@@ -635,6 +635,7 @@ fn policy_specs(options: &Options) -> Vec<PolicySpec> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_policy_record(
     options: &Options,
     source: &SourceSummary,
@@ -993,9 +994,10 @@ fn aggregate_decision(
 ) -> String {
     if policy_kind == "baseline" {
         "baseline".to_owned()
-    } else if regressed_workloads > 0 || aggregate_speedup_percent <= 0.0 {
-        "reject_candidate".to_owned()
-    } else if selected_mtp_workloads == 0 {
+    } else if regressed_workloads > 0
+        || aggregate_speedup_percent <= 0.0
+        || selected_mtp_workloads == 0
+    {
         "reject_candidate".to_owned()
     } else {
         "needs_more_data".to_owned()
@@ -1023,12 +1025,7 @@ fn aggregate_reasons(
             regressed_workload_ids.join(", ")
         ));
     }
-    if aggregate_speedup_percent > 0.0 {
-        reasons.push(format!(
-            "aggregate replay speedup was {:.3}%",
-            aggregate_speedup_percent
-        ));
-    } else if policy_kind != "baseline" {
+    if aggregate_speedup_percent > 0.0 || policy_kind != "baseline" {
         reasons.push(format!(
             "aggregate replay speedup was {:.3}%",
             aggregate_speedup_percent

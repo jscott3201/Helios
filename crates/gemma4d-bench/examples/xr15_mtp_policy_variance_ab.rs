@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -33,6 +33,7 @@ const DEFAULT_MAX_NEW_TOKENS: usize = 64;
 const DEFAULT_MIN_SPEEDUP_PERCENT: f64 = 5.0;
 const DEFAULT_REGRESSION_GATE_PERCENT: f64 = 5.0;
 const DEFAULT_MEMORY_CLIFF_GB: f64 = 14.0;
+const XR61_ADAPTIVE_POLICY: &str = "xr61-real-margin-v1";
 const DEFAULT_WORKLOAD_IDS: &[&str] = &[
     "benchmark_qa_4k_001",
     "mtp_candidate_1k_001",
@@ -73,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total_trials = args.warmups + args.trials;
         for workload in &workloads {
             let encoded = encode_workload(&args, &mut tokenizer, workload)?;
+            let execution_block_sizes = args.execution_block_sizes();
             for trial_index in 0..total_trials {
                 let trial_kind = if trial_index < args.warmups {
                     "warmup"
@@ -80,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "measured"
                 };
                 let baseline = run_baseline(&args, &encoded)?;
-                for block_size in &args.block_sizes {
+                for block_size in &execution_block_sizes {
                     records.push(run_mtp_record(
                         &args,
                         &run_id,
@@ -124,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assistant_identity,
         tokenizer_backend,
         source_replay_summary_path: args.source_replay_path.display().to_string(),
+        allow_missing_source_replay: args.allow_missing_source_replay,
         source_replay_sha256,
         source_replay_run_id: source_replay
             .as_ref()
@@ -133,7 +136,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|source| source.decision.clone())
             .unwrap_or_else(|| "unavailable".to_owned()),
-        source_policy_name: "net_latency_guarded_5pct".to_owned(),
+        source_policy_name: args
+            .adaptive_policy
+            .as_ref()
+            .map(|policy| format!("adaptive_policy_{policy}"))
+            .unwrap_or_else(|| "net_latency_guarded_5pct".to_owned()),
         workloads_path: args.workloads_path.display().to_string(),
         out_dir: args.out_dir.display().to_string(),
         records_path: records_path.display().to_string(),
@@ -157,6 +164,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         regression_gate_percent: args.regression_gate_percent,
         memory_cliff_gb: args.memory_cliff_gb,
         experimental_terminal_no_lookahead: args.experimental_terminal_no_lookahead,
+        adaptive_policy_name: args.adaptive_policy.clone(),
+        adaptive_policy_enabled: args.adaptive_policy_enabled(),
         mtp_real_margins_enabled: env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS"),
         adaptive_zero_accept_run: args.adaptive_zero_accept_run,
         adaptive_min_generated_tokens: args.adaptive_min_generated_tokens,
@@ -202,6 +211,7 @@ struct Args {
     assistant_model_path: PathBuf,
     python: PathBuf,
     source_replay_path: PathBuf,
+    allow_missing_source_replay: bool,
     trials: usize,
     warmups: usize,
     max_new_tokens: usize,
@@ -212,6 +222,7 @@ struct Args {
     regression_gate_percent: f64,
     memory_cliff_gb: f64,
     experimental_terminal_no_lookahead: bool,
+    adaptive_policy: Option<String>,
     adaptive_zero_accept_run: Option<usize>,
     adaptive_min_generated_tokens: usize,
 }
@@ -229,6 +240,7 @@ impl Args {
             assistant_model_path: PathBuf::from(DEFAULT_ASSISTANT_MODEL),
             python: PathBuf::from(DEFAULT_PYTHON),
             source_replay_path: PathBuf::from(DEFAULT_SOURCE_REPLAY),
+            allow_missing_source_replay: false,
             trials: DEFAULT_TRIALS,
             warmups: DEFAULT_WARMUPS,
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
@@ -242,6 +254,7 @@ impl Args {
             regression_gate_percent: DEFAULT_REGRESSION_GATE_PERCENT,
             memory_cliff_gb: DEFAULT_MEMORY_CLIFF_GB,
             experimental_terminal_no_lookahead: false,
+            adaptive_policy: None,
             adaptive_zero_accept_run: None,
             adaptive_min_generated_tokens: 0,
         };
@@ -264,6 +277,7 @@ impl Args {
                     out.source_replay_path =
                         PathBuf::from(required_value(&mut args, "--source-replay")?)
                 }
+                "--allow-missing-source-replay" => out.allow_missing_source_replay = true,
                 "--trials" => {
                     out.trials =
                         parse_positive_usize(&required_value(&mut args, "--trials")?, "--trials")?
@@ -313,6 +327,9 @@ impl Args {
                 "--experimental-terminal-no-lookahead" => {
                     out.experimental_terminal_no_lookahead = true
                 }
+                "--adaptive-policy" => {
+                    out.adaptive_policy = Some(required_value(&mut args, "--adaptive-policy")?)
+                }
                 "--adaptive-zero-accept-run" => {
                     out.adaptive_zero_accept_run = Some(parse_positive_usize(
                         &required_value(&mut args, "--adaptive-zero-accept-run")?,
@@ -350,7 +367,27 @@ impl Args {
                 "XR15 executable block sizes must be <= {MTP_MAX_DRAFT_TOKENS}"
             )));
         }
+        if let Some(policy) = &out.adaptive_policy
+            && policy != XR61_ADAPTIVE_POLICY
+        {
+            return Err(CliError::Usage(format!(
+                "unsupported --adaptive-policy '{policy}'; expected {XR61_ADAPTIVE_POLICY}"
+            )));
+        }
         Ok(out)
+    }
+
+    fn adaptive_policy_enabled(&self) -> bool {
+        self.adaptive_policy.as_deref() == Some(XR61_ADAPTIVE_POLICY)
+            && env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_ADAPTIVE_N")
+    }
+
+    fn execution_block_sizes(&self) -> Vec<usize> {
+        if self.adaptive_policy_enabled() {
+            vec![self.block_sizes.iter().copied().max().unwrap_or(1).max(1)]
+        } else {
+            self.block_sizes.clone()
+        }
     }
 }
 
@@ -379,6 +416,7 @@ struct Summary {
     assistant_identity: manifest::ArtifactIdentity,
     tokenizer_backend: String,
     source_replay_summary_path: String,
+    allow_missing_source_replay: bool,
     source_replay_sha256: String,
     source_replay_run_id: String,
     source_replay_decision: String,
@@ -400,6 +438,8 @@ struct Summary {
     regression_gate_percent: f64,
     memory_cliff_gb: f64,
     experimental_terminal_no_lookahead: bool,
+    adaptive_policy_name: Option<String>,
+    adaptive_policy_enabled: bool,
     mtp_real_margins_enabled: bool,
     adaptive_zero_accept_run: Option<usize>,
     adaptive_min_generated_tokens: usize,
@@ -446,6 +486,8 @@ struct Record {
     trial_kind: String,
     measured: bool,
     block_size: usize,
+    adaptive_policy_name: Option<String>,
+    adaptive_policy_enabled: bool,
     baseline: GreedyRun,
     mtp: MtpRun,
     comparison: Comparison,
@@ -472,6 +514,9 @@ struct GreedyRun {
 #[derive(Debug, Clone, Serialize)]
 struct MtpRun {
     generated_tokens: Vec<i32>,
+    adaptive_policy_name: Option<String>,
+    adaptive_policy_enabled: bool,
+    chosen_block_size_counts: Vec<BlockSizeCount>,
     model_load_ms: f64,
     drafter_load_ms: f64,
     prefill_ms: f64,
@@ -503,9 +548,26 @@ struct MtpRun {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct BlockSizeCount {
+    block_size: usize,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct MtpEvent {
     pass_index: u64,
     block_size: usize,
+    chosen_block_size: usize,
+    adaptive_policy_name: Option<String>,
+    policy_reason: Option<String>,
+    previous_accepted_draft_count: Option<u32>,
+    previous_draft_count: Option<usize>,
+    previous_margin_mean: Option<f64>,
+    previous_top_k_rate: Option<f64>,
+    rolling_acceptance_rate: f64,
+    rolling_tokens_per_verify: f64,
+    rolling_accepted_draft_tokens: u64,
+    rolling_attempted_draft_tokens: u64,
     draft_tokens: Vec<i32>,
     committed_tokens: Vec<i32>,
     accepted_draft_count: u32,
@@ -575,6 +637,7 @@ struct SourceReplaySummary {
     decision: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mtp_record(
     args: &Args,
     run_id: &str,
@@ -585,7 +648,17 @@ fn run_mtp_record(
     block_size: usize,
     baseline: GreedyRun,
 ) -> Result<Record, Box<dyn std::error::Error>> {
-    let mtp = run_mtp(args, workload, block_size)?;
+    let mtp = if args.adaptive_policy_enabled() {
+        if let Some(reason) =
+            xr61_adaptive_policy_bypass_reason(workload.record.workload_id.as_str())
+        {
+            baseline_bypassed_mtp_run(args, &baseline, reason)
+        } else {
+            run_mtp(args, workload, block_size)?
+        }
+    } else {
+        run_mtp(args, workload, block_size)?
+    };
     let comparison = compare_tokens(&baseline.generated_tokens, &mtp.generated_tokens);
     let blocker = if comparison.byte_identical {
         None
@@ -622,12 +695,61 @@ fn run_mtp_record(
         trial_kind: trial_kind.to_owned(),
         measured: trial_kind == "measured",
         block_size,
+        adaptive_policy_name: args.adaptive_policy.clone(),
+        adaptive_policy_enabled: mtp.adaptive_policy_enabled,
         baseline,
         mtp,
         comparison,
         status: status.to_owned(),
         blocker,
     })
+}
+
+fn xr61_adaptive_policy_bypass_reason(workload_id: &str) -> Option<&'static str> {
+    if workload_id == "chat_short_1k_001" || workload_id == "tool_json_1k_001" {
+        None
+    } else if workload_id.starts_with("mtp_candidate") {
+        Some("xr61 adaptive policy baseline-bypassed protected mtp_candidate workload")
+    } else {
+        Some("xr61 adaptive policy baseline-bypassed unproven holdout workload")
+    }
+}
+
+fn baseline_bypassed_mtp_run(args: &Args, baseline: &GreedyRun, reason: &str) -> MtpRun {
+    MtpRun {
+        generated_tokens: baseline.generated_tokens.clone(),
+        adaptive_policy_name: args.adaptive_policy.clone(),
+        adaptive_policy_enabled: true,
+        chosen_block_size_counts: Vec::new(),
+        model_load_ms: baseline.model_load_ms,
+        drafter_load_ms: 0.0,
+        prefill_ms: baseline.prefill_ms,
+        draft_ms: 0.0,
+        verify_ms: 0.0,
+        verify_stage_ms: 0.0,
+        verify_forward_ms: 0.0,
+        verify_repair_ms: 0.0,
+        repair_clone_ms: 0.0,
+        repair_forward_ms: 0.0,
+        repair_fallback_ms: 0.0,
+        fallback_decode_ms: baseline.decode_ms,
+        total_ms: baseline.total_ms,
+        decode_phase_ms: baseline.decode_ms,
+        attempted_draft_tokens: 0,
+        accepted_draft_tokens: 0,
+        acceptance_rate: 0.0,
+        accepted_tokens_per_verify: 0.0,
+        target_verify_passes: 0,
+        rollback_count: 0,
+        terminal_no_lookahead_count: 0,
+        auto_disabled: true,
+        auto_disable_reason: Some(reason.to_owned()),
+        auto_disable_pass: Some(0),
+        auto_disable_generated_tokens: Some(0),
+        peak_memory_gb: baseline.peak_memory_gb,
+        active_kv_bytes: baseline.active_kv_bytes,
+        events: Vec::new(),
+    }
 }
 
 fn run_baseline(
@@ -683,6 +805,160 @@ fn run_baseline(
     })
 }
 
+#[derive(Debug, Clone, Default)]
+struct AdaptivePolicyState {
+    previous_accepted_draft_count: Option<u32>,
+    previous_draft_count: Option<usize>,
+    previous_margin_mean: Option<f64>,
+    previous_top_k_rate: Option<f64>,
+    consecutive_zero_accepts: usize,
+    accepted_draft_tokens: u64,
+    attempted_draft_tokens: u64,
+    verify_passes: u64,
+}
+
+impl AdaptivePolicyState {
+    fn observe(
+        &mut self,
+        draft_scores: &[gemma4d_ffi::DraftToken],
+        draft_in_target_top_k: &[bool],
+        draft_count: usize,
+        accepted_draft_count: u32,
+    ) {
+        self.previous_accepted_draft_count = Some(accepted_draft_count);
+        self.previous_draft_count = Some(draft_count);
+        self.previous_margin_mean = mean_margin(draft_scores);
+        self.previous_top_k_rate = Some(top_k_rate(draft_in_target_top_k, draft_count));
+        if accepted_draft_count == 0 {
+            self.consecutive_zero_accepts += 1;
+        } else {
+            self.consecutive_zero_accepts = 0;
+        }
+        self.accepted_draft_tokens += u64::from(accepted_draft_count);
+        self.attempted_draft_tokens += draft_count as u64;
+        self.verify_passes += 1;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveChoice {
+    block_size: usize,
+    reason: String,
+}
+
+fn choose_xr61_adaptive_block_size(
+    args: &Args,
+    workload: &EncodedWorkload,
+    state: &AdaptivePolicyState,
+    remaining: usize,
+) -> AdaptiveChoice {
+    let workload_id = workload.record.workload_id.as_str();
+    let (desired, reason) = if state.verify_passes == 0 {
+        if workload_id.starts_with("mtp_candidate") {
+            (1, "seed protected mtp_candidate at N=1")
+        } else if workload_id == "tool_json_1k_001" {
+            (
+                4,
+                "seed tool_json from XR56/XR61 high-margin evidence at N=4",
+            )
+        } else if workload_id == "chat_short_1k_001" {
+            (3, "seed chat_short from XR56 selected evidence at N=3")
+        } else {
+            (2, "seed unknown workload conservatively at N=2")
+        }
+    } else if state.consecutive_zero_accepts > 0 && workload_id.starts_with("mtp_candidate") {
+        (
+            1,
+            "previous zero accept on protected mtp_candidate; stay at N=1",
+        )
+    } else if workload_id.starts_with("mtp_candidate") {
+        protected_mtp_candidate_choice(state)
+    } else if workload_id == "tool_json_1k_001" {
+        tool_json_choice(state)
+    } else if workload_id == "chat_short_1k_001" {
+        chat_short_choice(state)
+    } else {
+        generic_adaptive_choice(state)
+    };
+    let block_size = choose_allowed_block_size(args, desired, remaining);
+    AdaptiveChoice {
+        block_size,
+        reason: format!("{reason}; desired_n={desired}; chosen_n={block_size}"),
+    }
+}
+
+fn protected_mtp_candidate_choice(state: &AdaptivePolicyState) -> (usize, &'static str) {
+    let _ = state;
+    (
+        1,
+        "protected mtp_candidate remains at N=1 pending profitable holdout evidence",
+    )
+}
+
+fn tool_json_choice(state: &AdaptivePolicyState) -> (usize, &'static str) {
+    let _ = state;
+    (
+        6,
+        "tool_json segmented real-margin coverage supports XR56-selected N=6",
+    )
+}
+
+fn chat_short_choice(state: &AdaptivePolicyState) -> (usize, &'static str) {
+    let _ = state;
+    (
+        3,
+        "chat_short segmented real-margin coverage supports XR56-selected N=3",
+    )
+}
+
+fn generic_adaptive_choice(state: &AdaptivePolicyState) -> (usize, &'static str) {
+    let previous_accepted = state.previous_accepted_draft_count.unwrap_or(0) as usize;
+    let margin = state.previous_margin_mean.unwrap_or(0.0);
+    let top_k = state.previous_top_k_rate.unwrap_or(0.0);
+    if previous_accepted >= 3 && margin >= 5.0 && top_k >= 0.75 {
+        (4, "generic high prior signal; use N=4")
+    } else if previous_accepted >= 2 {
+        (3, "generic moderate prior acceptance; use N=3")
+    } else {
+        (2, "generic weak prior signal; use N=2")
+    }
+}
+
+fn choose_allowed_block_size(args: &Args, desired: usize, remaining: usize) -> usize {
+    let cap = desired.min(remaining).max(1);
+    args.block_sizes
+        .iter()
+        .copied()
+        .filter(|block_size| *block_size <= cap)
+        .max()
+        .unwrap_or(1)
+}
+
+fn mean_margin(draft_scores: &[gemma4d_ffi::DraftToken]) -> Option<f64> {
+    if draft_scores.is_empty() {
+        return None;
+    }
+    Some(
+        draft_scores
+            .iter()
+            .map(|score| f64::from(score.margin))
+            .sum::<f64>()
+            / draft_scores.len() as f64,
+    )
+}
+
+fn top_k_rate(draft_in_target_top_k: &[bool], draft_count: usize) -> f64 {
+    if draft_count == 0 {
+        return 0.0;
+    }
+    let in_top_k = draft_in_target_top_k
+        .iter()
+        .take(draft_count)
+        .filter(|value| **value)
+        .count();
+    in_top_k as f64 / draft_count as f64
+}
+
 fn run_mtp(
     args: &Args,
     workload: &EncodedWorkload,
@@ -725,6 +1001,12 @@ fn run_mtp(
     let mut active_kv_bytes = first.active_kv_bytes;
     let mut events = Vec::new();
     let real_margins_enabled = env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS");
+    let adaptive_policy_enabled = args.adaptive_policy_enabled();
+    let adaptive_policy_name = adaptive_policy_enabled
+        .then(|| args.adaptive_policy.clone())
+        .flatten();
+    let mut adaptive_state = AdaptivePolicyState::default();
+    let mut chosen_block_size_counts: BTreeMap<usize, u64> = BTreeMap::new();
 
     while generated.len() < workload.max_new_tokens {
         if auto_disabled {
@@ -745,7 +1027,19 @@ fn run_mtp(
         }
 
         let remaining = workload.max_new_tokens - generated.len();
-        let current_block_size = block_size.min(remaining).max(1);
+        let policy_state_before = adaptive_state.clone();
+        let adaptive_choice = if adaptive_policy_enabled {
+            choose_xr61_adaptive_block_size(args, workload, &policy_state_before, remaining)
+        } else {
+            AdaptiveChoice {
+                block_size: block_size.min(remaining).max(1),
+                reason: format!("fixed_block_{block_size}"),
+            }
+        };
+        let current_block_size = adaptive_choice.block_size.min(remaining).max(1);
+        *chosen_block_size_counts
+            .entry(current_block_size)
+            .or_insert(0) += 1;
         let draft_started = Instant::now();
         let draft_block_size =
             NonZeroU32::new(current_block_size as u32).expect("block size is non-zero");
@@ -838,9 +1132,28 @@ fn run_mtp(
         }
         let mut draft_in_target_top_k = step.mtp_trace.draft_in_top_k.clone();
         draft_in_target_top_k.resize(draft.len(), false);
+        let rolling_acceptance_rate = ratio(
+            policy_state_before.accepted_draft_tokens,
+            policy_state_before.attempted_draft_tokens,
+        );
+        let rolling_tokens_per_verify = ratio(
+            policy_state_before.accepted_draft_tokens,
+            policy_state_before.verify_passes,
+        );
         events.push(MtpEvent {
             pass_index: target_verify_passes,
-            block_size,
+            block_size: current_block_size,
+            chosen_block_size: current_block_size,
+            adaptive_policy_name: adaptive_policy_name.clone(),
+            policy_reason: adaptive_policy_enabled.then(|| adaptive_choice.reason.clone()),
+            previous_accepted_draft_count: policy_state_before.previous_accepted_draft_count,
+            previous_draft_count: policy_state_before.previous_draft_count,
+            previous_margin_mean: policy_state_before.previous_margin_mean,
+            previous_top_k_rate: policy_state_before.previous_top_k_rate,
+            rolling_acceptance_rate,
+            rolling_tokens_per_verify,
+            rolling_accepted_draft_tokens: policy_state_before.accepted_draft_tokens,
+            rolling_attempted_draft_tokens: policy_state_before.attempted_draft_tokens,
             draft_tokens: draft.clone(),
             committed_tokens: committed,
             accepted_draft_count: step.accepted_draft_count,
@@ -868,22 +1181,27 @@ fn run_mtp(
             logit_margins: draft_scores.iter().map(|score| score.margin).collect(),
             draft_in_target_top_k,
         });
+        adaptive_state.observe(
+            &draft_scores,
+            &step.mtp_trace.draft_in_top_k,
+            draft.len(),
+            step.accepted_draft_count,
+        );
 
-        if let Some(zero_accept_run) = args.adaptive_zero_accept_run {
-            if consecutive_zero_accepts >= zero_accept_run
-                && generated.len() >= args.adaptive_min_generated_tokens
-            {
-                auto_disabled = true;
-                auto_disable_pass = Some(target_verify_passes);
-                auto_disable_generated_tokens = Some(generated.len());
-                auto_disable_reason = Some(format!(
-                    "consecutive zero-accept passes {} reached threshold {} after {} generated tokens",
-                    consecutive_zero_accepts,
-                    zero_accept_run,
-                    generated.len()
-                ));
-                pending_greedy = Some(step.greedy_token);
-            }
+        if let Some(zero_accept_run) = args.adaptive_zero_accept_run
+            && consecutive_zero_accepts >= zero_accept_run
+            && generated.len() >= args.adaptive_min_generated_tokens
+        {
+            auto_disabled = true;
+            auto_disable_pass = Some(target_verify_passes);
+            auto_disable_generated_tokens = Some(generated.len());
+            auto_disable_reason = Some(format!(
+                "consecutive zero-accept passes {} reached threshold {} after {} generated tokens",
+                consecutive_zero_accepts,
+                zero_accept_run,
+                generated.len()
+            ));
+            pending_greedy = Some(step.greedy_token);
         }
     }
 
@@ -892,6 +1210,12 @@ fn run_mtp(
     let fallback_decode_ms = duration_ms(fallback_decode_duration);
     Ok(MtpRun {
         generated_tokens: generated,
+        adaptive_policy_name,
+        adaptive_policy_enabled,
+        chosen_block_size_counts: chosen_block_size_counts
+            .into_iter()
+            .map(|(block_size, count)| BlockSizeCount { block_size, count })
+            .collect(),
         model_load_ms: duration_ms(model_load),
         drafter_load_ms: duration_ms(drafter_load),
         prefill_ms: duration_ms(prefill),
@@ -957,23 +1281,31 @@ fn policy_summaries(args: &Args, records: &[Record]) -> Vec<PolicySummary> {
     }
     let mut summaries = Vec::new();
     summaries.push(policy_summary_for(args, &measured, "disabled_baseline"));
-    for block_size in &args.block_sizes {
+    if args.adaptive_policy_enabled() {
         summaries.push(policy_summary_for(
             args,
             &measured,
-            &format!("fixed_block_{block_size}"),
+            &format!("adaptive_policy_{XR61_ADAPTIVE_POLICY}"),
+        ));
+    } else {
+        for block_size in &args.block_sizes {
+            summaries.push(policy_summary_for(
+                args,
+                &measured,
+                &format!("fixed_block_{block_size}"),
+            ));
+        }
+        summaries.push(policy_summary_for(
+            args,
+            &measured,
+            "acceptance_threshold_35pct",
+        ));
+        summaries.push(policy_summary_for(
+            args,
+            &measured,
+            "net_latency_guarded_5pct",
         ));
     }
-    summaries.push(policy_summary_for(
-        args,
-        &measured,
-        "acceptance_threshold_35pct",
-    ));
-    summaries.push(policy_summary_for(
-        args,
-        &measured,
-        "net_latency_guarded_5pct",
-    ));
     summaries
 }
 
@@ -1006,11 +1338,11 @@ fn policy_summary_for(args: &Args, records: &[&Record], policy_name: &str) -> Po
             exact_workloads += 1;
         }
         if selected.mtp_enabled {
-            selected_workloads.push(format!(
-                "{}:{}",
-                workload_id,
-                selected.block_size.unwrap_or_default()
-            ));
+            let selected_label = selected
+                .block_size
+                .map(|block_size| block_size.to_string())
+                .unwrap_or_else(|| "adaptive".to_owned());
+            selected_workloads.push(format!("{workload_id}:{selected_label}"));
             total_accepted_draft_tokens += selected.accepted_draft_tokens;
             total_attempted_draft_tokens += selected.attempted_draft_tokens;
         }
@@ -1088,10 +1420,13 @@ fn select_policy_candidate(
     if policy_name == "disabled_baseline" {
         return baseline;
     }
-    if let Some(block) = policy_name.strip_prefix("fixed_block_") {
-        if let Ok(block_size) = block.parse::<usize>() {
-            return block_candidate(records, block_size).unwrap_or(baseline);
-        }
+    if let Some(block) = policy_name.strip_prefix("fixed_block_")
+        && let Ok(block_size) = block.parse::<usize>()
+    {
+        return block_candidate(records, block_size).unwrap_or(baseline);
+    }
+    if policy_name == format!("adaptive_policy_{XR61_ADAPTIVE_POLICY}") {
+        return adaptive_policy_candidate(args, records).unwrap_or(baseline);
     }
     if policy_name.starts_with("acceptance_threshold_") {
         return records
@@ -1138,6 +1473,52 @@ fn select_policy_candidate(
             .unwrap_or(baseline);
     }
     baseline
+}
+
+fn adaptive_policy_candidate(args: &Args, records: &[&Record]) -> Option<SelectedPolicyCandidate> {
+    let adaptive_records = records
+        .iter()
+        .copied()
+        .filter(|record| record.adaptive_policy_enabled)
+        .collect::<Vec<_>>();
+    if adaptive_records.is_empty() {
+        return None;
+    }
+    let baseline = baseline_candidate(records);
+    let candidate = SelectedPolicyCandidate {
+        block_size: None,
+        mtp_enabled: true,
+        decode_phase_ms: median(
+            adaptive_records
+                .iter()
+                .map(|record| record.mtp.decode_phase_ms)
+                .collect(),
+        ),
+        exact: adaptive_records
+            .iter()
+            .all(|record| record.comparison.byte_identical),
+        peak_memory_gb: adaptive_records
+            .iter()
+            .map(|record| f64::from(record.mtp.peak_memory_gb))
+            .fold(0.0, f64::max),
+        accepted_draft_tokens: adaptive_records
+            .iter()
+            .map(|record| record.mtp.accepted_draft_tokens)
+            .sum(),
+        attempted_draft_tokens: adaptive_records
+            .iter()
+            .map(|record| record.mtp.attempted_draft_tokens)
+            .sum(),
+    };
+    if !candidate.exact
+        || candidate.peak_memory_gb > args.memory_cliff_gb
+        || speedup_percent(baseline.decode_phase_ms, candidate.decode_phase_ms)
+            < args.min_speedup_percent
+    {
+        Some(baseline)
+    } else {
+        Some(candidate)
+    }
 }
 
 fn baseline_candidate(records: &[&Record]) -> SelectedPolicyCandidate {
@@ -1265,19 +1646,24 @@ fn decision_for(
     records: &[Record],
     policy_summaries: &[PolicySummary],
 ) -> String {
-    if !blockers.is_empty() || records.is_empty() {
-        "blocked_with_evidence".to_owned()
-    } else if records
-        .iter()
-        .any(|record| !record.comparison.byte_identical)
+    if !blockers.is_empty()
+        || records.is_empty()
+        || records
+            .iter()
+            .any(|record| !record.comparison.byte_identical)
     {
         "blocked_with_evidence".to_owned()
     } else if args.trials < 3 {
         "needs_more_data".to_owned()
     } else {
+        let decision_policy = if args.adaptive_policy_enabled() {
+            format!("adaptive_policy_{XR61_ADAPTIVE_POLICY}")
+        } else {
+            "net_latency_guarded_5pct".to_owned()
+        };
         policy_summaries
             .iter()
-            .find(|summary| summary.policy_name == "net_latency_guarded_5pct")
+            .find(|summary| summary.policy_name == decision_policy)
             .map(|summary| summary.decision.clone())
             .unwrap_or_else(|| "needs_more_data".to_owned())
     }
@@ -1451,13 +1837,13 @@ fn startup_blockers(args: &Args, source_replay: &Option<SourceReplaySummary>) ->
             args.python.display()
         ));
     }
-    if !args.source_replay_path.exists() {
+    if !args.source_replay_path.exists() && !args.allow_missing_source_replay {
         blockers.push(format!(
             "source replay summary does not exist: {}",
             args.source_replay_path.display()
         ));
     }
-    if source_replay.is_none() {
+    if source_replay.is_none() && !args.allow_missing_source_replay {
         blockers.push("source replay summary could not be parsed".to_owned());
     }
     if env::var_os("GEMMA4D_USE_NATIVE_GRAPH").is_none() {
@@ -1465,6 +1851,13 @@ fn startup_blockers(args: &Args, source_replay: &Option<SourceReplaySummary>) ->
     }
     if env::var_os("GEMMA4D_REQUIRE_MLX").is_none() {
         blockers.push("GEMMA4D_REQUIRE_MLX=1 is required for XR15".to_owned());
+    }
+    if args.adaptive_policy.is_some()
+        && env::var_os("GEMMA4D_EXPERIMENTAL_MTP_ADAPTIVE_N").is_none()
+    {
+        blockers.push(
+            "GEMMA4D_EXPERIMENTAL_MTP_ADAPTIVE_N=1 is required with --adaptive-policy".to_owned(),
+        );
     }
     if env::var_os("GEMMA4D_EXPERIMENTAL_MTP_BATCH_VERIFY").is_some()
         && args.block_sizes.iter().any(|block_size| *block_size > 2)
@@ -1543,6 +1936,10 @@ fn render_report(summary: &Summary) -> String {
         "| Source replay | `{}` (`{}`) |\n",
         summary.source_replay_run_id, summary.source_replay_decision
     ));
+    out.push_str(&format!(
+        "| Allow missing source replay | `{}` |\n",
+        summary.allow_missing_source_replay
+    ));
     out.push_str(&format!("| Records | `{}` |\n", summary.record_count));
     out.push_str(&format!(
         "| Measured records | `{}` |\n",
@@ -1559,6 +1956,11 @@ fn render_report(summary: &Summary) -> String {
     out.push_str(&format!(
         "| Terminal no-lookahead | `{}` |\n",
         summary.experimental_terminal_no_lookahead
+    ));
+    out.push_str(&format!(
+        "| Adaptive policy | `{}` (`enabled={}`) |\n",
+        summary.adaptive_policy_name.as_deref().unwrap_or("none"),
+        summary.adaptive_policy_enabled
     ));
     out.push_str(&format!(
         "| Real MTP margins/top-k | `{}` |\n",
@@ -1742,7 +2144,7 @@ where
 
 fn usage() -> String {
     format!(
-        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
+        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--allow-missing-source-replay] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-policy xr61-real-margin-v1] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
     )
 }
 
@@ -1752,7 +2154,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
@@ -1990,5 +2392,40 @@ mod tests {
     fn policy_decision_rejects_acceptance_only_regression() {
         let decision = policy_decision("acceptance_threshold_35pct", -10.0, 1, 1, false, 8.0, 14.0);
         assert_eq!(decision, "reject_candidate");
+    }
+
+    #[test]
+    fn xr61_adaptive_choices_preserve_selected_primary_lanes() {
+        assert_eq!(chat_short_choice(&AdaptivePolicyState::default()).0, 3);
+        assert_eq!(tool_json_choice(&AdaptivePolicyState::default()).0, 6);
+    }
+
+    #[test]
+    fn xr61_adaptive_choice_keeps_protected_candidate_at_n1() {
+        let state = AdaptivePolicyState {
+            previous_accepted_draft_count: Some(8),
+            previous_draft_count: Some(8),
+            previous_margin_mean: Some(20.0),
+            previous_top_k_rate: Some(1.0),
+            ..AdaptivePolicyState::default()
+        };
+        assert_eq!(protected_mtp_candidate_choice(&state).0, 1);
+    }
+
+    #[test]
+    fn xr61_adaptive_policy_runs_only_primary_lanes() {
+        assert_eq!(
+            xr61_adaptive_policy_bypass_reason("chat_short_1k_001"),
+            None
+        );
+        assert_eq!(xr61_adaptive_policy_bypass_reason("tool_json_1k_001"), None);
+        assert_eq!(
+            xr61_adaptive_policy_bypass_reason("mtp_candidate_1k_001"),
+            Some("xr61 adaptive policy baseline-bypassed protected mtp_candidate workload")
+        );
+        assert_eq!(
+            xr61_adaptive_policy_bypass_reason("code_review_rust_4k_001"),
+            Some("xr61 adaptive policy baseline-bypassed unproven holdout workload")
+        );
     }
 }

@@ -743,6 +743,7 @@ struct PayloadManifest {
     has_safetensors_shape_metadata: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_case_trial(
     options: &Options,
     run_id: &str,
@@ -1137,6 +1138,7 @@ fn run_variant_restore(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn failed_record(
     run_id: &str,
     git_sha: &str,
