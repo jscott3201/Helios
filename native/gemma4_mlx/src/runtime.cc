@@ -40,10 +40,13 @@ namespace {
 
 constexpr uint64_t kTargetMagic = 0x47454d3444415447ULL;
 constexpr uint64_t kDrafterMagic = 0x47454d3444524146ULL;
+constexpr uint64_t kDSparkDrafterMagic = 0x47454d344453504bULL;
 constexpr uint64_t kKvCacheMagic = 0x47454d344b564347ULL;
 constexpr uint64_t kKvSnapshotMagic = 0x47454d344b565347ULL;
 constexpr uint64_t kAdapterMagic = 0x47454d3441445054ULL;
 thread_local char g_last_error[512] = "";
+
+constexpr uint32_t kDSparkTargetLayerIds[GEMMA4_DSPARK_TARGET_TAP_COUNT] = {5, 17, 29, 41, 46};
 
 double elapsed_ms(std::chrono::steady_clock::time_point started) {
     return std::chrono::duration<double, std::milli>(
@@ -65,6 +68,9 @@ struct NativeTarget {
     uint64_t sequence_len;
     bool has_prefill_chunk_policy_override;
     Gemma4PrefillChunkPolicy prefill_chunk_policy;
+    bool dspark_taps_enabled;
+    uint32_t dspark_tap_layer_count;
+    uint32_t dspark_tap_layer_ids[GEMMA4_DSPARK_TARGET_TAP_COUNT];
     gemma4d::Gemma4ModelManifest manifest;
     std::unique_ptr<gemma4d::NativeTextModel> native_model;
     pid_t helper_pid;
@@ -105,6 +111,15 @@ struct NativeDrafter {
     gemma4d::Gemma4ModelManifest manifest;
     const gemma4d::NativeTextModel* target_native_model;
     std::unique_ptr<gemma4d::NativeMtpAssistantModel> native_model;
+};
+
+struct NativeDSparkDrafter {
+    uint64_t magic;
+    bool model_loaded;
+    std::string model_path;
+    gemma4d::Gemma4ModelManifest manifest;
+    const gemma4d::NativeTextModel* target_native_model;
+    std::unique_ptr<gemma4d::NativeDSparkModel> native_model;
 };
 
 struct NativeAdapter {
@@ -155,6 +170,45 @@ void clear_step_result(Gemma4StepResult* out) {
     if (out != nullptr) {
         std::memset(out, 0, sizeof(Gemma4StepResult));
     }
+}
+
+void clear_dspark_tap_info(Gemma4DSparkTapInfo* out) {
+    if (out != nullptr) {
+        std::memset(out, 0, sizeof(Gemma4DSparkTapInfo));
+    }
+}
+
+void clear_dspark_draft_result(Gemma4DSparkDraftResult* out) {
+    if (out != nullptr) {
+        std::memset(out, 0, sizeof(Gemma4DSparkDraftResult));
+    }
+}
+
+void reset_dspark_taps(NativeTarget* target) {
+    if (target == nullptr) {
+        return;
+    }
+    target->dspark_taps_enabled = false;
+    target->dspark_tap_layer_count = 0;
+    std::memset(target->dspark_tap_layer_ids, 0, sizeof(target->dspark_tap_layer_ids));
+    if (target->use_native_graph && target->native_model != nullptr) {
+        target->native_model->set_dspark_taps(nullptr, 0);
+    }
+}
+
+bool is_xr60_dspark_tap_config(const Gemma4DSparkTapConfig* config) {
+    if (config == nullptr || !config->enabled) {
+        return false;
+    }
+    if (config->layer_count != GEMMA4_DSPARK_TARGET_TAP_COUNT) {
+        return false;
+    }
+    for (size_t index = 0; index < GEMMA4_DSPARK_TARGET_TAP_COUNT; ++index) {
+        if (config->layer_ids[index] != kDSparkTargetLayerIds[index]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool same_kv_policy(const Gemma4KvPolicy& left, const Gemma4KvPolicy& right) {
@@ -799,6 +853,7 @@ struct Gemma4Target : NativeTarget {};
 struct Gemma4KvCache : NativeKvCache {};
 struct Gemma4KvSnapshot : NativeKvSnapshot {};
 struct Gemma4Drafter : NativeDrafter {};
+struct Gemma4DSparkDrafter : NativeDSparkDrafter {};
 struct Gemma4Adapter : NativeAdapter {};
 
 Gemma4Status gemma4_runtime_version(Gemma4VersionInfo* out) {
@@ -851,6 +906,7 @@ Gemma4Status gemma4_load_target(const Gemma4LoadConfig* config, Gemma4Target** o
         GEMMA4_PREFILL_CHUNK_DISABLED,
         0,
     };
+    reset_dspark_taps(target);
     target->manifest = gemma4d::Gemma4ModelManifest{};
     target->native_model.reset();
     target->helper_pid = -1;
@@ -956,6 +1012,59 @@ Gemma4Status gemma4_target_set_prefill_chunk_policy(
     target->prefill_chunk_policy = *policy;
     if (target->use_native_graph && target->native_model != nullptr) {
         target->native_model->set_prefill_chunk_policy(*policy);
+    }
+    return ok();
+}
+
+Gemma4Status gemma4_target_set_dspark_taps(
+    Gemma4Target* target,
+    const Gemma4DSparkTapConfig* config) {
+    if (target == nullptr) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_target_set_dspark_taps requires a non-null target");
+    }
+    if (target->magic != kTargetMagic) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_target_set_dspark_taps received an invalid target handle");
+    }
+    if (config == nullptr) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_target_set_dspark_taps requires a non-null config");
+    }
+
+    if (!config->enabled) {
+        reset_dspark_taps(target);
+        return ok();
+    }
+
+    if (!is_xr60_dspark_tap_config(config)) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "XR60 DSpark taps require exactly layers [5, 17, 29, 41, 46]");
+    }
+    if (target->model_loaded && !target->use_native_graph) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "DSpark hidden taps require a native graph target");
+    }
+    if (target->use_native_graph && target->native_model != nullptr && target->native_model->has_adapter()) {
+        return fail(
+            GEMMA4_ERR_ADAPTER,
+            "DSpark hidden taps are disabled while a standard LoRA adapter is active");
+    }
+
+    target->dspark_taps_enabled = true;
+    target->dspark_tap_layer_count = config->layer_count;
+    for (size_t index = 0; index < GEMMA4_DSPARK_TARGET_TAP_COUNT; ++index) {
+        target->dspark_tap_layer_ids[index] = config->layer_ids[index];
+    }
+    if (target->use_native_graph && target->native_model != nullptr) {
+        target->native_model->set_dspark_taps(
+            target->dspark_tap_layer_ids,
+            target->dspark_tap_layer_count);
     }
     return ok();
 }
@@ -1150,6 +1259,23 @@ Gemma4Status gemma4_kv_last_step(const Gemma4KvCache* cache, Gemma4StepResult* o
 
     *out = cache->last_step;
     out->native_last_hidden = cache->last_hidden.get();
+    return ok();
+}
+
+Gemma4Status gemma4_kv_dspark_tap_info(const Gemma4KvCache* cache, Gemma4DSparkTapInfo* out) {
+    clear_dspark_tap_info(out);
+
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_dspark_tap_info requires a valid cache handle");
+    }
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_kv_dspark_tap_info requires a non-null out pointer");
+    }
+    out->has_last_hidden = cache->last_hidden != nullptr;
+    if (cache->last_hidden == nullptr) {
+        return ok();
+    }
+    cache->last_hidden->fill_dspark_tap_info(out);
     return ok();
 }
 
@@ -1765,6 +1891,198 @@ Gemma4Status gemma4_mtp_draft_block(
             });
         }
     }
+    return ok();
+}
+
+Gemma4Status gemma4_load_dspark_drafter(
+    const Gemma4LoadConfig* config,
+    Gemma4Target* target,
+    Gemma4DSparkDrafter** out) {
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_dspark_drafter requires a non-null out pointer");
+    }
+    *out = nullptr;
+
+    if (config == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_dspark_drafter requires a non-null config");
+    }
+    if (target == nullptr || target->magic != kTargetMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_dspark_drafter requires a valid target handle");
+    }
+    if (is_empty(config->model_path)) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_load_dspark_drafter requires a non-empty model_path");
+    }
+    if (target->use_native_graph && target->native_model != nullptr && target->native_model->has_adapter()) {
+        return fail(
+            GEMMA4_ERR_ADAPTER,
+            "gemma4_load_dspark_drafter is disabled while a standard LoRA adapter is active");
+    }
+
+    Gemma4DSparkDrafter* drafter = new (std::nothrow) Gemma4DSparkDrafter{};
+    if (drafter == nullptr) {
+        return fail(GEMMA4_ERR_RUNTIME, "gemma4_load_dspark_drafter could not allocate drafter handle");
+    }
+
+    drafter->magic = kDSparkDrafterMagic;
+    drafter->model_loaded = false;
+    drafter->model_path = config->model_path;
+    drafter->manifest = gemma4d::Gemma4ModelManifest{};
+    drafter->target_native_model = target->use_native_graph ? target->native_model.get() : nullptr;
+    drafter->native_model.reset();
+
+    if (!config->allow_unsupported_config) {
+        std::error_code exists_error;
+        const std::filesystem::path model_path(config->model_path);
+        if (!std::filesystem::exists(model_path, exists_error)) {
+            delete drafter;
+            return fail(GEMMA4_ERR_MODEL_LOAD, "DSpark model_path does not exist");
+        }
+        if (!std::filesystem::is_directory(model_path, exists_error)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_MODEL_LOAD,
+                "DSpark model_path is not a directory: " + model_path.string());
+        }
+        if (!std::filesystem::exists(model_path / "config.json", exists_error)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_MODEL_LOAD,
+                "DSpark model_path is missing config.json: " + model_path.string());
+        }
+        if (!has_safetensors_file(model_path)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_MODEL_LOAD,
+                "DSpark model_path is missing model.safetensors: " + model_path.string());
+        }
+
+        std::string manifest_error;
+        if (!gemma4d::load_gemma4_dspark_manifest(model_path, &drafter->manifest, &manifest_error)) {
+            delete drafter;
+            return fail(
+                GEMMA4_ERR_UNSUPPORTED_CONFIG,
+                "unsupported Gemma 4 DSpark manifest: " + manifest_error);
+        }
+
+        if (target->use_native_graph) {
+            std::string native_error;
+            if (!gemma4d::NativeDSparkModel::load(
+                    model_path,
+                    drafter->manifest,
+                    &drafter->native_model,
+                    &native_error)) {
+                delete drafter;
+                return fail(GEMMA4_ERR_MODEL_LOAD, "native DSpark drafter load failed: " + native_error);
+            }
+        }
+        drafter->model_loaded = true;
+    }
+
+    *out = drafter;
+    return ok();
+}
+
+Gemma4Status gemma4_free_dspark_drafter(Gemma4DSparkDrafter* drafter) {
+    if (drafter == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_free_dspark_drafter requires a non-null drafter");
+    }
+    if (drafter->magic != kDSparkDrafterMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_free_dspark_drafter received an invalid drafter handle");
+    }
+
+    drafter->magic = 0;
+    delete drafter;
+    return ok();
+}
+
+Gemma4Status gemma4_dspark_draft_block(
+    Gemma4DSparkDrafter* drafter,
+    Gemma4KvCache* cache,
+    uint32_t max_block_size,
+    Gemma4DSparkDraftResult* out) {
+    clear_dspark_draft_result(out);
+
+    if (drafter == nullptr || drafter->magic != kDSparkDrafterMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_dspark_draft_block requires a valid drafter handle");
+    }
+    if (cache == nullptr || cache->magic != kKvCacheMagic) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_dspark_draft_block requires a valid cache handle");
+    }
+    if (out == nullptr) {
+        return fail(GEMMA4_ERR_INVALID_ARGUMENT, "gemma4_dspark_draft_block requires a non-null result");
+    }
+    if (max_block_size == 0 || max_block_size > GEMMA4_DSPARK_MAX_DRAFT_TOKENS) {
+        return fail(
+            GEMMA4_ERR_INVALID_ARGUMENT,
+            "gemma4_dspark_draft_block requires max_block_size in 1..=7");
+    }
+    if (!drafter->model_loaded) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires a loaded DSpark drafter; smoke handles do not draft");
+    }
+    if (cache->policy.active_mode != GEMMA4_KV_BF16 || cache->policy.allow_active_compressed_decode) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "DSpark drafting is disabled for compressed active KV until correctness is verified");
+    }
+    if (cache->last_hidden == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires target hidden taps from a native prefill/decode step");
+    }
+    Gemma4DSparkTapInfo tap_info{};
+    cache->last_hidden->fill_dspark_tap_info(&tap_info);
+    if (tap_info.layer_count != GEMMA4_DSPARK_TARGET_TAP_COUNT) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires all XR60 selected hidden taps");
+    }
+    if (drafter->target_native_model == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires a native target graph");
+    }
+    if (drafter->native_model == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires native DSpark tensors to be loaded");
+    }
+    if (drafter->target_native_model->has_adapter()) {
+        return fail(
+            GEMMA4_ERR_ADAPTER,
+            "gemma4_dspark_draft_block is disabled while a standard LoRA adapter is active");
+    }
+    if (cache->native_kv_state == nullptr) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires a native target KV state");
+    }
+    if (cache->native_tokens.empty()) {
+        return fail(
+            GEMMA4_ERR_UNSUPPORTED_CONFIG,
+            "gemma4_dspark_draft_block requires native context tokens");
+    }
+
+    size_t produced = max_block_size;
+    std::string native_error;
+    const auto started = std::chrono::steady_clock::now();
+    if (!drafter->native_model->draft_block(
+            *cache->native_kv_state,
+            *cache->last_hidden,
+            cache->native_tokens,
+            max_block_size,
+            out->tokens,
+            out->logits,
+            out->logit_margins,
+            out->confidence,
+            &produced,
+            &native_error)) {
+        return fail(GEMMA4_ERR_UNSUPPORTED_CONFIG, native_error);
+    }
+    out->token_count = static_cast<uint32_t>(std::min<size_t>(produced, GEMMA4_DSPARK_MAX_DRAFT_TOKENS));
+    out->draft_ms = elapsed_ms(started);
+    out->scheduler_us = 0;
     return ok();
 }
 

@@ -38,6 +38,7 @@ public:
     uint64_t sequence_len() const;
     uint32_t hidden_size() const;
     bool has_shared_kv() const;
+    void fill_dspark_tap_info(Gemma4DSparkTapInfo* out) const;
     std::unique_ptr<NativeHiddenState> clone() const;
 
 private:
@@ -46,6 +47,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     friend class NativeMtpAssistantModel;
+    friend class NativeDSparkModel;
     friend class NativeKvState;
     friend class NativeTextModel;
 };
@@ -92,6 +94,7 @@ public:
 private:
     std::unique_ptr<Impl> impl_;
 
+    friend class NativeDSparkModel;
     friend class NativeTextModel;
 };
 
@@ -152,6 +155,7 @@ public:
     size_t tensor_count() const;
     std::string summary() const;
     void set_prefill_chunk_policy(const Gemma4PrefillChunkPolicy& policy);
+    void set_dspark_taps(const uint32_t* layer_ids, size_t layer_count);
     bool set_adapter(std::shared_ptr<const NativeLoraAdapter> adapter, std::string* error);
     void clear_adapter();
     bool has_adapter() const;
@@ -251,6 +255,42 @@ public:
         std::string* error,
         bool lazy_second_draft = false,
         int32_t first_accept_token = 0) const;
+
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+class NativeDSparkModel {
+public:
+    struct Impl;
+
+    NativeDSparkModel();
+    ~NativeDSparkModel();
+
+    NativeDSparkModel(const NativeDSparkModel&) = delete;
+    NativeDSparkModel& operator=(const NativeDSparkModel&) = delete;
+    NativeDSparkModel(NativeDSparkModel&&) noexcept;
+    NativeDSparkModel& operator=(NativeDSparkModel&&) noexcept;
+
+    static bool load(
+        const std::filesystem::path& model_path,
+        const Gemma4ModelManifest& manifest,
+        std::unique_ptr<NativeDSparkModel>* out,
+        std::string* error);
+
+    size_t tensor_count() const;
+    std::string summary() const;
+    bool draft_block(
+        const NativeKvState& target_kv,
+        const NativeHiddenState& last_hidden,
+        const std::vector<int32_t>& context_tokens,
+        uint32_t block_size,
+        int32_t* out_tokens,
+        float* out_logits,
+        float* out_logit_margins,
+        float* out_confidence,
+        size_t* inout_count,
+        std::string* error) const;
 
 private:
     std::unique_ptr<Impl> impl_;

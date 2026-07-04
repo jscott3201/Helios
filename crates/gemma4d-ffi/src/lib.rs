@@ -27,6 +27,9 @@ mod raw {
     pub const GEMMA4_MTP_MAX_COMMITTED_TOKENS: usize = GEMMA4_MTP_TRACE_MAX_POSITIONS;
     pub const GEMMA4_MTP_TRACE_TOP_K: usize = 5;
     pub const GEMMA4_MTP_TRACE_MAX_RANK: usize = 4;
+    pub const GEMMA4_DSPARK_TARGET_TAP_COUNT: usize = 5;
+    pub const GEMMA4_DSPARK_MAX_DRAFT_TOKENS: usize = 7;
+    pub const GEMMA4_DSPARK_TAP_MAX_RANK: usize = 4;
 
     #[repr(C)]
     pub struct Gemma4Target {
@@ -35,6 +38,11 @@ mod raw {
 
     #[repr(C)]
     pub struct Gemma4Drafter {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    pub struct Gemma4DSparkDrafter {
         _private: [u8; 0],
     }
 
@@ -91,6 +99,37 @@ mod raw {
         pub compress_sliding_layers: bool,
         pub keep_mtp_shared_layers_bf16: bool,
         pub allow_active_compressed_decode: bool,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Gemma4DSparkTapConfig {
+        pub enabled: bool,
+        pub layer_count: u32,
+        pub layer_ids: [u32; GEMMA4_DSPARK_TARGET_TAP_COUNT],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Gemma4DSparkTapInfo {
+        pub has_last_hidden: bool,
+        pub layer_count: u32,
+        pub layer_ids: [u32; GEMMA4_DSPARK_TARGET_TAP_COUNT],
+        pub tap_ranks: [u32; GEMMA4_DSPARK_TARGET_TAP_COUNT],
+        pub tap_shapes: [u64; GEMMA4_DSPARK_TARGET_TAP_COUNT * GEMMA4_DSPARK_TAP_MAX_RANK],
+        pub tap_bytes: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct Gemma4DSparkDraftResult {
+        pub token_count: u32,
+        pub tokens: [i32; GEMMA4_DSPARK_MAX_DRAFT_TOKENS],
+        pub logits: [f32; GEMMA4_DSPARK_MAX_DRAFT_TOKENS],
+        pub logit_margins: [f32; GEMMA4_DSPARK_MAX_DRAFT_TOKENS],
+        pub confidence: [f32; GEMMA4_DSPARK_MAX_DRAFT_TOKENS],
+        pub draft_ms: f64,
+        pub scheduler_us: u64,
     }
 
     #[repr(C)]
@@ -217,6 +256,10 @@ mod raw {
             target: *mut Gemma4Target,
             policy: *const Gemma4PrefillChunkPolicy,
         ) -> Gemma4Status;
+        pub fn gemma4_target_set_dspark_taps(
+            target: *mut Gemma4Target,
+            config: *const Gemma4DSparkTapConfig,
+        ) -> Gemma4Status;
         pub fn gemma4_load_adapter(
             target: *mut Gemma4Target,
             config: *const Gemma4AdapterLoadConfig,
@@ -242,6 +285,10 @@ mod raw {
         pub fn gemma4_kv_last_step(
             cache: *const Gemma4KvCache,
             out: *mut Gemma4StepResult,
+        ) -> Gemma4Status;
+        pub fn gemma4_kv_dspark_tap_info(
+            cache: *const Gemma4KvCache,
+            out: *mut Gemma4DSparkTapInfo,
         ) -> Gemma4Status;
         pub fn gemma4_kv_snapshot_export(
             cache: *const Gemma4KvCache,
@@ -316,6 +363,18 @@ mod raw {
             out_logit_margins: *mut f32,
             inout_count: *mut usize,
         ) -> Gemma4Status;
+        pub fn gemma4_load_dspark_drafter(
+            config: *const Gemma4LoadConfig,
+            target: *mut Gemma4Target,
+            out: *mut *mut Gemma4DSparkDrafter,
+        ) -> Gemma4Status;
+        pub fn gemma4_free_dspark_drafter(drafter: *mut Gemma4DSparkDrafter) -> Gemma4Status;
+        pub fn gemma4_dspark_draft_block(
+            drafter: *mut Gemma4DSparkDrafter,
+            cache: *mut Gemma4KvCache,
+            max_block_size: u32,
+            out: *mut Gemma4DSparkDraftResult,
+        ) -> Gemma4Status;
         pub fn gemma4_verify_tokens(
             target: *mut Gemma4Target,
             cache: *mut Gemma4KvCache,
@@ -335,12 +394,93 @@ mod raw {
 }
 
 pub const MTP_MAX_DRAFT_TOKENS: usize = raw::GEMMA4_MTP_MAX_DRAFT_TOKENS;
+pub const DSPARK_TARGET_TAP_COUNT: usize = raw::GEMMA4_DSPARK_TARGET_TAP_COUNT;
+pub const DSPARK_MAX_DRAFT_TOKENS: usize = raw::GEMMA4_DSPARK_MAX_DRAFT_TOKENS;
+
+const XR60_DSPARK_LAYER_IDS: [u32; DSPARK_TARGET_TAP_COUNT] = [5, 17, 29, 41, 46];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DraftToken {
     pub token: i32,
     pub logit: f32,
     pub margin: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DSparkDraftToken {
+    pub token: i32,
+    pub logit: f32,
+    pub margin: f32,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DSparkDraftBlock {
+    pub tokens: Vec<DSparkDraftToken>,
+    pub draft_ms: f64,
+    pub scheduler_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DSparkTapConfig {
+    enabled: bool,
+    layer_ids: Vec<u32>,
+}
+
+impl DSparkTapConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            layer_ids: Vec::new(),
+        }
+    }
+
+    pub fn xr60_default() -> Self {
+        Self {
+            enabled: true,
+            layer_ids: XR60_DSPARK_LAYER_IDS.to_vec(),
+        }
+    }
+
+    pub fn enabled(layer_ids: impl IntoIterator<Item = u32>) -> Result<Self> {
+        let layer_ids = layer_ids.into_iter().collect::<Vec<_>>();
+        if layer_ids.len() > DSPARK_TARGET_TAP_COUNT {
+            return Err(Error {
+                status: Status::InvalidArgument,
+                message: format!(
+                    "DSpark tap config supports at most {DSPARK_TARGET_TAP_COUNT} layers"
+                ),
+            });
+        }
+        Ok(Self {
+            enabled: true,
+            layer_ids,
+        })
+    }
+
+    pub fn layer_ids(&self) -> &[u32] {
+        &self.layer_ids
+    }
+
+    fn raw(&self) -> raw::Gemma4DSparkTapConfig {
+        let mut layer_ids = [0; raw::GEMMA4_DSPARK_TARGET_TAP_COUNT];
+        for (index, layer_id) in self.layer_ids.iter().copied().enumerate() {
+            layer_ids[index] = layer_id;
+        }
+        raw::Gemma4DSparkTapConfig {
+            enabled: self.enabled,
+            layer_count: self.layer_ids.len() as u32,
+            layer_ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DSparkTapInfo {
+    pub has_last_hidden: bool,
+    pub layer_ids: Vec<u32>,
+    pub tap_shapes: Vec<Vec<u64>>,
+    pub tap_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,6 +712,17 @@ impl Target {
             raw::gemma4_target_set_prefill_chunk_policy(self.ptr.as_ptr(), &raw_policy)
         })
     }
+
+    pub fn set_dspark_taps(&mut self, config: &DSparkTapConfig) -> Result<()> {
+        let raw_config = config.raw();
+        // SAFETY: `self.ptr` is an owned target handle, and `raw_config` is a valid stack config
+        // pointer for the duration of the call.
+        check(unsafe { raw::gemma4_target_set_dspark_taps(self.ptr.as_ptr(), &raw_config) })
+    }
+
+    pub fn load_dspark_drafter(&self, config: &LoadConfig) -> Result<DSparkDrafter<'_>> {
+        DSparkDrafter::load(config, self)
+    }
 }
 
 impl Drop for Target {
@@ -705,6 +856,70 @@ impl Drop for Drafter<'_> {
 }
 
 #[derive(Debug)]
+pub struct DSparkDrafter<'target> {
+    ptr: NonNull<raw::Gemma4DSparkDrafter>,
+    _target: PhantomData<&'target Target>,
+}
+
+impl<'target> DSparkDrafter<'target> {
+    pub fn load(config: &LoadConfig, target: &'target Target) -> Result<Self> {
+        let model_path = CString::new(config.model_path.as_str())?;
+        let model_id = optional_cstring(config.model_id.as_deref())?;
+        let model_revision = optional_cstring(config.model_revision.as_deref())?;
+        let expected_architecture = optional_cstring(config.expected_architecture.as_deref())?;
+
+        let raw_config = raw::Gemma4LoadConfig {
+            model_path: model_path.as_ptr(),
+            model_id: optional_ptr(&model_id),
+            model_revision: optional_ptr(&model_revision),
+            expected_architecture: optional_ptr(&expected_architecture),
+            max_context_tokens: config.max_context_tokens.get(),
+            allow_unsupported_config: config.allow_unsupported_config,
+        };
+
+        let mut out = ptr::null_mut();
+        // SAFETY: `raw_config` C strings live through the call; `target` is valid; `out` is writable.
+        check(unsafe {
+            raw::gemma4_load_dspark_drafter(&raw_config, target.ptr.as_ptr(), &mut out)
+        })?;
+        let ptr = NonNull::new(out).ok_or_else(|| Error {
+            status: Status::Runtime,
+            message: "gemma4_load_dspark_drafter returned OK with a null drafter".to_owned(),
+        })?;
+        Ok(Self {
+            ptr,
+            _target: PhantomData,
+        })
+    }
+
+    pub fn draft_block(
+        &self,
+        cache: &mut KvCache,
+        max_block_size: NonZeroU32,
+    ) -> Result<DSparkDraftBlock> {
+        let mut out = raw::Gemma4DSparkDraftResult::default();
+        // SAFETY: handles come from safe wrappers and `out` is writable for the duration of the call.
+        check(unsafe {
+            raw::gemma4_dspark_draft_block(
+                self.ptr.as_ptr(),
+                cache.ptr.as_ptr(),
+                max_block_size.get(),
+                &mut out,
+            )
+        })?;
+        Ok(dspark_draft_block_from_raw(&out))
+    }
+}
+
+impl Drop for DSparkDrafter<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is an owned DSpark drafter handle returned by `gemma4_load_dspark_drafter`.
+        let status = unsafe { raw::gemma4_free_dspark_drafter(self.ptr.as_ptr()) };
+        debug_assert_eq!(Status::from_raw(status), Status::Ok);
+    }
+}
+
+#[derive(Debug)]
 pub struct KvCache {
     ptr: NonNull<raw::Gemma4KvCache>,
 }
@@ -743,6 +958,13 @@ impl KvCache {
         // SAFETY: `self.ptr` is an owned KV cache handle and `out` is writable.
         check(unsafe { raw::gemma4_kv_last_step(self.ptr.as_ptr(), &mut out) })?;
         Ok(out.into())
+    }
+
+    pub fn dspark_tap_info(&self) -> Result<DSparkTapInfo> {
+        let mut out = raw::Gemma4DSparkTapInfo::default();
+        // SAFETY: `self.ptr` is an owned KV cache handle and `out` is writable.
+        check(unsafe { raw::gemma4_kv_dspark_tap_info(self.ptr.as_ptr(), &mut out) })?;
+        Ok(dspark_tap_info_from_raw(&out))
     }
 
     pub fn export_snapshot(&self) -> Result<KvSnapshot> {
@@ -1029,6 +1251,44 @@ fn shape_from_raw(rank: u32, shape: &[u64; raw::GEMMA4_MTP_TRACE_MAX_RANK]) -> V
     shape[..rank].to_vec()
 }
 
+fn dspark_tap_info_from_raw(raw: &raw::Gemma4DSparkTapInfo) -> DSparkTapInfo {
+    let layer_count = raw
+        .layer_count
+        .min(raw::GEMMA4_DSPARK_TARGET_TAP_COUNT as u32) as usize;
+    let mut tap_shapes = Vec::with_capacity(layer_count);
+    for index in 0..layer_count {
+        let rank = raw.tap_ranks[index].min(raw::GEMMA4_DSPARK_TAP_MAX_RANK as u32) as usize;
+        let start = index * raw::GEMMA4_DSPARK_TAP_MAX_RANK;
+        tap_shapes.push(raw.tap_shapes[start..start + rank].to_vec());
+    }
+
+    DSparkTapInfo {
+        has_last_hidden: raw.has_last_hidden,
+        layer_ids: raw.layer_ids[..layer_count].to_vec(),
+        tap_shapes,
+        tap_bytes: raw.tap_bytes,
+    }
+}
+
+fn dspark_draft_block_from_raw(raw: &raw::Gemma4DSparkDraftResult) -> DSparkDraftBlock {
+    let token_count = raw
+        .token_count
+        .min(raw::GEMMA4_DSPARK_MAX_DRAFT_TOKENS as u32) as usize;
+    let tokens = (0..token_count)
+        .map(|index| DSparkDraftToken {
+            token: raw.tokens[index],
+            logit: raw.logits[index],
+            margin: raw.logit_margins[index],
+            confidence: raw.confidence[index],
+        })
+        .collect();
+    DSparkDraftBlock {
+        tokens,
+        draft_ms: raw.draft_ms,
+        scheduler_us: raw.scheduler_us,
+    }
+}
+
 pub fn prefill(target: &Target, cache: &mut KvCache, tokens: &[i32]) -> Result<StepResult> {
     let mut out = raw::Gemma4StepResult::default();
     let token_ptr = if tokens.is_empty() {
@@ -1292,6 +1552,16 @@ mod tests {
     }
 
     #[test]
+    fn dspark_raw_layout_stays_pinned() {
+        assert_eq!(std::mem::size_of::<raw::Gemma4DSparkTapConfig>(), 28);
+        assert_eq!(std::mem::align_of::<raw::Gemma4DSparkTapConfig>(), 4);
+        assert_eq!(std::mem::size_of::<raw::Gemma4DSparkTapInfo>(), 216);
+        assert_eq!(std::mem::align_of::<raw::Gemma4DSparkTapInfo>(), 8);
+        assert_eq!(std::mem::size_of::<raw::Gemma4DSparkDraftResult>(), 136);
+        assert_eq!(std::mem::align_of::<raw::Gemma4DSparkDraftResult>(), 8);
+    }
+
+    #[test]
     fn target_and_kv_lifecycle_work_without_model_loading() {
         let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
         let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
@@ -1301,6 +1571,53 @@ mod tests {
         drop(drafter);
         drop(cache);
         drop(target);
+    }
+
+    #[test]
+    fn dspark_lifecycle_and_tap_info_fail_closed_without_model_loading() {
+        let mut target =
+            Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        target
+            .set_dspark_taps(&DSparkTapConfig::xr60_default())
+            .expect("XR60 DSpark tap config should be accepted on smoke target");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+
+        let info = cache
+            .dspark_tap_info()
+            .expect("empty cache should report no DSpark taps");
+        assert!(!info.has_last_hidden);
+        assert!(info.layer_ids.is_empty());
+
+        let drafter = target
+            .load_dspark_drafter(&LoadConfig::smoke("/tmp/gemma4d-dspark-smoke"))
+            .expect("DSpark smoke drafter handle");
+        let err = drafter
+            .draft_block(&mut cache, NonZeroU32::new(1).expect("non-zero"))
+            .expect_err("DSpark smoke handles must not draft");
+        assert_eq!(err.status(), Status::UnsupportedConfig);
+        assert!(err.message().contains("loaded DSpark drafter"));
+        drop(drafter);
+
+        target
+            .set_dspark_taps(&DSparkTapConfig::disabled())
+            .expect("DSpark taps should disable cleanly");
+    }
+
+    #[test]
+    fn dspark_tap_setter_rejects_non_xr60_layers() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let raw_config = raw::Gemma4DSparkTapConfig {
+            enabled: true,
+            layer_count: 1,
+            layer_ids: [5, 0, 0, 0, 0],
+        };
+
+        // SAFETY: `target` is a valid smoke target; the intentionally incomplete
+        // layer list validates native DSpark argument checks without model execution.
+        let status =
+            unsafe { raw::gemma4_target_set_dspark_taps(target.ptr.as_ptr(), &raw_config) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("XR60 DSpark taps"));
     }
 
     #[test]
@@ -1451,7 +1768,10 @@ mod tests {
             allow_unsupported_config: false,
         };
 
-        let target = Target::load(&config).expect("native target model should load");
+        let mut target = Target::load(&config).expect("native target model should load");
+        target
+            .set_dspark_taps(&DSparkTapConfig::xr60_default())
+            .expect("XR60 DSpark taps should enable on native target");
         let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
         let step = prefill(&target, &mut cache, &[9259]).expect("native prefill should run");
         assert_eq!(step.sequence_len, 1);
@@ -1459,6 +1779,13 @@ mod tests {
         assert!(step.peak_memory_gb > 0.0);
         assert!(step.active_kv_bytes > 0);
         assert!(step.native_last_hidden.is_some());
+        let tap_info = cache
+            .dspark_tap_info()
+            .expect("native prefill should expose DSpark tap metadata");
+        assert!(tap_info.has_last_hidden);
+        assert_eq!(tap_info.layer_ids, XR60_DSPARK_LAYER_IDS.to_vec());
+        assert_eq!(tap_info.tap_shapes, vec![vec![1, 1, 3840]; 5]);
+        assert!(tap_info.tap_bytes > 0);
 
         let mut baseline_cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
         let baseline_first =
@@ -1599,9 +1926,19 @@ mod tests {
         assert!(last_error_message().contains("prefill_chunk_policy"));
 
         // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe { raw::gemma4_target_set_dspark_taps(ptr::null_mut(), ptr::null()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("dspark_taps"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
         let status = unsafe { raw::gemma4_kv_create(ptr::null(), ptr::null_mut()) };
         assert_eq!(Status::from_raw(status), Status::InvalidArgument);
         assert!(last_error_message().contains("kv_create"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe { raw::gemma4_kv_dspark_tap_info(ptr::null(), ptr::null_mut()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("dspark_tap_info"));
 
         // SAFETY: This deliberately passes null pointers to validate native argument checks.
         let status =
@@ -1610,9 +1947,21 @@ mod tests {
         assert!(last_error_message().contains("load_drafter"));
 
         // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe {
+            raw::gemma4_load_dspark_drafter(ptr::null(), ptr::null_mut(), ptr::null_mut())
+        };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("load_dspark_drafter"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
         let status = unsafe { raw::gemma4_free_drafter(ptr::null_mut()) };
         assert_eq!(Status::from_raw(status), Status::InvalidArgument);
         assert!(last_error_message().contains("free_drafter"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe { raw::gemma4_free_dspark_drafter(ptr::null_mut()) };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("free_dspark_drafter"));
 
         // SAFETY: This deliberately passes null pointers to validate native argument checks.
         let status = unsafe {
@@ -1628,6 +1977,13 @@ mod tests {
         };
         assert_eq!(Status::from_raw(status), Status::InvalidArgument);
         assert!(last_error_message().contains("mtp_draft_block"));
+
+        // SAFETY: This deliberately passes null pointers to validate native argument checks.
+        let status = unsafe {
+            raw::gemma4_dspark_draft_block(ptr::null_mut(), ptr::null_mut(), 0, ptr::null_mut())
+        };
+        assert_eq!(Status::from_raw(status), Status::InvalidArgument);
+        assert!(last_error_message().contains("dspark_draft_block"));
 
         // SAFETY: This deliberately passes null pointers to validate native argument checks.
         let status = unsafe {
@@ -1684,6 +2040,55 @@ mod tests {
     }
 
     #[test]
+    fn dspark_drafter_strict_load_reports_missing_path() {
+        let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        let config = LoadConfig {
+            model_path: "/tmp/gemma4d-missing-dspark-drafter".to_owned(),
+            model_id: Some("deepseek-ai/dspark_gemma4_12b_block7".to_owned()),
+            model_revision: Some("2fa72e7".to_owned()),
+            expected_architecture: Some("Gemma4DSparkModel".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let err = target
+            .load_dspark_drafter(&config)
+            .expect_err("strict DSpark load should fail");
+        assert_eq!(err.status(), Status::ModelLoad);
+        assert!(err.message().contains("DSpark model_path does not exist"));
+    }
+
+    #[test]
+    fn dspark_drafter_strict_load_accepts_released_block7_manifest_but_requires_taps() {
+        let fixture = write_dspark_fixture();
+        let mut target =
+            Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
+        target
+            .set_dspark_taps(&DSparkTapConfig::xr60_default())
+            .expect("XR60 taps should be accepted before loading DSpark");
+        let config = LoadConfig {
+            model_path: fixture.to_string_lossy().into_owned(),
+            model_id: Some("deepseek-ai/dspark_gemma4_12b_block7".to_owned()),
+            model_revision: Some("2fa72e7".to_owned()),
+            expected_architecture: Some("Gemma4DSparkModel".to_owned()),
+            max_context_tokens: NonZeroU32::new(8192).expect("non-zero"),
+            allow_unsupported_config: false,
+        };
+
+        let drafter = target
+            .load_dspark_drafter(&config)
+            .expect("released DSpark block-7 manifest should load");
+        let mut cache = KvCache::create(&KvPolicy::default()).expect("kv cache handle");
+        let err = drafter
+            .draft_block(&mut cache, NonZeroU32::new(1).expect("non-zero"))
+            .expect_err("DSpark draft execution still requires native hidden taps");
+        assert_eq!(err.status(), Status::UnsupportedConfig);
+        assert!(err.message().contains("target hidden taps"));
+
+        fs::remove_dir_all(fixture).expect("remove DSpark fixture");
+    }
+
+    #[test]
     fn smoke_drafter_draft_block_is_unsupported() {
         let target = Target::load(&LoadConfig::smoke("/tmp/gemma4d-smoke")).expect("target handle");
         let drafter = Drafter::load(&LoadConfig::smoke("/tmp/gemma4d-smoke-drafter"), &target)
@@ -1719,6 +2124,20 @@ mod tests {
             .expect("write assistant config");
         fs::write(dir.join("tokenizer.json"), "{}").expect("write assistant tokenizer");
         write_safetensors_header(&dir.join("model.safetensors"), assistant_tensor_keys());
+        dir
+    }
+
+    fn write_dspark_fixture() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        dir.push(format!("gemma4d-dspark-fixture-{unique}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create DSpark fixture dir");
+        fs::write(dir.join("config.json"), dspark_config_json()).expect("write DSpark config");
+        write_safetensors_header(&dir.join("model.safetensors"), dspark_tensor_keys());
         dir
     }
 
@@ -1793,6 +2212,86 @@ mod tests {
                     format!("{prefix}.biases"),
                 ]);
             }
+        }
+        keys
+    }
+
+    fn dspark_config_json() -> &'static str {
+        r#"{
+  "architectures": ["Gemma4DSparkModel"],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "attention_k_eq_v": true,
+  "block_size": 7,
+  "bos_token_id": 2,
+  "confidence_head_with_markov": true,
+  "dtype": "bfloat16",
+  "enable_confidence_head": true,
+  "enable_moe_block": false,
+  "eos_token_id": 1,
+  "global_head_dim": 512,
+  "head_dim": 256,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "hidden_size": 3840,
+  "intermediate_size": 15360,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "markov_head_type": "vanilla",
+  "markov_rank": 256,
+  "mask_token_id": 4,
+  "max_position_embeddings": 262144,
+  "model_type": "gemma4_text",
+  "num_anchors": 512,
+  "num_attention_heads": 16,
+  "num_global_key_value_heads": 1,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_kv_shared_layers": 0,
+  "pad_token_id": 0,
+  "sliding_window": 1024,
+  "target_layer_ids": [5, 17, 29, 41, 46],
+  "target_model_type": "gemma4_unified",
+  "target_text_model_type": "gemma4_unified_text",
+  "tie_word_embeddings": false,
+  "vocab_size": 262144,
+  "vocab_size_per_layer_input": 262144
+}"#
+    }
+
+    fn dspark_tensor_keys() -> Vec<String> {
+        let mut keys = vec![
+            "embed_tokens.weight".to_owned(),
+            "fc.weight".to_owned(),
+            "hidden_norm.weight".to_owned(),
+            "norm.weight".to_owned(),
+            "lm_head.weight".to_owned(),
+            "markov_head.markov_w1.weight".to_owned(),
+            "markov_head.markov_w2.weight".to_owned(),
+            "confidence_head.proj.weight".to_owned(),
+            "confidence_head.proj.bias".to_owned(),
+        ];
+        for layer in 0..5 {
+            let base = format!("layers.{layer}");
+            keys.extend([
+                format!("{base}.input_layernorm.weight"),
+                format!("{base}.post_attention_layernorm.weight"),
+                format!("{base}.pre_feedforward_layernorm.weight"),
+                format!("{base}.post_feedforward_layernorm.weight"),
+                format!("{base}.layer_scalar"),
+                format!("{base}.self_attn.q_proj.weight"),
+                format!("{base}.self_attn.k_proj.weight"),
+                format!("{base}.self_attn.o_proj.weight"),
+                format!("{base}.self_attn.q_norm.weight"),
+                format!("{base}.self_attn.k_norm.weight"),
+                format!("{base}.mlp.gate_proj.weight"),
+                format!("{base}.mlp.up_proj.weight"),
+                format!("{base}.mlp.down_proj.weight"),
+            ]);
         }
         keys
     }
