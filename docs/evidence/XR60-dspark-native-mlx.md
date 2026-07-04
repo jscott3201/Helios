@@ -373,6 +373,44 @@ quantization. The DSpark checkpoint config is BF16 and identifies the target as
 whether the 4-bit target tap distribution is compatible with the released
 DeepSpec drafter.
 
+## Native Hidden Tap Snapshot Slice
+
+The fixed-prefix benchmark can now emit native target hidden-tap snapshots for
+Phase 2 parity without adding a new C ABI surface. The implementation uses the
+existing native KV snapshot exporter, which already persists
+`dspark_context.tap_*.hidden` arrays when XR60 taps are enabled.
+
+Smoke command:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/tap-snapshot-smoke --native-tap-snapshot-dir benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/native_tap_snapshot_manifest.json
+benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/xr60-1783154137-hello_smoke.safetensors
+benchmarks/out/XR60-dspark-native-mlx/tap-snapshot-smoke/{records.jsonl,summary.json,report.md,blockers.md,decision.md}
+```
+
+Result:
+
+- manifest status: `ready_for_reference_compare`
+- workload: `hello_smoke`
+- prompt tokens: `[9259]`
+- prefill greedy token/logit: `236772`, `17.75`
+- tap layer ids: `[5, 17, 29, 41, 46]`
+- tap shapes: five `[1, 1, 3840]` tensors
+- tap bytes: `38400`
+- snapshot payload size: about `410K`
+- DSpark exactness still passed only through verifier fallback; accepted draft
+  tokens remained `0`
+
+This gives the native side of hidden-tap parity a concrete, small artifact.
+DeepSpec/PyTorch fixture comparison remains blocked on local Python
+dependencies.
+
 ## Verification
 
 Commands run:
@@ -393,6 +431,8 @@ GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_m
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/trace-anchor-mask --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/trace-anchor-mask-2tok --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 2
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 2
+GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/tap-snapshot-smoke --native-tap-snapshot-dir benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
 ```
 
 Observed result:
@@ -423,6 +463,10 @@ Observed result:
   `benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
   Exactness passed for both bounded workloads and all fixed block sizes, but
   every record still had `accepted_draft_tokens = 0`.
+- The native hidden-tap snapshot smoke wrote
+  `benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/native_tap_snapshot_manifest.json`
+  and a small safetensors payload containing the selected native DSpark context
+  taps for `hello_smoke`.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and

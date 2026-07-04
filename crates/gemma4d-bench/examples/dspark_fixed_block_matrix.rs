@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_id = run_id();
     let mut blockers = startup_blockers(&args, &draft_config);
     let mut records = Vec::new();
+    let mut native_tap_snapshots = Vec::new();
     if blockers.is_empty() {
         eprintln!("XR60 DSpark loading target: {}", args.model_path.display());
         match Target::load(&target_config(&args)) {
@@ -50,6 +51,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match DSparkDrafter::load(&dspark_config(&args), &target) {
                         Ok(drafter) => {
                             for probe in probes(args.max_new_tokens, &args.workload_ids) {
+                                if args.native_tap_snapshot_dir.is_some() {
+                                    match dump_native_tap_snapshot(&target, &args, &run_id, &probe)
+                                    {
+                                        Ok(snapshot) => native_tap_snapshots.push(snapshot),
+                                        Err(err) => blockers.push(format!(
+                                            "{} native tap snapshot failed: {}",
+                                            probe.id, err
+                                        )),
+                                    }
+                                }
                                 eprintln!("XR60 DSpark baseline workload={}", probe.id);
                                 let baseline = match run_baseline(&target, &probe) {
                                     Ok(baseline) => baseline,
@@ -136,10 +147,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report_path: report_path.display().to_string(),
         blockers_path: blockers_path.display().to_string(),
         decision_path: decision_path.display().to_string(),
+        native_tap_snapshot_manifest_path: native_tap_snapshot_manifest_path(&args),
         block_sizes: args.block_sizes.clone(),
         workload_ids: args.workload_ids.clone(),
         max_new_tokens: args.max_new_tokens,
         target_layer_ids: EXPECTED_TARGET_LAYERS.to_vec(),
+        native_tap_snapshots: native_tap_snapshots.clone(),
         records: records.clone(),
         blockers: blockers.clone(),
         measurement_notes: vec![
@@ -155,6 +168,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&report_path, render_report(&summary))?;
     fs::write(&blockers_path, render_blockers(&summary))?;
     fs::write(&decision_path, format!("{decision}\n"))?;
+    if let Some(snapshot_dir) = &args.native_tap_snapshot_dir {
+        fs::create_dir_all(snapshot_dir)?;
+        let manifest_path = snapshot_dir.join("native_tap_snapshot_manifest.json");
+        let manifest = NativeTapSnapshotManifest {
+            schema_version: 1,
+            goal: GOAL,
+            phase: "02-hidden-tap-parity",
+            status: if native_tap_snapshots.is_empty() {
+                "blocked"
+            } else {
+                "ready_for_reference_compare"
+            },
+            run_id: summary.run_id.clone(),
+            generated_at_unix_seconds: summary.generated_at_unix_seconds,
+            command: summary.command.clone(),
+            target_layer_ids: EXPECTED_TARGET_LAYERS.to_vec(),
+            snapshots: native_tap_snapshots,
+            blockers: blockers.clone(),
+        };
+        fs::write(manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    }
 
     println!("XR60 DSpark fixed-block matrix: {decision}");
     println!("records: {}", records_path.display());
@@ -174,6 +208,7 @@ struct Args {
     workload_ids: Vec<String>,
     max_new_tokens: usize,
     max_context_tokens: usize,
+    native_tap_snapshot_dir: Option<PathBuf>,
 }
 
 impl Args {
@@ -191,6 +226,7 @@ impl Args {
             .collect::<Vec<_>>();
         let mut max_new_tokens = 32;
         let mut max_context_tokens = 8192;
+        let mut native_tap_snapshot_dir = None;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -218,9 +254,15 @@ impl Args {
                         .parse()
                         .map_err(|_| "--max-context-tokens must be an integer")?;
                 }
+                "--native-tap-snapshot-dir" => {
+                    native_tap_snapshot_dir = Some(PathBuf::from(required_value(
+                        &mut args,
+                        "--native-tap-snapshot-dir",
+                    )?));
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- [--out-dir PATH] [--model-path PATH] [--draft-path PATH] [--block-sizes 1,2,4,7] [--workloads hello_smoke,hello_reference_prefix] [--max-new-tokens N] [--max-context-tokens N]"
+                        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- [--out-dir PATH] [--model-path PATH] [--draft-path PATH] [--block-sizes 1,2,4,7] [--workloads hello_smoke,hello_reference_prefix] [--max-new-tokens N] [--max-context-tokens N] [--native-tap-snapshot-dir PATH]"
                     );
                     std::process::exit(0);
                 }
@@ -262,6 +304,7 @@ impl Args {
             workload_ids,
             max_new_tokens,
             max_context_tokens,
+            native_tap_snapshot_dir,
         })
     }
 }
@@ -285,13 +328,45 @@ struct Summary {
     report_path: String,
     blockers_path: String,
     decision_path: String,
+    native_tap_snapshot_manifest_path: Option<String>,
     block_sizes: Vec<usize>,
     workload_ids: Vec<String>,
     max_new_tokens: usize,
     target_layer_ids: Vec<u32>,
+    native_tap_snapshots: Vec<NativeTapSnapshot>,
     records: Vec<Record>,
     blockers: Vec<String>,
     measurement_notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NativeTapSnapshotManifest {
+    schema_version: u32,
+    goal: &'static str,
+    phase: &'static str,
+    status: &'static str,
+    run_id: String,
+    generated_at_unix_seconds: u64,
+    command: String,
+    target_layer_ids: Vec<u32>,
+    snapshots: Vec<NativeTapSnapshot>,
+    blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NativeTapSnapshot {
+    workload_id: &'static str,
+    prompt_tokens: Vec<i32>,
+    prompt_sha256: String,
+    snapshot_path: String,
+    prefill_greedy_token: i32,
+    prefill_greedy_logit: f32,
+    tap_layer_ids: Vec<u32>,
+    tap_shapes: Vec<Vec<u64>>,
+    tap_bytes: u64,
+    hidden_present: bool,
+    context_tokens: usize,
+    active_kv_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -637,6 +712,41 @@ fn run_baseline(target: &Target, probe: &Probe) -> Result<NativeRun, Box<dyn std
     })
 }
 
+fn dump_native_tap_snapshot(
+    target: &Target,
+    args: &Args,
+    run_id: &str,
+    probe: &Probe,
+) -> Result<NativeTapSnapshot, Box<dyn std::error::Error>> {
+    let snapshot_dir = args
+        .native_tap_snapshot_dir
+        .as_ref()
+        .ok_or("native tap snapshot dir is not configured")?;
+    fs::create_dir_all(snapshot_dir)?;
+
+    let mut cache = KvCache::create(&KvPolicy::default())?;
+    let first = prefill(target, &mut cache, &probe.prompt_tokens)?;
+    let tap_info = cache.dspark_tap_info()?;
+    let snapshot = cache.export_snapshot()?;
+    let snapshot_path = snapshot_dir.join(format!("{}-{}.safetensors", run_id, probe.id));
+    snapshot.save_to_path(&snapshot_path)?;
+
+    Ok(NativeTapSnapshot {
+        workload_id: probe.id,
+        prompt_tokens: probe.prompt_tokens.clone(),
+        prompt_sha256: checksum_tokens(&probe.prompt_tokens),
+        snapshot_path: snapshot_path.display().to_string(),
+        prefill_greedy_token: first.greedy_token,
+        prefill_greedy_logit: first.greedy_logit,
+        tap_layer_ids: tap_info.layer_ids,
+        tap_shapes: tap_info.tap_shapes,
+        tap_bytes: tap_info.tap_bytes,
+        hidden_present: tap_info.has_last_hidden,
+        context_tokens: probe.prompt_tokens.len(),
+        active_kv_bytes: first.active_kv_bytes,
+    })
+}
+
 fn run_dspark(
     target: &Target,
     drafter: &DSparkDrafter,
@@ -926,7 +1036,26 @@ fn render_report(summary: &Summary) -> String {
         out.push_str("No verifier trace records were emitted.\n\n");
     }
     out.push_str("\n## Hidden tap parity\n\n");
-    out.push_str("Not measured. Required target tap ids are `[5, 17, 29, 41, 46]`.\n\n");
+    if summary.native_tap_snapshots.is_empty() {
+        out.push_str("Not measured. Required target tap ids are `[5, 17, 29, 41, 46]`.\n\n");
+    } else {
+        out.push_str("Native tap snapshots were emitted for reference comparison; DeepSpec/PyTorch numeric parity is still not measured.\n\n");
+        if let Some(path) = &summary.native_tap_snapshot_manifest_path {
+            out.push_str(&format!("- Manifest: `{}`\n", escape_md(path)));
+        }
+        for snapshot in &summary.native_tap_snapshots {
+            out.push_str(&format!(
+                "- {}: path=`{}` layers={:?} shapes={:?} tap_bytes={} prefill_greedy={}\n",
+                snapshot.workload_id,
+                escape_md(&snapshot.snapshot_path),
+                snapshot.tap_layer_ids,
+                snapshot.tap_shapes,
+                snapshot.tap_bytes,
+                snapshot.prefill_greedy_token
+            ));
+        }
+        out.push('\n');
+    }
     out.push_str("## MLX parity\n\n");
     out.push_str("Not measured. See `tools/dspark/convert_to_mlx.py` and `tools/dspark/compare_mlx_parity.py`.\n\n");
     out.push_str("## Blockers\n\n");
@@ -1034,6 +1163,14 @@ fn fmt_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn native_tap_snapshot_manifest_path(args: &Args) -> Option<String> {
+    args.native_tap_snapshot_dir.as_ref().map(|path| {
+        path.join("native_tap_snapshot_manifest.json")
+            .display()
+            .to_string()
+    })
 }
 
 #[allow(dead_code)]
