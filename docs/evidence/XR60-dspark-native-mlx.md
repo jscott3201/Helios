@@ -411,6 +411,52 @@ This gives the native side of hidden-tap parity a concrete, small artifact.
 DeepSpec/PyTorch fixture comparison remains blocked on local Python
 dependencies.
 
+## DeepSpec Warm-Start Alignment
+
+DeepSpec's DSpark evaluator prefills the prompt, commits the first target token,
+then proposes DSpark tokens from that committed current-token anchor. The XR60
+fixed-prefix harness now mirrors that flow explicitly with
+`warmup_target_tokens = 1` before the DSpark draft/verify loop. This keeps
+`gemma4_verify_tokens` semantics unchanged while preventing the benchmark from
+drafting directly from the prompt's last token.
+
+Matrix command:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 3
+```
+
+Artifacts:
+
+```text
+benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/records.jsonl
+benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/summary.json
+benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/report.md
+benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/blockers.md
+benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/decision.md
+```
+
+Result:
+
+- decision: `keep_disabled_pending_broader_evidence`
+- exactness: passed for both workloads at block sizes `1, 2, 4, 7`
+- warmup target tokens: `1` for every measured record
+- accepted draft tokens: `0` for every record
+- attempted draft tokens: `2` per record for `max_new_tokens = 3`
+- `hello_smoke` first post-warmup draft: `[236745]` or `[236745, 735]`;
+  target greedy trace: `[236772, 236761]`; committed fallback: `[236772]`
+- `hello_reference_prefix` first post-warmup draft: `[107]` or
+  `[107, 236829]`; target greedy trace: `[236779, 236772]`; committed
+  fallback: `[236779]`
+- peak memory range: `13.566` to `13.569` GB
+- decode throughput range: `0.028` to `0.063` tok/s
+
+The alignment removes a benchmark-semantics mismatch but does not improve
+acceptance. The next required evidence is reference parity: compare the native
+DSpark draft outputs against DeepSpec/PyTorch using the native tap snapshot as
+the target-hidden input, then determine whether the remaining zero acceptance is
+native decoder math, 4-bit-vs-BF16 target distribution, or prompt selection.
+
 ## Verification
 
 Commands run:
@@ -433,6 +479,9 @@ GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --ex
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/matrix-anchor-mask --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 2
 GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
 GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/tap-snapshot-smoke --native-tap-snapshot-dir benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 1
+GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/warm-anchor-smoke --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke --block-sizes 1 --max-new-tokens 2
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --workloads hello_smoke,hello_reference_prefix --block-sizes 1,2,4,7 --max-new-tokens 3
 ```
 
 Observed result:
@@ -467,6 +516,11 @@ Observed result:
   `benchmarks/out/XR60-dspark-native-mlx/02-hidden-tap-parity/native-smoke/native_tap_snapshot_manifest.json`
   and a small safetensors payload containing the selected native DSpark context
   taps for `hello_smoke`.
+- The DeepSpec warm-start matrix wrote
+  `benchmarks/out/XR60-dspark-native-mlx/warm-anchor-matrix/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`.
+  Exactness passed for both bounded workloads and all fixed block sizes with
+  `warmup_target_tokens = 1`, but every record still had
+  `accepted_draft_tokens = 0`.
 - The ignored-by-default full-model FFI test now enables XR60 DSpark taps before
   native prefill and asserts tap ids `[5, 17, 29, 41, 46]`, shapes
   `[1, 1, 3840]`, and nonzero tap bytes when `GEMMA4D_FULL_MODEL_TESTS` and
