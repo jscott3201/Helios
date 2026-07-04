@@ -425,6 +425,34 @@ struct GenerateJson {
     active_kv_bytes: Option<u64>,
 }
 
+struct VariantRun<'a> {
+    options: &'a XrAbOptions,
+    model_identity: &'a manifest::ArtifactIdentity,
+    git_sha: &'a str,
+    git_status_short: &'a str,
+    run_id: &'a str,
+    run_kind: RunKind,
+    workload: &'a WorkloadRecord,
+    prompt: &'a str,
+    prompt_sha256: &'a str,
+    variant: &'a VariantConfig,
+    trial_index: usize,
+}
+
+struct SummaryInput<'a> {
+    options: &'a XrAbOptions,
+    model_identity: &'a manifest::ArtifactIdentity,
+    selected_workloads: Vec<String>,
+    selected_workload_details: Vec<SelectedWorkload>,
+    record_count: usize,
+    records: &'a [XrAbRecord],
+    command_paths: Vec<String>,
+    generated_files: Vec<String>,
+    run_id: &'a str,
+    git_sha: &'a str,
+    git_status_short: &'a str,
+}
+
 pub fn parse_cli_args<I, S>(args: I) -> Result<XrAbOptions, CliError>
 where
     I: IntoIterator<Item = S>,
@@ -609,19 +637,19 @@ pub fn write_xr_ab_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliEr
                 let mut baseline_tokens = None;
                 let mut baseline_logits = None;
                 for variant in &variants {
-                    let mut record = run_variant(
+                    let mut record = run_variant(VariantRun {
                         options,
-                        &model_identity,
-                        &git_sha,
-                        &git_status_short,
-                        &run_id,
+                        model_identity: &model_identity,
+                        git_sha: &git_sha,
+                        git_status_short: &git_status_short,
+                        run_id: &run_id,
                         run_kind,
                         workload,
-                        &prompt,
-                        &prompt_sha256,
+                        prompt: &prompt,
+                        prompt_sha256: &prompt_sha256,
                         variant,
                         trial_index,
-                    );
+                    });
                     if variant.name == options.baseline.name {
                         record.correctness = CorrectnessGate {
                             status: "passed".to_owned(),
@@ -683,28 +711,28 @@ pub fn write_xr_ab_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliEr
     command_paths.dedup();
     write_jsonl(&records_path, &records)?;
     let selected_workload_details = workloads.iter().map(selected_workload).collect::<Vec<_>>();
-    let summary = build_summary(
+    let summary = build_summary(SummaryInput {
         options,
-        &model_identity,
-        workloads
+        model_identity: &model_identity,
+        selected_workloads: workloads
             .iter()
             .map(|workload| workload.workload_id.clone())
             .collect(),
         selected_workload_details,
-        records.len(),
-        &records,
+        record_count: records.len(),
+        records: &records,
         command_paths,
-        vec![
+        generated_files: vec![
             records_path.display().to_string(),
             summary_path.display().to_string(),
             report_path.display().to_string(),
             blockers_path.display().to_string(),
             decision_path.display().to_string(),
         ],
-        &run_id,
-        &git_sha,
-        &git_status_short,
-    );
+        run_id: &run_id,
+        git_sha: &git_sha,
+        git_status_short: &git_status_short,
+    });
 
     fs::write(
         &summary_path,
@@ -722,57 +750,17 @@ pub fn write_xr_ab_artifacts(options: &XrAbOptions) -> Result<XrAbSummary, CliEr
     Ok(summary)
 }
 
-fn run_variant(
-    options: &XrAbOptions,
-    model_identity: &manifest::ArtifactIdentity,
-    git_sha: &str,
-    git_status_short: &str,
-    run_id: &str,
-    run_kind: RunKind,
-    workload: &WorkloadRecord,
-    prompt: &str,
-    prompt_sha256: &str,
-    variant: &VariantConfig,
-    trial_index: usize,
-) -> XrAbRecord {
-    match run_kind {
-        RunKind::DryRun => dry_run_record(
-            options,
-            model_identity,
-            git_sha,
-            git_status_short,
-            run_id,
-            workload,
-            prompt_sha256,
-            variant,
-            trial_index,
-        ),
-        RunKind::Real => real_run_record(
-            options,
-            model_identity,
-            git_sha,
-            git_status_short,
-            run_id,
-            workload,
-            prompt,
-            prompt_sha256,
-            variant,
-            trial_index,
-        ),
+fn run_variant(input: VariantRun<'_>) -> XrAbRecord {
+    match input.run_kind {
+        RunKind::DryRun => dry_run_record(&input),
+        RunKind::Real => real_run_record(&input),
     }
 }
 
-fn dry_run_record(
-    options: &XrAbOptions,
-    model_identity: &manifest::ArtifactIdentity,
-    git_sha: &str,
-    git_status_short: &str,
-    run_id: &str,
-    workload: &WorkloadRecord,
-    prompt_sha256: &str,
-    variant: &VariantConfig,
-    trial_index: usize,
-) -> XrAbRecord {
+fn dry_run_record(input: &VariantRun<'_>) -> XrAbRecord {
+    let options = input.options;
+    let workload = input.workload;
+    let trial_index = input.trial_index;
     let max_new_tokens = effective_max_new_tokens(options, workload);
     let output_token_ids = synthetic_tokens(workload, trial_index, max_new_tokens);
     let output_logits = synthetic_logits(workload, max_new_tokens);
@@ -791,15 +779,15 @@ fn dry_run_record(
     );
     let input_tokens = workload.actual_context_tokens;
     base_record(
-        model_identity,
-        git_sha,
-        git_status_short,
-        run_id,
+        input.model_identity,
+        input.git_sha,
+        input.git_status_short,
+        input.run_id,
         RunKind::DryRun,
         workload,
-        prompt_sha256,
-        variant,
-        trial_index,
+        input.prompt_sha256,
+        input.variant,
+        input.trial_index,
         input_tokens,
         output_token_ids,
         output_logits,
@@ -821,31 +809,29 @@ fn dry_run_record(
     )
 }
 
-fn real_run_record(
-    options: &XrAbOptions,
-    model_identity: &manifest::ArtifactIdentity,
-    git_sha: &str,
-    git_status_short: &str,
-    run_id: &str,
-    workload: &WorkloadRecord,
-    prompt: &str,
-    prompt_sha256: &str,
-    variant: &VariantConfig,
-    trial_index: usize,
-) -> XrAbRecord {
+fn real_run_record(input: &VariantRun<'_>) -> XrAbRecord {
+    let options = input.options;
+    let model_identity = input.model_identity;
+    let git_sha = input.git_sha;
+    let git_status_short = input.git_status_short;
+    let run_id = input.run_id;
+    let workload = input.workload;
+    let prompt_sha256 = input.prompt_sha256;
+    let variant = input.variant;
+    let trial_index = input.trial_index;
     let max_new_tokens = effective_max_new_tokens(options, workload);
     let command_display = generate_command_display(options, workload, variant, max_new_tokens);
     if !model_identity.exists {
         return blocked_record(
-            model_identity,
-            git_sha,
-            git_status_short,
-            run_id,
+            input.model_identity,
+            input.git_sha,
+            input.git_status_short,
+            input.run_id,
             RunKind::Real,
             workload,
-            prompt_sha256,
+            input.prompt_sha256,
             variant,
-            trial_index,
+            input.trial_index,
             command_display,
             format!(
                 "model artifacts missing at {}",
@@ -858,15 +844,15 @@ fn real_run_record(
         BackendMode::ServerRealHelper | BackendMode::ServerNative
     ) {
         return blocked_record(
-            model_identity,
-            git_sha,
-            git_status_short,
-            run_id,
+            input.model_identity,
+            input.git_sha,
+            input.git_status_short,
+            input.run_id,
             RunKind::Real,
             workload,
-            prompt_sha256,
+            input.prompt_sha256,
             variant,
-            trial_index,
+            input.trial_index,
             command_display,
             "server backend modes are explicit config values in XR01; the smoke runner executes local generate backends and fails closed for server modes".to_owned(),
         );
@@ -883,7 +869,7 @@ fn real_run_record(
         .arg("--model-path")
         .arg(&options.model_path)
         .arg("--prompt")
-        .arg(prompt)
+        .arg(input.prompt)
         .arg("--max-context-tokens")
         .arg(workload.actual_context_tokens.max(1).to_string())
         .arg("--max-new-tokens")
@@ -1245,19 +1231,9 @@ fn compare_against_baseline(
     }
 }
 
-fn build_summary(
-    options: &XrAbOptions,
-    model_identity: &manifest::ArtifactIdentity,
-    selected_workloads: Vec<String>,
-    selected_workload_details: Vec<SelectedWorkload>,
-    record_count: usize,
-    records: &[XrAbRecord],
-    command_paths: Vec<String>,
-    generated_files: Vec<String>,
-    run_id: &str,
-    git_sha: &str,
-    git_status_short: &str,
-) -> XrAbSummary {
+fn build_summary(input: SummaryInput<'_>) -> XrAbSummary {
+    let options = input.options;
+    let records = input.records;
     let dry_run_records = records
         .iter()
         .filter(|record| record.run_kind == "dry_run")
@@ -1305,7 +1281,7 @@ fn build_summary(
     blockers.sort();
     blockers.dedup();
 
-    let failed_hypotheses = failed_hypotheses(options.goal, &family_recommendations, &records);
+    let failed_hypotheses = failed_hypotheses(options.goal, &family_recommendations, records);
     let decision = decision_for(
         options.goal,
         &blockers,
@@ -1331,11 +1307,11 @@ fn build_summary(
         generated_at_unix_seconds: unix_seconds_now(),
         decision: decision.to_owned(),
         status: status.to_owned(),
-        run_id: run_id.to_owned(),
-        git_sha: git_sha.to_owned(),
-        git_status_short: git_status_short.to_owned(),
+        run_id: input.run_id.to_owned(),
+        git_sha: input.git_sha.to_owned(),
+        git_status_short: input.git_status_short.to_owned(),
         mode: options.mode,
-        model_identity: model_identity.clone(),
+        model_identity: input.model_identity.clone(),
         workloads_path: options.workloads_path.display().to_string(),
         out_dir: options.out_dir.display().to_string(),
         records_path: options.out_dir.join("records.jsonl").display().to_string(),
@@ -1346,9 +1322,9 @@ fn build_summary(
         variants: vec![options.baseline.clone(), options.candidate.clone()],
         requested_trials: options.trials,
         requested_max_new_tokens: options.max_new_tokens,
-        selected_workloads,
-        selected_workload_details,
-        record_count,
+        selected_workloads: input.selected_workloads,
+        selected_workload_details: input.selected_workload_details,
+        record_count: input.record_count,
         dry_run_records,
         real_records,
         passed_records,
@@ -1357,8 +1333,8 @@ fn build_summary(
         schema_checks,
         family_recommendations,
         failed_hypotheses,
-        command_paths,
-        generated_files,
+        command_paths: input.command_paths,
+        generated_files: input.generated_files,
         blockers,
     }
 }
@@ -1628,9 +1604,7 @@ fn schema_checks(records: &[XrAbRecord]) -> SchemaChecks {
         has_prefill_ms: records.iter().all(|record| record.prefill_ms >= 0.0),
         has_total_ms: records.iter().all(|record| record.total_ms >= 0.0),
         has_peak_memory: records.iter().all(|record| record.peak_mlx_gb >= 0.0),
-        has_active_kv_bytes: records
-            .iter()
-            .all(|record| record.active_kv_bytes <= u64::MAX),
+        has_active_kv_bytes: true,
         has_output_token_ids: records.iter().all(|record| {
             record.status == "blocked" || record.generated_tokens == record.output_token_ids.len()
         }),
@@ -2027,26 +2001,23 @@ fn generate_command_display(
         .iter()
         .map(|(key, value)| format!("{key}={}", shell_quote(value)))
         .collect::<Vec<_>>();
-    parts.extend(
-        [
-            "cargo".to_owned(),
-            "run".to_owned(),
-            "-p".to_owned(),
-            "gemma4d-server".to_owned(),
-            "--".to_owned(),
-            "generate".to_owned(),
-            "--model-path".to_owned(),
-            shell_quote(&options.model_path.display().to_string()),
-            "--prompt".to_owned(),
-            format!("\"$(cat {})\"", shell_quote(&workload.prompt_path)),
-            "--max-context-tokens".to_owned(),
-            workload.actual_context_tokens.max(1).to_string(),
-            "--max-new-tokens".to_owned(),
-            max_new_tokens.to_string(),
-            "--json".to_owned(),
-        ]
-        .into_iter(),
-    );
+    parts.extend([
+        "cargo".to_owned(),
+        "run".to_owned(),
+        "-p".to_owned(),
+        "gemma4d-server".to_owned(),
+        "--".to_owned(),
+        "generate".to_owned(),
+        "--model-path".to_owned(),
+        shell_quote(&options.model_path.display().to_string()),
+        "--prompt".to_owned(),
+        format!("\"$(cat {})\"", shell_quote(&workload.prompt_path)),
+        "--max-context-tokens".to_owned(),
+        workload.actual_context_tokens.max(1).to_string(),
+        "--max-new-tokens".to_owned(),
+        max_new_tokens.to_string(),
+        "--json".to_owned(),
+    ]);
     parts.join(" ")
 }
 

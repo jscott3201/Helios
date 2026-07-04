@@ -330,6 +330,7 @@ fn variants(options: &Options) -> Vec<Variant> {
     variants
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_trials(
     variant: &Variant,
     artifact_path: &Path,

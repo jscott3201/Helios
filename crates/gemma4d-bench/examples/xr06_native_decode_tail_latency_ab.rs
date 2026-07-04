@@ -706,11 +706,11 @@ fn native_variant_with_extra_env<const N: usize>(
         "GEMMA4D_NATIVE_DECODE_KV_EVAL".to_owned(),
         eval_policy.to_owned(),
     );
-    if let Ok(value) = std::env::var("GEMMA4D_NATIVE_DECODE_PROFILE") {
-        if !value.is_empty() {
-            config.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value.clone());
-            env.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value);
-        }
+    if let Ok(value) = std::env::var("GEMMA4D_NATIVE_DECODE_PROFILE")
+        && !value.is_empty()
+    {
+        config.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value.clone());
+        env.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value);
     }
     for (key, value) in extra_env {
         config.insert(key.to_owned(), value.to_owned());

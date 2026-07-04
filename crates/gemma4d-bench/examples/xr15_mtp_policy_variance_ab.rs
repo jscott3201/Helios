@@ -367,12 +367,12 @@ impl Args {
                 "XR15 executable block sizes must be <= {MTP_MAX_DRAFT_TOKENS}"
             )));
         }
-        if let Some(policy) = &out.adaptive_policy {
-            if policy != XR61_ADAPTIVE_POLICY {
-                return Err(CliError::Usage(format!(
-                    "unsupported --adaptive-policy '{policy}'; expected {XR61_ADAPTIVE_POLICY}"
-                )));
-            }
+        if let Some(policy) = &out.adaptive_policy
+            && policy != XR61_ADAPTIVE_POLICY
+        {
+            return Err(CliError::Usage(format!(
+                "unsupported --adaptive-policy '{policy}'; expected {XR61_ADAPTIVE_POLICY}"
+            )));
         }
         Ok(out)
     }
@@ -637,6 +637,7 @@ struct SourceReplaySummary {
     decision: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_mtp_record(
     args: &Args,
     run_id: &str,
@@ -1187,21 +1188,20 @@ fn run_mtp(
             step.accepted_draft_count,
         );
 
-        if let Some(zero_accept_run) = args.adaptive_zero_accept_run {
-            if consecutive_zero_accepts >= zero_accept_run
-                && generated.len() >= args.adaptive_min_generated_tokens
-            {
-                auto_disabled = true;
-                auto_disable_pass = Some(target_verify_passes);
-                auto_disable_generated_tokens = Some(generated.len());
-                auto_disable_reason = Some(format!(
-                    "consecutive zero-accept passes {} reached threshold {} after {} generated tokens",
-                    consecutive_zero_accepts,
-                    zero_accept_run,
-                    generated.len()
-                ));
-                pending_greedy = Some(step.greedy_token);
-            }
+        if let Some(zero_accept_run) = args.adaptive_zero_accept_run
+            && consecutive_zero_accepts >= zero_accept_run
+            && generated.len() >= args.adaptive_min_generated_tokens
+        {
+            auto_disabled = true;
+            auto_disable_pass = Some(target_verify_passes);
+            auto_disable_generated_tokens = Some(generated.len());
+            auto_disable_reason = Some(format!(
+                "consecutive zero-accept passes {} reached threshold {} after {} generated tokens",
+                consecutive_zero_accepts,
+                zero_accept_run,
+                generated.len()
+            ));
+            pending_greedy = Some(step.greedy_token);
         }
     }
 
@@ -1420,10 +1420,10 @@ fn select_policy_candidate(
     if policy_name == "disabled_baseline" {
         return baseline;
     }
-    if let Some(block) = policy_name.strip_prefix("fixed_block_") {
-        if let Ok(block_size) = block.parse::<usize>() {
-            return block_candidate(records, block_size).unwrap_or(baseline);
-        }
+    if let Some(block) = policy_name.strip_prefix("fixed_block_")
+        && let Ok(block_size) = block.parse::<usize>()
+    {
+        return block_candidate(records, block_size).unwrap_or(baseline);
     }
     if policy_name == format!("adaptive_policy_{XR61_ADAPTIVE_POLICY}") {
         return adaptive_policy_candidate(args, records).unwrap_or(baseline);
@@ -1646,11 +1646,11 @@ fn decision_for(
     records: &[Record],
     policy_summaries: &[PolicySummary],
 ) -> String {
-    if !blockers.is_empty() || records.is_empty() {
-        "blocked_with_evidence".to_owned()
-    } else if records
-        .iter()
-        .any(|record| !record.comparison.byte_identical)
+    if !blockers.is_empty()
+        || records.is_empty()
+        || records
+            .iter()
+            .any(|record| !record.comparison.byte_identical)
     {
         "blocked_with_evidence".to_owned()
     } else if args.trials < 3 {
@@ -2154,7 +2154,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
     values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]

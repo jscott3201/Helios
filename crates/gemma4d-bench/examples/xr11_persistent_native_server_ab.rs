@@ -506,8 +506,7 @@ fn run_cases(
             ));
         }
     }
-    let baseline_final_metrics =
-        fetch_prometheus(baseline_server.addr).unwrap_or_else(PrometheusSnapshot::default);
+    let baseline_final_metrics = fetch_prometheus(baseline_server.addr).unwrap_or_default();
     drop(baseline_server);
 
     let candidate_server = start_server(args, ServerBackend::PersistentNative, false)?;
@@ -559,8 +558,7 @@ fn run_cases(
             });
         }
     }
-    let candidate_final_metrics =
-        fetch_prometheus(candidate_server.addr).unwrap_or_else(PrometheusSnapshot::default);
+    let candidate_final_metrics = fetch_prometheus(candidate_server.addr).unwrap_or_default();
     drop(candidate_server);
 
     Ok(RunOutput {

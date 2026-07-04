@@ -440,20 +440,20 @@ fn run_python_parity(
         "--out".to_owned(),
         parity_path.display().to_string(),
     ]);
-    if parity_path.exists() {
-        if let Err(error) = fs::remove_file(parity_path) {
-            return PythonRun {
-                command: command.join(" "),
-                status_success: false,
-                exit_status: "not_started".to_owned(),
-                stdout: String::new(),
-                stderr: String::new(),
-                blocker: format!(
-                    "failed to remove stale Python parity result {} before run: {error}",
-                    parity_path.display()
-                ),
-            };
-        }
+    if parity_path.exists()
+        && let Err(error) = fs::remove_file(parity_path)
+    {
+        return PythonRun {
+            command: command.join(" "),
+            status_success: false,
+            exit_status: "not_started".to_owned(),
+            stdout: String::new(),
+            stderr: String::new(),
+            blocker: format!(
+                "failed to remove stale Python parity result {} before run: {error}",
+                parity_path.display()
+            ),
+        };
     }
     let mut process = Command::new(&args.python);
     if let Some(pythonpath) = args.pythonpath.as_deref() {
