@@ -90,8 +90,8 @@ Current behavior is intentionally fail-closed:
 - On a native-graph target build, strict DSpark loads materialize matching
   DSpark safetensors into an opaque `NativeDSparkModel`.
 - Draft calls validate the loaded drafter, cached target tap context, last-token
-  tap metadata, and native token alignment, then remain unsupported until
-  DSpark decoder math is implemented.
+  tap metadata, and native token alignment, then route through the native
+  fixed-prefix DSpark decoder path.
 - Adapter-active and compressed-active-KV DSpark paths are rejected.
 
 The reference header at `references/ffi/gemma4_mlx.h` was synced to the live
@@ -157,6 +157,30 @@ The native target path now preserves that prerequisite state:
 This slice deliberately avoids a last-token-only DSpark implementation, because
 that would not match the released DeepSpec architecture.
 
+## Native DSpark Decoder Slice
+
+`NativeDSparkModel::draft_block` now contains the first native MLX
+fixed-prefix block-7 decoder path for the released DSpark checkpoint:
+
+- dense BF16 `embed_tokens`, `fc`, layer projection, `lm_head`, Markov, and
+  confidence-head helpers;
+- selected target tap context concatenation in `[5, 17, 29, 41, 46]` order,
+  `fc.weight` projection, and `hidden_norm`;
+- five Gemma-style DSpark layers with full-attention q/k/o projections,
+  q/k RMS norms, RoPE, `attention_k_eq_v` value handling, RMS-normed residual
+  blocks, GEGLU MLP, and layer scalar;
+- full block-7 masked draft input construction using the current context token
+  at slot 0 and `mask_token_id = 4` for remaining slots;
+- softcapped `lm_head` logits followed by sequential vanilla Markov bias
+  (`markov_w1` previous-token embedding and `markov_w2` vocab projection);
+- per-token top-2 greedy token/logit/margin extraction and confidence sigmoid
+  output for scheduled fixed prefixes 1, 2, 4, and 7.
+
+The C ABI path `gemma4_dspark_draft_block` already routes into this native
+method and records native draft latency in `Gemma4DSparkDraftResult`. This code
+is build-verified against local MLX headers, but it has not been runtime-parity
+verified because the released `model.safetensors` file is not present locally.
+
 ## Verification
 
 Commands run:
@@ -167,15 +191,18 @@ cargo test -p gemma4d-ffi --lib
 cargo fmt --all --check
 git diff --check
 cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run
+GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --lib --no-run
 cargo run -p gemma4d-bench --example dspark_fixed_block_matrix -- --out-dir benchmarks/out/XR60-dspark-native-mlx --model-path artifacts/models/gemma-4-12B-it-4bit --draft-path artifacts/drafts/dspark-gemma4-12b-block7 --block-sizes 1,2,4,7 --max-new-tokens 32
 ```
 
 Observed result:
 
 - `cargo test -p gemma4d-ffi --lib`: 21 passed, 1 ignored after adding
-  DSpark strict loader and tap-context admission changes.
+  DSpark strict loader, tap-context admission changes, and native decoder math.
 - `cargo test -p gemma4d-bench --example dspark_fixed_block_matrix --no-run`:
   compiled successfully.
+- `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-ffi --lib --no-run`:
+  compiled successfully, covering the MLX-only native DSpark helper code.
 - The fixed-prefix harness wrote
   `benchmarks/out/XR60-dspark-native-mlx/{records.jsonl,summary.json,report.md,blockers.md,decision.md}`
   with decision `blocked`.
@@ -189,10 +216,14 @@ Observed result:
 - DSpark weights are not present locally:
   `artifacts/drafts/dspark-gemma4-12b-block7/model.safetensors`.
 - DeepSpec/PyTorch fixture code is not yet integrated.
-- Native DSpark draft execution is not yet implemented.
+- Native DSpark draft execution has not yet been parity-verified against the
+  released checkpoint because the checkpoint weights are missing locally.
+- The benchmark example still emits fail-closed startup records; full workload
+  execution should be wired once the DSpark checkpoint is available.
 
 ## Next Slice
 
-Implement fixed-prefix DSpark drafts against the captured native tap arrays and
-existing `gemma4_verify_tokens` verifier semantics once the 6.86 GB DSpark
-weights are available locally.
+Download or provide the released DSpark `model.safetensors`, run the native
+draft path against the captured tap arrays, compare against DeepSpec/PyTorch
+fixtures, and then wire the fixed-prefix benchmark workload through
+`gemma4_dspark_draft_block` and `gemma4_verify_tokens`.

@@ -121,6 +121,9 @@ struct NativeDSparkModel::Impl {
     size_t dspark_tensor_count = 0;
     size_t total_tensor_count_seen = 0;
     uint32_t block_size = 0;
+    uint32_t markov_rank = 0;
+    uint32_t mask_token_id = 0;
+    uint32_t vocab_size = 0;
     std::vector<uint32_t> target_layer_ids;
     std::string manifest_summary;
 };
@@ -461,6 +464,13 @@ constexpr int kTargetLayerCount = 48;
 constexpr int kHiddenSize = 3840;
 constexpr int kSlidingWindowSize = 1024;
 constexpr uint64_t kBf16Bytes = 2;
+constexpr int kDSparkLayerCount = 5;
+constexpr int kDSparkNumHeads = 16;
+constexpr int kDSparkKvHeads = 1;
+constexpr int kDSparkHeadDim = 512;
+constexpr int kDSparkVocabSize = 262144;
+constexpr int kDSparkMarkovRank = 256;
+constexpr int kDSparkFeatureSize = kHiddenSize * GEMMA4_DSPARK_TARGET_TAP_COUNT;
 
 std::optional<array> decode_block_causal_mask(
     int query_len,
@@ -2084,6 +2094,208 @@ std::vector<NativeTopKEntries> top_k_for_block_logits(const array& logits, size_
         per_position.push_back(top_k_for_flat_logits(slot_logits, GEMMA4_MTP_TRACE_TOP_K, true));
     }
     return per_position;
+}
+
+array dense_linear(const NativeDSparkModel::Impl& impl, const array& x, const std::string& prefix) {
+    return model_dtype(mlx::core::matmul(x, mlx::core::transpose(tensor_or_throw(impl, prefix + ".weight"))));
+}
+
+array dense_linear_with_bias(const NativeDSparkModel::Impl& impl, const array& x, const std::string& prefix) {
+    return model_dtype(dense_linear(impl, x, prefix) + tensor_or_throw(impl, prefix + ".bias"));
+}
+
+array dspark_token_embedding(const NativeDSparkModel::Impl& impl, const std::vector<int32_t>& token_ids) {
+    if (token_ids.empty() || token_ids.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("native DSpark embedding received invalid token count");
+    }
+    array ids(token_ids.begin(), {1, static_cast<int>(token_ids.size())}, mlx::core::int32);
+    return model_dtype(
+        mlx::core::take(tensor_or_throw(impl, "embed_tokens.weight"), ids, 0) *
+        model_scalar(std::sqrt(static_cast<float>(kHiddenSize))));
+}
+
+array dspark_project_context(
+    const NativeDSparkModel::Impl& impl,
+    const std::vector<NativeHiddenState::Impl::DSparkTap>& context_taps,
+    int context_len) {
+    if (context_taps.size() != GEMMA4_DSPARK_TARGET_TAP_COUNT || context_len <= 0) {
+        throw std::runtime_error("native DSpark context projection received invalid tap context");
+    }
+    std::vector<array> tap_arrays;
+    tap_arrays.reserve(context_taps.size());
+    for (const NativeHiddenState::Impl::DSparkTap& tap : context_taps) {
+        tap_arrays.push_back(tap.hidden);
+    }
+    array h = mlx::core::concatenate(std::move(tap_arrays), 2);
+    const auto& shape = h.shape();
+    if (shape.size() != 3 || shape[0] != 1 || shape[1] != context_len || shape[2] != kDSparkFeatureSize) {
+        throw std::runtime_error("native DSpark context projection produced an unexpected feature shape");
+    }
+    h = dense_linear(impl, h, "fc");
+    return model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, "hidden_norm.weight")),
+        1e-6f));
+}
+
+array dspark_attention_forward(
+    const NativeDSparkModel::Impl& impl,
+    const array& target_context,
+    const array& x,
+    uint32_t layer_idx,
+    int context_len,
+    int block_len,
+    int anchor_position) {
+    const std::string base = "layers." + std::to_string(layer_idx);
+
+    array queries = dense_linear(impl, x, base + ".self_attn.q_proj");
+    queries = mlx::core::reshape(queries, {1, block_len, kDSparkNumHeads, kDSparkHeadDim});
+    queries = model_dtype(mlx::core::fast::rms_norm(
+        queries,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.q_norm.weight")),
+        1e-6f));
+    queries = mlx::core::transpose(queries, {0, 2, 1, 3});
+    queries = apply_rope(queries, true, kDSparkHeadDim, anchor_position);
+
+    array context_keys = dense_linear(impl, target_context, base + ".self_attn.k_proj");
+    context_keys = mlx::core::reshape(context_keys, {1, context_len, kDSparkKvHeads, kDSparkHeadDim});
+    array context_values = context_keys;
+    context_keys = model_dtype(mlx::core::fast::rms_norm(
+        context_keys,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.k_norm.weight")),
+        1e-6f));
+    context_keys = mlx::core::transpose(context_keys, {0, 2, 1, 3});
+    context_keys = apply_rope(context_keys, true, kDSparkHeadDim, 0);
+    context_values = model_dtype(mlx::core::fast::rms_norm(context_values, std::nullopt, 1e-6f));
+    context_values = mlx::core::transpose(context_values, {0, 2, 1, 3});
+
+    array noise_keys = dense_linear(impl, x, base + ".self_attn.k_proj");
+    noise_keys = mlx::core::reshape(noise_keys, {1, block_len, kDSparkKvHeads, kDSparkHeadDim});
+    array noise_values = noise_keys;
+    noise_keys = model_dtype(mlx::core::fast::rms_norm(
+        noise_keys,
+        std::optional<array>(tensor_or_throw(impl, base + ".self_attn.k_norm.weight")),
+        1e-6f));
+    noise_keys = mlx::core::transpose(noise_keys, {0, 2, 1, 3});
+    noise_keys = apply_rope(noise_keys, true, kDSparkHeadDim, anchor_position);
+    noise_values = model_dtype(mlx::core::fast::rms_norm(noise_values, std::nullopt, 1e-6f));
+    noise_values = mlx::core::transpose(noise_values, {0, 2, 1, 3});
+
+    const int attention_len = context_len + block_len;
+    array keys = mlx::core::concatenate({context_keys, noise_keys}, 2);
+    array values = mlx::core::concatenate({context_values, noise_values}, 2);
+    keys = mlx::core::broadcast_to(keys, {1, kDSparkNumHeads, attention_len, kDSparkHeadDim});
+    values = mlx::core::broadcast_to(values, {1, kDSparkNumHeads, attention_len, kDSparkHeadDim});
+
+    array output = mlx::core::fast::scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        1.0f,
+        "",
+        std::nullopt);
+    output = mlx::core::transpose(output, {0, 2, 1, 3});
+    output = mlx::core::reshape(output, {1, block_len, kDSparkNumHeads * kDSparkHeadDim});
+    return dense_linear(impl, output, base + ".self_attn.o_proj");
+}
+
+array dspark_layer_forward(
+    const NativeDSparkModel::Impl& impl,
+    const array& target_context,
+    const array& x,
+    uint32_t layer_idx,
+    int context_len,
+    int block_len,
+    int anchor_position) {
+    const std::string base = "layers." + std::to_string(layer_idx);
+    const array residual = x;
+
+    array h = model_dtype(mlx::core::fast::rms_norm(
+        x,
+        std::optional<array>(tensor_or_throw(impl, base + ".input_layernorm.weight")),
+        1e-6f));
+    h = dspark_attention_forward(impl, target_context, h, layer_idx, context_len, block_len, anchor_position);
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_attention_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(residual + h);
+
+    const array mlp_residual = h;
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".pre_feedforward_layernorm.weight")),
+        1e-6f));
+    array gate = dense_linear(impl, h, base + ".mlp.gate_proj");
+    array up = dense_linear(impl, h, base + ".mlp.up_proj");
+    h = model_dtype(geglu(gate, up));
+    h = dense_linear(impl, h, base + ".mlp.down_proj");
+    h = model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, base + ".post_feedforward_layernorm.weight")),
+        1e-6f));
+    h = model_dtype(mlp_residual + h);
+    return model_dtype(h * tensor_or_throw(impl, base + ".layer_scalar"));
+}
+
+array dspark_forward_hidden(
+    const NativeDSparkModel::Impl& impl,
+    const std::vector<NativeHiddenState::Impl::DSparkTap>& context_taps,
+    int32_t anchor_token_id,
+    int context_len,
+    int block_len) {
+    if (block_len != GEMMA4_DSPARK_MAX_DRAFT_TOKENS) {
+        throw std::runtime_error("native DSpark fixed-prefix path expects the released block-7 drafter");
+    }
+    const int anchor_position = context_len - 1;
+    std::vector<int32_t> draft_ids(static_cast<size_t>(block_len), static_cast<int32_t>(impl.mask_token_id));
+    draft_ids[0] = anchor_token_id;
+
+    array target_context = dspark_project_context(impl, context_taps, context_len);
+    array h = dspark_token_embedding(impl, draft_ids);
+    for (uint32_t layer = 0; layer < kDSparkLayerCount; ++layer) {
+        h = dspark_layer_forward(impl, target_context, h, layer, context_len, block_len, anchor_position);
+    }
+    return model_dtype(mlx::core::fast::rms_norm(
+        h,
+        std::optional<array>(tensor_or_throw(impl, "norm.weight")),
+        1e-6f));
+}
+
+array dspark_logits_for_hidden(const NativeDSparkModel::Impl& impl, const array& h) {
+    array logits = dense_linear(impl, h, "lm_head");
+    return model_dtype(mlx::core::tanh(logits / model_scalar(30.0f)) * model_scalar(30.0f));
+}
+
+array dspark_markov_embedding(const NativeDSparkModel::Impl& impl, int32_t token_id) {
+    if (token_id < 0 || token_id >= static_cast<int32_t>(impl.vocab_size)) {
+        throw std::runtime_error("native DSpark Markov head received an out-of-vocabulary token id");
+    }
+    const std::vector<int32_t> ids = {token_id};
+    array token_ids(ids.begin(), {1}, mlx::core::int32);
+    return model_dtype(mlx::core::reshape(
+        mlx::core::take(tensor_or_throw(impl, "markov_head.markov_w1.weight"), token_ids, 0),
+        {static_cast<int>(impl.markov_rank)}));
+}
+
+array dspark_markov_bias(const NativeDSparkModel::Impl& impl, const array& markov_embedding) {
+    array bias = mlx::core::matmul(
+        mlx::core::reshape(markov_embedding, {1, static_cast<int>(impl.markov_rank)}),
+        mlx::core::transpose(tensor_or_throw(impl, "markov_head.markov_w2.weight")));
+    return model_dtype(mlx::core::reshape(bias, {static_cast<int>(impl.vocab_size)}));
+}
+
+float dspark_confidence(
+    const NativeDSparkModel::Impl& impl,
+    const array& hidden,
+    int step,
+    const array& markov_embedding) {
+    array slot_hidden = mlx::core::slice(hidden, {0, step, 0}, {1, step + 1, kHiddenSize});
+    array markov = mlx::core::reshape(markov_embedding, {1, 1, static_cast<int>(impl.markov_rank)});
+    array feature = mlx::core::concatenate({slot_hidden, markov}, 2);
+    array confidence = to_float32(mlx::core::sigmoid(dense_linear_with_bias(impl, feature, "confidence_head.proj")));
+    mlx::core::eval(confidence);
+    return confidence.item<float>();
 }
 
 void initialize_single_target_trace(Gemma4MtpTraceInfo* trace, uint64_t sequence_len, uint32_t top_k) {
@@ -4088,6 +4300,9 @@ bool NativeDSparkModel::load(
         std::unique_ptr<NativeDSparkModel> model(new NativeDSparkModel());
         model->impl_->manifest_summary = manifest.summary();
         model->impl_->block_size = manifest.block_size;
+        model->impl_->markov_rank = manifest.markov_rank;
+        model->impl_->mask_token_id = manifest.mask_token_id;
+        model->impl_->vocab_size = manifest.vocab_size;
         model->impl_->target_layer_ids = manifest.target_layer_ids;
 
         const std::vector<std::filesystem::path> files = safetensor_files(model_path);
@@ -4212,6 +4427,10 @@ bool NativeDSparkModel::draft_block(
             *error = "native Gemma 4 DSpark model is not the XR60 block-7 drafter";
             return false;
         }
+        if (impl_->markov_rank != kDSparkMarkovRank || impl_->vocab_size != kDSparkVocabSize) {
+            *error = "native Gemma 4 DSpark model does not match the XR60 Markov/vocab shape";
+            return false;
+        }
         if (target_kv.impl_ == nullptr || target_kv.impl_->sequence_len == 0) {
             *error = "native DSpark draft requires a populated target KV state";
             return false;
@@ -4260,8 +4479,40 @@ bool NativeDSparkModel::draft_block(
             }
         }
 
-        *error = "native DSpark decoder math is not implemented yet";
-        return false;
+        const int context_len = static_cast<int>(context_tokens.size());
+        const int full_block_len = static_cast<int>(impl_->block_size);
+        array hidden = dspark_forward_hidden(
+            *impl_,
+            target_kv.impl_->dspark_context_taps,
+            context_tokens.back(),
+            context_len,
+            full_block_len);
+        array logits = dspark_logits_for_hidden(*impl_, hidden);
+
+        int32_t previous_token = context_tokens.back();
+        size_t produced = 0;
+        for (uint32_t step = 0; step < block_size; ++step) {
+            array slot_logits = mlx::core::reshape(
+                mlx::core::slice(
+                    logits,
+                    {0, static_cast<int>(step), 0},
+                    {1, static_cast<int>(step + 1), static_cast<int>(impl_->vocab_size)}),
+                {static_cast<int>(impl_->vocab_size)});
+            array markov_embedding = dspark_markov_embedding(*impl_, previous_token);
+            array corrected_logits = model_dtype(slot_logits + dspark_markov_bias(*impl_, markov_embedding));
+            NativeTopKEntries top_k = top_k_for_flat_logits(corrected_logits, 2);
+            const int32_t token = top_k[0].token_id;
+            out_tokens[produced] = token;
+            out_logits[produced] = top_k[0].logit;
+            out_logit_margins[produced] = top_k[0].logit - top_k[1].logit;
+            out_confidence[produced] =
+                dspark_confidence(*impl_, hidden, static_cast<int>(step), markov_embedding);
+            previous_token = token;
+            ++produced;
+        }
+
+        *inout_count = produced;
+        return true;
     } catch (const std::exception& ex) {
         *error = std::string("native Gemma 4 DSpark draft failed: ") + ex.what();
         return false;
