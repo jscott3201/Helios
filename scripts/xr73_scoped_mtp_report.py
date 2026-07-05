@@ -401,6 +401,94 @@ def native_warmup_context(
     }
 
 
+def server_prefix_warm_context(
+    summary: dict[str, Any] | None,
+    *,
+    summary_path: str | None,
+    report_path: str | None,
+    label: str,
+) -> dict[str, Any]:
+    if summary is None:
+        return {
+            "present": False,
+            "label": label,
+            "summary_path": summary_path,
+            "report_path": report_path,
+            "reason": "server prefix warm summary not provided",
+        }
+
+    warmups = []
+    for warmup in summary.get("candidate_warmups") or []:
+        warmups.append(
+            {
+                "workload_id": warmup.get("workload_id"),
+                "status": warmup.get("status"),
+                "requested_prefix_tokens": int(warmup.get("requested_prefix_tokens") or 0),
+                "prompt_tokens": int(warmup.get("prompt_tokens") or 0),
+                "warmup_context_tokens": int(warmup.get("warmup_context_tokens") or 0),
+                "tokenize_ms": float(warmup.get("tokenize_ms") or 0.0),
+                "prefill_ms": float(warmup.get("prefill_ms") or 0.0),
+                "decode_ms": float(warmup.get("decode_ms") or 0.0),
+                "total_ms": float(warmup.get("total_ms") or 0.0),
+                "peak_memory_gb": float(warmup.get("peak_memory_gb") or 0.0),
+                "active_kv_bytes": int(warmup.get("active_kv_bytes") or 0),
+            }
+        )
+
+    request_deltas = []
+    for row in summary.get("records") or []:
+        baseline = row.get("baseline") or {}
+        candidate = row.get("candidate") or {}
+        baseline_metrics = baseline.get("metrics") or {}
+        candidate_metrics = candidate.get("metrics") or {}
+        baseline_first = (baseline_metrics.get("decode_token_latencies_ms") or [None])[0]
+        candidate_first = (candidate_metrics.get("decode_token_latencies_ms") or [None])[0]
+        request_deltas.append(
+            {
+                "workload_id": row.get("workload_id"),
+                "repeat_index": int(row.get("repeat_index") or 0),
+                "status": row.get("comparison_status"),
+                "baseline_first_token_ms": float(baseline_first or 0.0),
+                "candidate_first_token_ms": float(candidate_first or 0.0),
+                "first_token_delta_ms": float(baseline_first or 0.0) - float(candidate_first or 0.0),
+                "baseline_total_ms": float(baseline_metrics.get("total_ms") or 0.0),
+                "candidate_total_ms": float(candidate_metrics.get("total_ms") or 0.0),
+                "baseline_request_wall_ms": float(baseline.get("request_wall_ms") or 0.0),
+                "candidate_request_wall_ms": float(candidate.get("request_wall_ms") or 0.0),
+            }
+        )
+
+    final_metrics = summary.get("final_metrics") or {}
+    candidate_metrics = final_metrics.get("candidate") or {}
+    return {
+        "present": True,
+        "label": label,
+        "decision": summary.get("decision"),
+        "status": summary.get("status"),
+        "run_id": summary.get("run_id"),
+        "mode": summary.get("mode"),
+        "summary_path": summary_path or summary.get("summary_path"),
+        "report_path": report_path or summary.get("report_path"),
+        "blockers": list(summary.get("blockers") or []),
+        "candidate_prefix_warmup_tokens": summary.get("candidate_prefix_warmup_tokens"),
+        "warmups": warmups,
+        "request_deltas": request_deltas,
+        "final_metrics": {
+            "prefix_warmups_total": float(candidate_metrics.get("prefix_warmups_total") or 0.0),
+            "prefix_warmup_tokens_total": float(
+                candidate_metrics.get("prefix_warmup_tokens_total") or 0.0
+            ),
+            "prefix_warmup_seconds": float(candidate_metrics.get("prefix_warmup_seconds") or 0.0),
+            "memory_peak_mlx_bytes": float(candidate_metrics.get("memory_peak_mlx_bytes") or 0.0),
+        },
+        "claim_boundaries": [
+            "XR85 server prefix warmup is explicit local control-surface work only.",
+            "XR85 does not make prefix warmup automatic or default-on.",
+            "Broad MTP default-on still depends on protected aggregate gates.",
+        ],
+    }
+
+
 def build_result(args: argparse.Namespace) -> dict[str, Any]:
     candidate_summary = load_json(Path(args.candidate_summary))
     oracle_summary = load_json(Path(args.oracle_summary))
@@ -409,6 +497,11 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
     native_warmup_summary = (
         load_json(Path(args.native_warmup_summary), required=False)
         if args.native_warmup_summary
+        else None
+    )
+    server_prefix_summary = (
+        load_json(Path(args.server_prefix_warm_summary), required=False)
+        if args.server_prefix_warm_summary
         else None
     )
 
@@ -507,6 +600,12 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
             report_path=args.native_warmup_report,
             label=args.native_warmup_label,
         ),
+        "server_prefix_warm_context": server_prefix_warm_context(
+            server_prefix_summary,
+            summary_path=args.server_prefix_warm_summary,
+            report_path=args.server_prefix_warm_report,
+            label=args.server_prefix_warm_label,
+        ),
         "scoped_gates": gates,
         "broad_default_gates": broad_default_gates,
         "blockers": blockers,
@@ -517,6 +616,8 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
             "holdout_summary": args.holdout_summary,
             "native_warmup_summary": args.native_warmup_summary,
             "native_warmup_report": args.native_warmup_report,
+            "server_prefix_warm_summary": args.server_prefix_warm_summary,
+            "server_prefix_warm_report": args.server_prefix_warm_report,
         },
     }
 
@@ -631,6 +732,63 @@ def render_markdown(result: dict[str, Any]) -> str:
             )
         lines.extend(["", "Claim boundaries:"])
         lines.extend(f"- {boundary}" for boundary in native_warmup["claim_boundaries"])
+    server_prefix = result.get("server_prefix_warm_context") or {}
+    if server_prefix.get("present"):
+        lines.extend(
+            [
+                "",
+                "## Server Prefix-Warm Context",
+                "",
+                f"- Label: `{server_prefix['label']}`",
+                f"- Decision: `{server_prefix.get('decision')}`",
+                f"- Status: `{server_prefix.get('status')}`",
+                f"- Mode: `{server_prefix.get('mode')}`",
+                f"- Summary: `{server_prefix.get('summary_path')}`",
+                f"- Report: `{server_prefix.get('report_path')}`",
+                f"- Prefix warmups total: `{fmt(server_prefix['final_metrics']['prefix_warmups_total'])}`",
+                f"- Prefix warm tokens total: `{fmt(server_prefix['final_metrics']['prefix_warmup_tokens_total'])}`",
+                f"- Prefix warm seconds: `{fmt(server_prefix['final_metrics']['prefix_warmup_seconds'])}`",
+                "",
+                "| Workload | Status | Prefix | Prompt | Warm ctx | Total ms | Prefill ms | Decode ms | Peak GB |",
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for warmup in server_prefix["warmups"]:
+            lines.append(
+                "| `{workload_id}` | `{status}` | {prefix} | {prompt} | {warm} | {total} | {prefill} | {decode} | {peak} |".format(
+                    workload_id=warmup["workload_id"],
+                    status=warmup["status"],
+                    prefix=warmup["requested_prefix_tokens"],
+                    prompt=warmup["prompt_tokens"],
+                    warm=warmup["warmup_context_tokens"],
+                    total=fmt(warmup["total_ms"]),
+                    prefill=fmt(warmup["prefill_ms"]),
+                    decode=fmt(warmup["decode_ms"]),
+                    peak=fmt(warmup["peak_memory_gb"]),
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "| Workload | Repeat | Status | Baseline first ms | Candidate first ms | Delta ms | Baseline total ms | Candidate total ms |",
+                "|---|---:|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for delta in server_prefix["request_deltas"]:
+            lines.append(
+                "| `{workload_id}` | {repeat} | `{status}` | {baseline_first} | {candidate_first} | {delta_ms} | {baseline_total} | {candidate_total} |".format(
+                    workload_id=delta["workload_id"],
+                    repeat=delta["repeat_index"],
+                    status=delta["status"],
+                    baseline_first=fmt(delta["baseline_first_token_ms"]),
+                    candidate_first=fmt(delta["candidate_first_token_ms"]),
+                    delta_ms=fmt(delta["first_token_delta_ms"]),
+                    baseline_total=fmt(delta["baseline_total_ms"]),
+                    candidate_total=fmt(delta["candidate_total_ms"]),
+                )
+            )
+        lines.extend(["", "Claim boundaries:"])
+        lines.extend(f"- {boundary}" for boundary in server_prefix["claim_boundaries"])
     lines.extend(
         [
             "",
@@ -685,6 +843,9 @@ def main() -> None:
     parser.add_argument("--native-warmup-summary")
     parser.add_argument("--native-warmup-report")
     parser.add_argument("--native-warmup-label", default="XR78 native amortized warmup")
+    parser.add_argument("--server-prefix-warm-summary")
+    parser.add_argument("--server-prefix-warm-report")
+    parser.add_argument("--server-prefix-warm-label", default="XR85 server prefix warmup")
     parser.add_argument("--protected-workload", action="append", default=list(DEFAULT_PROTECTED_WORKLOADS))
     parser.add_argument(
         "--holdout-workload",
