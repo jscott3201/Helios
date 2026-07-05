@@ -3,13 +3,12 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR77 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR78 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
 
-The next high-value goal is a shape-scoped/load-time native warmup policy
-matrix.
+The next high-value goal is a warmup-aware MTP protected aggregate rerun.
 
 XR72 closed the immediate native diagnostic question: the remaining
 full-attention tail is dominated by MLX full-attention eval, especially chat
@@ -22,19 +21,22 @@ tail, while a harness-only same-shape warmup probe sharply reduced the chat
 first-token/raw p99 tail. XR77 then made that warmup evidence cost-accounted:
 the first-token/raw p99 tail improvement repeated, but the discarded warmup
 cost was roughly `3.2 s` at p50, which rules out naive per-request warmup.
-XR73 accepted the repeatedly strong chat/tool MTP lane as an explicit scoped
-opt-in, while rejecting broad default-on because the protected aggregate remains
-below the release gate. XR74 closed the readiness sweep for the current local
+XR78 then showed the warm state survives repeated same-loaded-target,
+fresh-cache requests for the chat tail lane, while the 4K code workload did not
+reproduce the tail and gained no meaningful warmup benefit. XR73 accepted the
+repeatedly strong chat/tool MTP lane as an explicit scoped opt-in, while
+rejecting broad default-on because the protected aggregate remains below the
+release gate. XR74 closed the readiness sweep for the current local
 persistent-native default surface. The next useful step is therefore a
-default-off, shape-scoped policy matrix that treats warmup as load-time or
-amortized work, not request-path work.
+warmup-aware protected MTP aggregate rerun, with broad MTP default-on still
+parked behind the protected aggregate gate.
 
 Recommended order:
 
-1. Native load-time/amortized warmup policy matrix, default-off until it proves
-   shape scope, cost amortization, and non-profile runtime-default comparisons
-   beyond `chat_short_1k_001`.
-2. Rerun protected MTP aggregate only after the native tail baseline is cleaner.
+1. Warmup-aware MTP protected aggregate rerun using the accepted scoped
+   chat/tool opt-in and the current native-tail claim boundaries.
+2. Keep native warmup as out-of-request/load-time shape work unless a later
+   server policy proves amortization without user-visible cost.
 3. Keep DSpark parked until native and MTP gates are cleaner.
 
 ## Evidence summary
@@ -98,6 +100,18 @@ Recommended order:
   was large: total p50 `3203.529 ms`, with prefill p50 `2737.664 ms` and decode
   p50 `360.509 ms`, so the viable direction is out-of-request/load-time or
   amortized exact-shape warmup, not per-request warmup.
+- XR78 added a default-off
+  `native_decode_runtime_default_warmup_amortized_4` variant that warms once
+  per loaded target/workload and then measures four repeated fresh-cache
+  requests on the same loaded target. The gate-valid 1K/4K run wrote `36/36`
+  correct records with no blockers, peak MLX `7.639 GB`, and `0/1116` profile
+  samples. On `chat_short_1k_001`, warmup-amortized versus runtime default
+  passed the XR06 tail gate: raw p50 moved `70.524 -> 70.300 ms`, raw p99/max
+  improved `387.059 -> 92.292 ms` (`+76.155%`), and first-token p50 improved
+  `387.059 -> 92.292 ms`. Warmup event p50 was still large at `3843.020 ms`,
+  amortized over four requests to `960.755 ms`, so it remains out-of-request
+  or load-time shape work. On `code_review_rust_4k_001`, the baseline did not
+  reproduce a tail and warmup was not selected.
 - Post-XR70 MTP kept exactness and oracle checks, but protected aggregate speedup
   was `+19.845%`, below the `25%` broad default-on gate. Selected chat/tool lanes
   remain attractive at about `+30.784%`.
@@ -118,7 +132,7 @@ Recommended order:
 
 | Area | Files / symbols | Responsibility | Notes |
 |---|---|---|---|
-| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, profile-perturbation, warmup-probe, warmup-costed, full-attention KV update capacity, and XR75 group-eval candidates |
+| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, profile-perturbation, warmup-probe, warmup-costed, amortized warmup, full-attention KV update capacity, and XR75 group-eval candidates |
 | Native profile ABI | `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs` | Carries per-token decode profile fields across C ABI and Rust | Current fields split broad forward, deferred KV eval, full-attention/sliding eval, update/capacity/slice/visible-slice, group eval attribution, and eval sync |
 | Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention eval; XR75 rejected simple serial group scheduling |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker |
@@ -129,7 +143,7 @@ Recommended order:
 
 ## Findings
 
-### high: Warmup is viable only as shape-scoped amortized work
+### high: Native tail is clean enough to rerun protected MTP
 
 Evidence: XR72 accepted runtime default against explicit per-layer on all five
 rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
@@ -140,7 +154,10 @@ follow-up. XR76 showed profile-mode perturbation is not the main cause and a
 same-shape warmup probe cut chat first-token p50 `177.571 -> 86.680 ms` while
 raw p99 improved `51.186%`. XR77 repeated the win with cost accounting:
 first-token p50 moved `188.836 -> 92.922 ms` and raw p99 improved `50.792%`,
-but discarded warmup total p50 was `3203.529 ms`. Broad MTP default-on remains
+but discarded warmup total p50 was `3203.529 ms`. XR78 showed repeated
+same-loaded-target fresh-cache chat requests keep that first-token tail benefit:
+raw p99 improved `76.155%`, first-token p50 moved `387.059 -> 92.292 ms`, and
+the 4K code workload did not reproduce a tail. Broad MTP default-on remains
 below the protected aggregate gate, and XR70/XR71 full-attention update
 candidates remain default-off.
 
@@ -149,11 +166,10 @@ another readiness/doc pass or a serial group-eval full matrix. The remaining
 native speed evidence points at first-token warm/JIT/cache behavior, but the
 cost model rules out naive request-path warmup.
 
-Recommendation: Scope the next native patch around an exact-shape load-time or
-amortized warmup matrix. It should prove which context families benefit,
-whether the warmed state survives across requests, and whether the cost can be
-paid outside user-visible latency. Treat profile mode and serial group eval as
-rejected promotion lanes unless new evidence changes their cost model.
+Recommendation: Keep native warmup as default-off out-of-request/load-time
+shape work and move the next optimization pass to MTP protected aggregate
+reruns. Treat profile mode and serial group eval as rejected promotion lanes
+unless new evidence changes their cost model.
 
 ### high: Broad MTP default-on is still unsupported
 
@@ -178,7 +194,7 @@ within the documented scope. This is not production internet-facing serving
 readiness and does not promote MTP or default-off experimental native candidates.
 
 Recommendation: Keep rollback flags and accepted/default-off boundaries
-explicit in docs while moving speed work to the native amortized-warmup lane.
+explicit in docs while moving speed work to the MTP protected aggregate lane.
 
 ### info: CI workflow removal is already true in this checkout
 
@@ -194,19 +210,17 @@ rewrite old milestone reports.
 
 ## Next work items
 
-### Native amortized warmup matrix
+### Warmup-aware MTP protected aggregate
 
-XR77 showed the same-shape warmup hypothesis survives cost accounting, but its
-median discarded cost is about `3.2 s` for a 1K chat context. The next task
-should test a default-off load-time or amortized exact-shape warmup policy
-across selected 1K/4K workloads, prove whether the first-token tail improvement
-survives beyond `chat_short_1k_001`, and report warmup cost separately from
-request latency. Do not spend more time on capacity growth, visible-slice
-overhead, profile-mode scheduling, or serial group scheduling without new
-evidence.
+XR78 showed same-loaded-target warm state survives repeated fresh-cache chat
+requests and that the tested 4K workload does not need warmup. The next task
+should rerun the protected MTP aggregate with explicit accounting for the native
+tail/warmup claim boundaries: scoped chat/tool opt-in may remain accepted, but
+broad default-on still requires protected aggregate speed above the release
+gate with exactness, oracle, holdout, memory, and default-overhead checks.
 
 ## Gaps and unknowns
 
-- XR77 accounted for warmup cost on `chat_short_1k_001`, but it does not yet
-  prove production shape selection, cross-request warm-state lifetime, or
-  generalization beyond that first-token tail lane.
+- XR78 proves warm-state lifetime only within the same loaded target and
+  same-shape fresh-cache benchmark path; a production server warmup policy
+  would still need separate admission, scheduling, and observability work.

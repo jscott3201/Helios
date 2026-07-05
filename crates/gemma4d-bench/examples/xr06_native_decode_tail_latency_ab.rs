@@ -425,6 +425,8 @@ struct Variant {
     grouped_end_kv_eval_count: usize,
     logits_sync_after_decode: bool,
     warmup_decode_before_measurement: bool,
+    warmup_once_per_trial_workload: bool,
+    warmup_reuse_measured_requests: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -454,13 +456,18 @@ struct Record {
     config: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
     trial_index: usize,
+    request_repeat_index: usize,
     input_tokens: usize,
     generated_tokens: usize,
     model_load_ms: f64,
+    warmup_amortization_repeats: usize,
     warmup_context_tokens: usize,
     warmup_prefill_ms: f64,
     warmup_decode_ms: f64,
     warmup_total_ms: f64,
+    warmup_amortized_prefill_ms: f64,
+    warmup_amortized_decode_ms: f64,
+    warmup_amortized_total_ms: f64,
     prefill_ms: f64,
     ttft_ms: f64,
     decode_ms: f64,
@@ -715,11 +722,16 @@ struct FirstTokenAggregate {
 struct WarmupCostAggregate {
     variant: String,
     workload_id: String,
-    sample_count: usize,
+    warmup_event_count: usize,
+    measured_request_count: usize,
     context_tokens: Option<ScalarStats>,
+    amortization_repeats: Option<ScalarStats>,
     prefill_ms: Option<LatencyStats>,
     decode_ms: Option<LatencyStats>,
     total_ms: Option<LatencyStats>,
+    amortized_prefill_ms: Option<LatencyStats>,
+    amortized_decode_ms: Option<LatencyStats>,
+    amortized_total_ms: Option<LatencyStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -728,6 +740,18 @@ struct WarmupCost {
     prefill_ms: f64,
     decode_ms: f64,
     total_ms: f64,
+}
+
+impl WarmupCost {
+    fn amortized(&self, measured_requests: usize) -> Self {
+        let denominator = measured_requests.max(1) as f64;
+        Self {
+            context_tokens: self.context_tokens,
+            prefill_ms: self.prefill_ms / denominator,
+            decode_ms: self.decode_ms / denominator,
+            total_ms: self.total_ms / denominator,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -785,6 +809,13 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             Some("native_decode_runtime_default"),
             0,
             48,
+        ),
+        native_default_amortized_warmup_variant(
+            "native_decode_runtime_default_warmup_amortized_4",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            4,
         ),
         native_default_variant_with_extra_env(
             "native_decode_full_attention_group_eval",
@@ -985,6 +1016,36 @@ fn native_default_warmup_variant(
     variant
 }
 
+fn native_default_amortized_warmup_variant(
+    name: &str,
+    baseline_variant: Option<&str>,
+    immediate_layer_kv_eval_count: usize,
+    grouped_end_kv_eval_count: usize,
+    measured_requests: usize,
+) -> Variant {
+    let mut variant = native_default_warmup_variant(
+        name,
+        baseline_variant,
+        immediate_layer_kv_eval_count,
+        grouped_end_kv_eval_count,
+    );
+    variant.config.insert(
+        "warmup_reuse_scope".to_owned(),
+        "once_per_loaded_target_workload".to_owned(),
+    );
+    variant.config.insert(
+        "warmup_state_lifetime_probe".to_owned(),
+        "same_loaded_target_fresh_cache_repeated_requests".to_owned(),
+    );
+    variant.config.insert(
+        "warmup_amortization_measured_requests".to_owned(),
+        measured_requests.to_string(),
+    );
+    variant.warmup_once_per_trial_workload = true;
+    variant.warmup_reuse_measured_requests = measured_requests.max(1);
+    variant
+}
+
 fn native_default_variant_with_extra_env<const N: usize>(
     name: &str,
     baseline_variant: Option<&str>,
@@ -1020,6 +1081,8 @@ fn native_default_variant_with_extra_env<const N: usize>(
         grouped_end_kv_eval_count,
         logits_sync_after_decode: true,
         warmup_decode_before_measurement: false,
+        warmup_once_per_trial_workload: false,
+        warmup_reuse_measured_requests: 1,
     }
 }
 
@@ -1063,6 +1126,8 @@ fn native_variant_with_extra_env<const N: usize>(
         grouped_end_kv_eval_count,
         logits_sync_after_decode: true,
         warmup_decode_before_measurement: false,
+        warmup_once_per_trial_workload: false,
+        warmup_reuse_measured_requests: 1,
     }
 }
 
@@ -1104,6 +1169,7 @@ fn run_variant_trial(
                     model_identity,
                     variant,
                     trial_index,
+                    0,
                     workload,
                     model_load,
                     format!("target load failed: {error}"),
@@ -1114,19 +1180,67 @@ fn run_variant_trial(
     };
 
     for workload in workload_inputs {
-        records.push(run_decode_record(
-            options,
-            run_id,
-            git_sha,
-            git_status_short,
-            command,
-            model_identity,
-            variant,
-            trial_index,
-            workload,
-            model_load,
-            &target,
-        )?);
+        if variant.warmup_once_per_trial_workload {
+            let warmup_cost = match warmup_decode_once(&target, &workload.token_ids) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    records.push(failed_record(
+                        run_id,
+                        git_sha,
+                        git_status_short,
+                        command,
+                        model_identity,
+                        variant,
+                        trial_index,
+                        0,
+                        workload,
+                        model_load,
+                        format!("warmup decode failed: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            let measured_requests = variant.warmup_reuse_measured_requests.max(1);
+            let amortized_cost = warmup_cost.amortized(measured_requests);
+            for request_repeat_index in 0..measured_requests {
+                let warmup_event_cost = (request_repeat_index == 0).then_some(warmup_cost.clone());
+                records.push(run_decode_record(
+                    options,
+                    run_id,
+                    git_sha,
+                    git_status_short,
+                    command,
+                    model_identity,
+                    variant,
+                    trial_index,
+                    request_repeat_index,
+                    workload,
+                    model_load,
+                    &target,
+                    warmup_event_cost,
+                    Some(amortized_cost.clone()),
+                    measured_requests,
+                )?);
+            }
+        } else {
+            records.push(run_decode_record(
+                options,
+                run_id,
+                git_sha,
+                git_status_short,
+                command,
+                model_identity,
+                variant,
+                trial_index,
+                0,
+                workload,
+                model_load,
+                &target,
+                None,
+                None,
+                1,
+            )?);
+        }
     }
 
     Ok(())
@@ -1142,11 +1256,17 @@ fn run_decode_record(
     _model_identity: &manifest::ArtifactIdentity,
     variant: &Variant,
     trial_index: usize,
+    request_repeat_index: usize,
     workload: &WorkloadInput,
     model_load: Duration,
     target: &Target,
+    warmup_event_cost: Option<WarmupCost>,
+    warmup_amortized_cost: Option<WarmupCost>,
+    warmup_amortization_repeats: usize,
 ) -> Result<Record, Box<dyn std::error::Error>> {
-    let warmup_cost = if variant.warmup_decode_before_measurement {
+    let warmup_cost = if let Some(cost) = warmup_event_cost {
+        Some(cost)
+    } else if variant.warmup_decode_before_measurement && !variant.warmup_once_per_trial_workload {
         match warmup_decode_once(target, &workload.token_ids) {
             Ok(cost) => Some(cost),
             Err(error) => {
@@ -1158,6 +1278,7 @@ fn run_decode_record(
                     _model_identity,
                     variant,
                     trial_index,
+                    request_repeat_index,
                     workload,
                     model_load,
                     format!("warmup decode failed: {error}"),
@@ -1184,6 +1305,7 @@ fn run_decode_record(
                 _model_identity,
                 variant,
                 trial_index,
+                request_repeat_index,
                 workload,
                 model_load,
                 format!("prefill failed: {error}"),
@@ -1289,9 +1411,11 @@ fn run_decode_record(
         config: variant.config.clone(),
         env: variant.env.clone(),
         trial_index,
+        request_repeat_index,
         input_tokens: workload.token_ids.len(),
         generated_tokens,
         model_load_ms: duration_ms(model_load),
+        warmup_amortization_repeats,
         warmup_context_tokens: warmup_cost
             .as_ref()
             .map(|cost| cost.context_tokens)
@@ -1308,6 +1432,33 @@ fn run_decode_record(
             .as_ref()
             .map(|cost| cost.total_ms)
             .unwrap_or(0.0),
+        warmup_amortized_prefill_ms: warmup_amortized_cost
+            .as_ref()
+            .map(|cost| cost.prefill_ms)
+            .unwrap_or_else(|| {
+                warmup_cost
+                    .as_ref()
+                    .map(|cost| cost.prefill_ms)
+                    .unwrap_or(0.0)
+            }),
+        warmup_amortized_decode_ms: warmup_amortized_cost
+            .as_ref()
+            .map(|cost| cost.decode_ms)
+            .unwrap_or_else(|| {
+                warmup_cost
+                    .as_ref()
+                    .map(|cost| cost.decode_ms)
+                    .unwrap_or(0.0)
+            }),
+        warmup_amortized_total_ms: warmup_amortized_cost
+            .as_ref()
+            .map(|cost| cost.total_ms)
+            .unwrap_or_else(|| {
+                warmup_cost
+                    .as_ref()
+                    .map(|cost| cost.total_ms)
+                    .unwrap_or(0.0)
+            }),
         prefill_ms,
         ttft_ms: prefill_ms,
         decode_ms,
@@ -1368,6 +1519,7 @@ fn failed_record(
     _model_identity: &manifest::ArtifactIdentity,
     variant: &Variant,
     trial_index: usize,
+    request_repeat_index: usize,
     workload: &WorkloadInput,
     model_load: Duration,
     blocker: String,
@@ -1391,13 +1543,18 @@ fn failed_record(
         config: variant.config.clone(),
         env: variant.env.clone(),
         trial_index,
+        request_repeat_index,
         input_tokens: workload.token_ids.len(),
         generated_tokens: 0,
         model_load_ms: duration_ms(model_load),
+        warmup_amortization_repeats: 0,
         warmup_context_tokens: 0,
         warmup_prefill_ms: 0.0,
         warmup_decode_ms: 0.0,
         warmup_total_ms: 0.0,
+        warmup_amortized_prefill_ms: 0.0,
+        warmup_amortized_decode_ms: 0.0,
+        warmup_amortized_total_ms: 0.0,
         prefill_ms: 0.0,
         ttft_ms: 0.0,
         decode_ms: 0.0,
@@ -1678,12 +1835,24 @@ fn build_first_token_aggregates(records: &[Record]) -> Vec<FirstTokenAggregate> 
 fn build_warmup_cost_aggregates(records: &[Record]) -> Vec<WarmupCostAggregate> {
     let keys = records
         .iter()
-        .filter(|record| record.status == "passed" && record.warmup_total_ms > 0.0)
+        .filter(|record| {
+            record.status == "passed"
+                && (record.warmup_total_ms > 0.0 || record.warmup_amortized_total_ms > 0.0)
+        })
         .map(|record| (record.variant.clone(), record.workload_id.clone()))
         .collect::<BTreeSet<_>>();
     let mut out = Vec::new();
     for (variant, workload_id) in keys {
-        let group = records
+        let measured_group = records
+            .iter()
+            .filter(|record| {
+                record.status == "passed"
+                    && record.variant == variant
+                    && record.workload_id == workload_id
+                    && record.warmup_amortized_total_ms > 0.0
+            })
+            .collect::<Vec<_>>();
+        let event_group = records
             .iter()
             .filter(|record| {
                 record.status == "passed"
@@ -1692,30 +1861,51 @@ fn build_warmup_cost_aggregates(records: &[Record]) -> Vec<WarmupCostAggregate> 
                     && record.warmup_total_ms > 0.0
             })
             .collect::<Vec<_>>();
-        let context_tokens = group
+        let context_tokens = event_group
             .iter()
             .map(|record| record.warmup_context_tokens as f64)
             .collect::<Vec<_>>();
-        let prefill_ms = group
+        let amortization_repeats = measured_group
+            .iter()
+            .map(|record| record.warmup_amortization_repeats as f64)
+            .collect::<Vec<_>>();
+        let prefill_ms = event_group
             .iter()
             .map(|record| record.warmup_prefill_ms)
             .collect::<Vec<_>>();
-        let decode_ms = group
+        let decode_ms = event_group
             .iter()
             .map(|record| record.warmup_decode_ms)
             .collect::<Vec<_>>();
-        let total_ms = group
+        let total_ms = event_group
             .iter()
             .map(|record| record.warmup_total_ms)
+            .collect::<Vec<_>>();
+        let amortized_prefill_ms = measured_group
+            .iter()
+            .map(|record| record.warmup_amortized_prefill_ms)
+            .collect::<Vec<_>>();
+        let amortized_decode_ms = measured_group
+            .iter()
+            .map(|record| record.warmup_amortized_decode_ms)
+            .collect::<Vec<_>>();
+        let amortized_total_ms = measured_group
+            .iter()
+            .map(|record| record.warmup_amortized_total_ms)
             .collect::<Vec<_>>();
         out.push(WarmupCostAggregate {
             variant,
             workload_id,
-            sample_count: group.len(),
+            warmup_event_count: event_group.len(),
+            measured_request_count: measured_group.len(),
             context_tokens: scalar_stats(&context_tokens),
+            amortization_repeats: scalar_stats(&amortization_repeats),
             prefill_ms: latency_stats(&prefill_ms),
             decode_ms: latency_stats(&decode_ms),
             total_ms: latency_stats(&total_ms),
+            amortized_prefill_ms: latency_stats(&amortized_prefill_ms),
+            amortized_decode_ms: latency_stats(&amortized_decode_ms),
+            amortized_total_ms: latency_stats(&amortized_total_ms),
         });
     }
     out
@@ -2716,22 +2906,24 @@ fn render_report(summary: &Summary) -> String {
 
     if !summary.warmup_cost_aggregates.is_empty() {
         out.push_str("\n## Warmup Cost\n\n");
-        out.push_str("| Workload | Variant | Samples | Context Tokens p50 | Prefill p50 | Prefill p95 | Decode p50 | Decode p95 | Total p50 | Total p95 | Total max |\n");
-        out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        out.push_str("| Workload | Variant | Events | Requests | Amortize N p50 | Context Tokens p50 | Event Total p50 | Event Total p95 | Event Total max | Amortized Total p50 | Amortized Total p95 | Amortized Prefill p50 | Amortized Decode p50 |\n");
+        out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
         for aggregate in &summary.warmup_cost_aggregates {
             out.push_str(&format!(
-                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 aggregate.workload_id,
                 aggregate.variant,
-                aggregate.sample_count,
+                aggregate.warmup_event_count,
+                aggregate.measured_request_count,
+                fmt_scalar_p50(&aggregate.amortization_repeats),
                 fmt_scalar_p50(&aggregate.context_tokens),
-                fmt_stats_p50(&aggregate.prefill_ms),
-                fmt_stats_p95(&aggregate.prefill_ms),
-                fmt_stats_p50(&aggregate.decode_ms),
-                fmt_stats_p95(&aggregate.decode_ms),
                 fmt_stats_p50(&aggregate.total_ms),
                 fmt_stats_p95(&aggregate.total_ms),
-                fmt_stats_max(&aggregate.total_ms)
+                fmt_stats_max(&aggregate.total_ms),
+                fmt_stats_p50(&aggregate.amortized_total_ms),
+                fmt_stats_p95(&aggregate.amortized_total_ms),
+                fmt_stats_p50(&aggregate.amortized_prefill_ms),
+                fmt_stats_p50(&aggregate.amortized_decode_ms)
             ));
         }
         out.push_str("\nWarmup costs are recorded for the discarded same-context prefill/decode pass and are not included in measured request `prefill_ms`, `decode_ms`, or `total_ms`.\n");
