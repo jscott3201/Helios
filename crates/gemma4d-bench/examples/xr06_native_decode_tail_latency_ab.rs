@@ -39,7 +39,16 @@ const DEFAULT_WORKLOAD_IDS: &[&str] = &[
 const ENV_KEYS: &[&str] = &[
     "GEMMA4D_REQUIRE_MLX",
     "GEMMA4D_USE_NATIVE_GRAPH",
+    "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY",
+    "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS",
     "GEMMA4D_NATIVE_DECODE_KV_EVAL",
+    "GEMMA4D_NATIVE_DECODE_PROFILE",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
+];
+const INHERITED_GLOBAL_ENV_KEYS: &[&str] = &[
+    "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY",
+    "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS",
     "GEMMA4D_NATIVE_DECODE_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
@@ -361,6 +370,7 @@ struct Environment {
     cargo: String,
     mlx_version: String,
     hw_memsize_bytes: Option<u64>,
+    captured_env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -718,12 +728,7 @@ fn native_default_variant(
     let mut env = BTreeMap::new();
     env.insert("GEMMA4D_REQUIRE_MLX".to_owned(), "1".to_owned());
     env.insert("GEMMA4D_USE_NATIVE_GRAPH".to_owned(), "1".to_owned());
-    if let Ok(value) = std::env::var("GEMMA4D_NATIVE_DECODE_PROFILE")
-        && !value.is_empty()
-    {
-        config.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value.clone());
-        env.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value);
-    }
+    inherit_global_variant_env(&mut config, &mut env);
     Variant {
         name: name.to_owned(),
         config,
@@ -757,16 +762,11 @@ fn native_variant_with_extra_env<const N: usize>(
     let mut env = BTreeMap::new();
     env.insert("GEMMA4D_REQUIRE_MLX".to_owned(), "1".to_owned());
     env.insert("GEMMA4D_USE_NATIVE_GRAPH".to_owned(), "1".to_owned());
+    inherit_global_variant_env(&mut config, &mut env);
     env.insert(
         "GEMMA4D_NATIVE_DECODE_KV_EVAL".to_owned(),
         eval_policy.to_owned(),
     );
-    if let Ok(value) = std::env::var("GEMMA4D_NATIVE_DECODE_PROFILE")
-        && !value.is_empty()
-    {
-        config.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value.clone());
-        env.insert("GEMMA4D_NATIVE_DECODE_PROFILE".to_owned(), value);
-    }
     for (key, value) in extra_env {
         config.insert(key.to_owned(), value.to_owned());
         env.insert(key.to_owned(), value.to_owned());
@@ -1707,6 +1707,20 @@ fn decision_for(blockers: &[String], comparisons: &[Comparison], records: &[Reco
     }
 }
 
+fn inherit_global_variant_env(
+    config: &mut BTreeMap<String, String>,
+    env: &mut BTreeMap<String, String>,
+) {
+    for key in INHERITED_GLOBAL_ENV_KEYS {
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            config.insert((*key).to_owned(), value.clone());
+            env.insert((*key).to_owned(), value);
+        }
+    }
+}
+
 struct EnvGuard {
     previous: Vec<(String, Option<String>)>,
 }
@@ -2384,6 +2398,15 @@ fn command_line() -> String {
 }
 
 fn capture_environment() -> Environment {
+    let captured_env = ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*key).to_owned(), value))
+        })
+        .collect();
     Environment {
         machine: command_stdout("uname", &["-a"]).unwrap_or_else(|| "unknown".to_owned()),
         macos: command_stdout("sw_vers", &["-productVersion"])
@@ -2400,6 +2423,7 @@ fn capture_environment() -> Environment {
         .unwrap_or_else(|| "unknown".to_owned()),
         hw_memsize_bytes: command_stdout("sysctl", &["-n", "hw.memsize"])
             .and_then(|value| value.parse::<u64>().ok()),
+        captured_env,
     }
 }
 
