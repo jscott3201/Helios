@@ -489,6 +489,15 @@ struct DecodeProfileTrace {
     layer_graph_ms: f64,
     attention_kv_mutation_ms: f64,
     deferred_kv_eval_ms: f64,
+    deferred_kv_eval_full_attention_ms: f64,
+    deferred_kv_eval_sliding_ms: f64,
+    deferred_kv_eval_full_attention_arrays: u64,
+    deferred_kv_eval_sliding_arrays: u64,
+    deferred_kv_eval_total_arrays: u64,
+    deferred_kv_eval_full_attention_bytes: u64,
+    deferred_kv_eval_sliding_bytes: u64,
+    deferred_kv_eval_total_bytes: u64,
+    deferred_kv_eval_sequence_len: u64,
     lm_head_ms: f64,
     non_kv_forward_graph_ms: f64,
     greedy_select_ms: f64,
@@ -524,6 +533,15 @@ struct DecodeProfileAggregate {
     layer_graph_ms: Option<LatencyStats>,
     attention_kv_mutation_ms: Option<LatencyStats>,
     deferred_kv_eval_ms: Option<LatencyStats>,
+    deferred_kv_eval_full_attention_ms: Option<LatencyStats>,
+    deferred_kv_eval_sliding_ms: Option<LatencyStats>,
+    deferred_kv_eval_full_attention_arrays: Option<ScalarStats>,
+    deferred_kv_eval_sliding_arrays: Option<ScalarStats>,
+    deferred_kv_eval_total_arrays: Option<ScalarStats>,
+    deferred_kv_eval_full_attention_bytes: Option<ScalarStats>,
+    deferred_kv_eval_sliding_bytes: Option<ScalarStats>,
+    deferred_kv_eval_total_bytes: Option<ScalarStats>,
+    deferred_kv_eval_sequence_len: Option<ScalarStats>,
     lm_head_ms: Option<LatencyStats>,
     non_kv_forward_graph_ms: Option<LatencyStats>,
     greedy_select_ms: Option<LatencyStats>,
@@ -572,6 +590,18 @@ struct LatencyStats {
     p99_ms: f64,
     max_ms: f64,
     mean_ms: f64,
+    cv: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ScalarStats {
+    count: usize,
+    min: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+    mean: f64,
     cv: Option<f64>,
 }
 
@@ -1299,6 +1329,17 @@ fn decode_profile_trace(
         layer_graph_ms: profile.layer_graph_ms,
         attention_kv_mutation_ms: profile.attention_kv_mutation_ms,
         deferred_kv_eval_ms: profile.deferred_kv_eval_ms,
+        deferred_kv_eval_full_attention_ms: profile.deferred_kv_eval_full_attention_ms,
+        deferred_kv_eval_sliding_ms: profile.deferred_kv_eval_sliding_ms,
+        deferred_kv_eval_full_attention_arrays: profile.deferred_kv_eval_full_attention_arrays,
+        deferred_kv_eval_sliding_arrays: profile.deferred_kv_eval_sliding_arrays,
+        deferred_kv_eval_total_arrays: profile.deferred_kv_eval_full_attention_arrays
+            + profile.deferred_kv_eval_sliding_arrays,
+        deferred_kv_eval_full_attention_bytes: profile.deferred_kv_eval_full_attention_bytes,
+        deferred_kv_eval_sliding_bytes: profile.deferred_kv_eval_sliding_bytes,
+        deferred_kv_eval_total_bytes: profile.deferred_kv_eval_full_attention_bytes
+            + profile.deferred_kv_eval_sliding_bytes,
+        deferred_kv_eval_sequence_len: profile.deferred_kv_eval_sequence_len,
         lm_head_ms: profile.lm_head_ms,
         non_kv_forward_graph_ms,
         greedy_select_ms: profile.greedy_select_ms,
@@ -1355,6 +1396,41 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
         let deferred_kv_eval_ms = latency_stats(&profile_values(&profiles, |profile| {
             profile.deferred_kv_eval_ms
         }));
+        let deferred_kv_eval_full_attention_ms =
+            latency_stats(&profile_values(&profiles, |profile| {
+                profile.deferred_kv_eval_full_attention_ms
+            }));
+        let deferred_kv_eval_sliding_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.deferred_kv_eval_sliding_ms
+        }));
+        let deferred_kv_eval_full_attention_arrays =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.deferred_kv_eval_full_attention_arrays
+            }));
+        let deferred_kv_eval_sliding_arrays =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.deferred_kv_eval_sliding_arrays
+            }));
+        let deferred_kv_eval_total_arrays =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.deferred_kv_eval_total_arrays
+            }));
+        let deferred_kv_eval_full_attention_bytes =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.deferred_kv_eval_full_attention_bytes
+            }));
+        let deferred_kv_eval_sliding_bytes =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.deferred_kv_eval_sliding_bytes
+            }));
+        let deferred_kv_eval_total_bytes =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.deferred_kv_eval_total_bytes
+            }));
+        let deferred_kv_eval_sequence_len =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.deferred_kv_eval_sequence_len
+            }));
         let lm_head_ms = latency_stats(&profile_values(&profiles, |profile| profile.lm_head_ms));
         let non_kv_forward_graph_ms = latency_stats(&profile_values(&profiles, |profile| {
             profile.non_kv_forward_graph_ms
@@ -1385,6 +1461,11 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             ("non_kv_forward_graph_ms", &non_kv_forward_graph_ms),
             ("attention_kv_mutation_ms", &attention_kv_mutation_ms),
             ("deferred_kv_eval_ms", &deferred_kv_eval_ms),
+            (
+                "deferred_kv_eval_full_attention_ms",
+                &deferred_kv_eval_full_attention_ms,
+            ),
+            ("deferred_kv_eval_sliding_ms", &deferred_kv_eval_sliding_ms),
             ("lm_head_ms", &lm_head_ms),
             ("decode_embedding_ms", &decode_embedding_ms),
             ("greedy_select_ms", &greedy_select_ms),
@@ -1413,6 +1494,15 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             layer_graph_ms,
             attention_kv_mutation_ms,
             deferred_kv_eval_ms,
+            deferred_kv_eval_full_attention_ms,
+            deferred_kv_eval_sliding_ms,
+            deferred_kv_eval_full_attention_arrays,
+            deferred_kv_eval_sliding_arrays,
+            deferred_kv_eval_total_arrays,
+            deferred_kv_eval_full_attention_bytes,
+            deferred_kv_eval_sliding_bytes,
+            deferred_kv_eval_total_bytes,
+            deferred_kv_eval_sequence_len,
             lm_head_ms,
             non_kv_forward_graph_ms,
             greedy_select_ms,
@@ -1440,6 +1530,8 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             "non_kv_forward_graph_ms is derived as forward_graph_ms - attention_kv_mutation_ms - deferred_kv_eval_ms and represents the remaining graph lane: embedding, non-KV layer work, final norm/LM head, and small native book-keeping".to_owned(),
             "layer_graph_ms includes the full per-layer decode loop, including attention KV mutation and non-KV attention/MLP work".to_owned(),
             "deferred_kv_eval_ms is the grouped end-of-decode KV eval path when the selected KV eval mode defers layer KV synchronization".to_owned(),
+            "XR69 profile fields split deferred KV eval into full-attention and sliding-window groups; when profiling is enabled these groups are evaluated separately for attribution, while non-profile runtime behavior keeps the original grouped eval call".to_owned(),
+            "deferred KV eval array and byte counts are shape/dtype estimates for the arrays submitted to MLX eval at the current decode sequence length".to_owned(),
             "eval_sync_ms is the explicit MLX eval call on greedy token and max-logit arrays".to_owned(),
             "output_read_ms covers scalar item reads for greedy token and greedy logit".to_owned(),
             "rust_ffi_overhead_ms is host decode_one latency minus total_native_decode_ms, clamped at zero".to_owned(),
@@ -1453,6 +1545,16 @@ where
     F: Fn(&DecodeProfileTrace) -> f64,
 {
     profiles.iter().map(|profile| field(profile)).collect()
+}
+
+fn profile_scalar_values<F>(profiles: &[&DecodeProfileTrace], field: F) -> Vec<f64>
+where
+    F: Fn(&DecodeProfileTrace) -> u64,
+{
+    profiles
+        .iter()
+        .map(|profile| field(profile) as f64)
+        .collect()
 }
 
 fn largest_profile_stage_by_mean<const N: usize>(
@@ -2040,11 +2142,11 @@ fn render_profile_report(summary: &Summary) -> String {
     out.push_str(&format!("- Records: `{}`\n\n", summary.record_count));
 
     out.push_str("## Stage Aggregates\n\n");
-    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Non-KV graph mean | KV mutation mean | Deferred KV eval mean | LM head mean | Eval sync mean | Greedy select mean | Rust/FFI overhead mean | Largest stage |\n");
-    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Non-KV graph mean | KV mutation mean | Deferred KV eval mean | Full-attn KV eval mean | Sliding KV eval mean | Eval arrays mean | Eval bytes mean | Eval seq len mean | LM head mean | Eval sync mean | Greedy select mean | Rust/FFI overhead mean | Largest stage |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for aggregate in &summary.decode_profile.aggregates {
         out.push_str(&format!(
-            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
             aggregate.workload_id,
             aggregate.variant,
             aggregate.enabled_sample_count,
@@ -2055,6 +2157,11 @@ fn render_profile_report(summary: &Summary) -> String {
             fmt_stats_mean(&aggregate.non_kv_forward_graph_ms),
             fmt_stats_mean(&aggregate.attention_kv_mutation_ms),
             fmt_stats_mean(&aggregate.deferred_kv_eval_ms),
+            fmt_stats_mean(&aggregate.deferred_kv_eval_full_attention_ms),
+            fmt_stats_mean(&aggregate.deferred_kv_eval_sliding_ms),
+            fmt_scalar_mean(&aggregate.deferred_kv_eval_total_arrays),
+            fmt_scalar_mean(&aggregate.deferred_kv_eval_total_bytes),
+            fmt_scalar_mean(&aggregate.deferred_kv_eval_sequence_len),
             fmt_stats_mean(&aggregate.lm_head_ms),
             fmt_stats_mean(&aggregate.eval_sync_ms),
             fmt_stats_mean(&aggregate.greedy_select_ms),
@@ -2227,6 +2334,33 @@ fn latency_stats(values: &[f64]) -> Option<LatencyStats> {
     })
 }
 
+fn scalar_stats(values: &[f64]) -> Option<ScalarStats> {
+    if values.is_empty() {
+        return None;
+    }
+    let values = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    let min = min_value(&values)?;
+    let max = max_value(&values)?;
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    Some(ScalarStats {
+        count: values.len(),
+        min,
+        p50: percentile(values.clone(), 0.50)?,
+        p95: percentile(values.clone(), 0.95)?,
+        p99: percentile(values.clone(), 0.99)?,
+        max,
+        mean,
+        cv: coefficient_of_variation(&values),
+    })
+}
+
 fn steady_latency_stats(values: &[f64]) -> Option<LatencyStats> {
     if values.len() <= STEADY_WARMUP_SAMPLES {
         return None;
@@ -2336,6 +2470,10 @@ fn fmt_opt(value: Option<f64>) -> String {
 
 fn fmt_stats_mean(stats: &Option<LatencyStats>) -> String {
     fmt_opt(stats.as_ref().map(|stats| stats.mean_ms))
+}
+
+fn fmt_scalar_mean(stats: &Option<ScalarStats>) -> String {
+    fmt_opt(stats.as_ref().map(|stats| stats.mean))
 }
 
 fn parse_csv(value: &str) -> Vec<String> {

@@ -165,6 +165,13 @@ mod raw {
         pub layer_graph_ms: f64,
         pub attention_kv_mutation_ms: f64,
         pub deferred_kv_eval_ms: f64,
+        pub deferred_kv_eval_full_attention_ms: f64,
+        pub deferred_kv_eval_sliding_ms: f64,
+        pub deferred_kv_eval_full_attention_arrays: u64,
+        pub deferred_kv_eval_sliding_arrays: u64,
+        pub deferred_kv_eval_full_attention_bytes: u64,
+        pub deferred_kv_eval_sliding_bytes: u64,
+        pub deferred_kv_eval_sequence_len: u64,
         pub lm_head_ms: f64,
         pub greedy_select_ms: f64,
         pub target_top_k_ms: f64,
@@ -944,6 +951,13 @@ pub struct DecodeProfileInfo {
     pub layer_graph_ms: f64,
     pub attention_kv_mutation_ms: f64,
     pub deferred_kv_eval_ms: f64,
+    pub deferred_kv_eval_full_attention_ms: f64,
+    pub deferred_kv_eval_sliding_ms: f64,
+    pub deferred_kv_eval_full_attention_arrays: u64,
+    pub deferred_kv_eval_sliding_arrays: u64,
+    pub deferred_kv_eval_full_attention_bytes: u64,
+    pub deferred_kv_eval_sliding_bytes: u64,
+    pub deferred_kv_eval_sequence_len: u64,
     pub lm_head_ms: f64,
     pub greedy_select_ms: f64,
     pub target_top_k_ms: f64,
@@ -964,6 +978,13 @@ impl DecodeProfileInfo {
             layer_graph_ms: 0.0,
             attention_kv_mutation_ms: 0.0,
             deferred_kv_eval_ms: 0.0,
+            deferred_kv_eval_full_attention_ms: 0.0,
+            deferred_kv_eval_sliding_ms: 0.0,
+            deferred_kv_eval_full_attention_arrays: 0,
+            deferred_kv_eval_sliding_arrays: 0,
+            deferred_kv_eval_full_attention_bytes: 0,
+            deferred_kv_eval_sliding_bytes: 0,
+            deferred_kv_eval_sequence_len: 0,
             lm_head_ms: 0.0,
             greedy_select_ms: 0.0,
             target_top_k_ms: 0.0,
@@ -1045,6 +1066,13 @@ fn decode_profile_from_raw(raw: &raw::Gemma4DecodeProfileInfo) -> DecodeProfileI
         layer_graph_ms: raw.layer_graph_ms,
         attention_kv_mutation_ms: raw.attention_kv_mutation_ms,
         deferred_kv_eval_ms: raw.deferred_kv_eval_ms,
+        deferred_kv_eval_full_attention_ms: raw.deferred_kv_eval_full_attention_ms,
+        deferred_kv_eval_sliding_ms: raw.deferred_kv_eval_sliding_ms,
+        deferred_kv_eval_full_attention_arrays: raw.deferred_kv_eval_full_attention_arrays,
+        deferred_kv_eval_sliding_arrays: raw.deferred_kv_eval_sliding_arrays,
+        deferred_kv_eval_full_attention_bytes: raw.deferred_kv_eval_full_attention_bytes,
+        deferred_kv_eval_sliding_bytes: raw.deferred_kv_eval_sliding_bytes,
+        deferred_kv_eval_sequence_len: raw.deferred_kv_eval_sequence_len,
         lm_head_ms: raw.lm_head_ms,
         greedy_select_ms: raw.greedy_select_ms,
         target_top_k_ms: raw.target_top_k_ms,
@@ -1368,7 +1396,7 @@ mod tests {
     #[test]
     fn runtime_version_reports_smoke_backend() {
         let version = runtime_version().expect("runtime version should be available");
-        assert_eq!(version.abi_version, 6);
+        assert_eq!(version.abi_version, 7);
         assert_eq!(version.backend_name, "gemma4_mlx");
         assert!(version.backend_version.starts_with("m03-"));
     }
@@ -1381,13 +1409,13 @@ mod tests {
 
     #[test]
     fn decode_profile_raw_layout_stays_pinned() {
-        assert_eq!(std::mem::size_of::<raw::Gemma4DecodeProfileInfo>(), 120);
+        assert_eq!(std::mem::size_of::<raw::Gemma4DecodeProfileInfo>(), 176);
         assert_eq!(std::mem::align_of::<raw::Gemma4DecodeProfileInfo>(), 8);
     }
 
     #[test]
     fn step_result_raw_layout_stays_pinned() {
-        assert_eq!(std::mem::size_of::<raw::Gemma4StepResult>(), 1608);
+        assert_eq!(std::mem::size_of::<raw::Gemma4StepResult>(), 1664);
         assert_eq!(std::mem::align_of::<raw::Gemma4StepResult>(), 8);
         assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, greedy_token), 0);
         assert_eq!(
@@ -1410,7 +1438,7 @@ mod tests {
             std::mem::offset_of!(raw::Gemma4StepResult, decode_profile),
             160
         );
-        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, mtp_trace), 280);
+        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, mtp_trace), 336);
     }
 
     #[test]

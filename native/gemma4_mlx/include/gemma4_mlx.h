@@ -117,6 +117,13 @@ typedef struct Gemma4DecodeProfileInfo {
     double layer_graph_ms;
     double attention_kv_mutation_ms;
     double deferred_kv_eval_ms;
+    double deferred_kv_eval_full_attention_ms;
+    double deferred_kv_eval_sliding_ms;
+    uint64_t deferred_kv_eval_full_attention_arrays;
+    uint64_t deferred_kv_eval_sliding_arrays;
+    uint64_t deferred_kv_eval_full_attention_bytes;
+    uint64_t deferred_kv_eval_sliding_bytes;
+    uint64_t deferred_kv_eval_sequence_len;
     double lm_head_ms;
     double greedy_select_ms;
     double target_top_k_ms;

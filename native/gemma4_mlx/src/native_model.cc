@@ -1085,25 +1085,96 @@ array target_layer_decode_block_forward(
     return model_dtype(h * tensor_or_throw(impl, base + ".layer_scalar"));
 }
 
-void eval_deferred_decode_kv(NativeKvState::Impl* target_kv, DecodeKvEvalMode mode) {
+uint64_t array_nbytes_u64(const array& value) {
+    return static_cast<uint64_t>(value.nbytes());
+}
+
+void append_deferred_decode_kv_array(
+    std::vector<array>& arrays,
+    const array& value,
+    uint64_t* array_count,
+    uint64_t* byte_count) {
+    arrays.push_back(value);
+    if (array_count != nullptr) {
+        *array_count += 1;
+    }
+    if (byte_count != nullptr) {
+        *byte_count += array_nbytes_u64(value);
+    }
+}
+
+void eval_deferred_decode_kv(
+    NativeKvState::Impl* target_kv,
+    DecodeKvEvalMode mode,
+    Gemma4DecodeProfileInfo* decode_profile = nullptr,
+    uint64_t sequence_len = 0) {
     if (target_kv == nullptr || mode == DecodeKvEvalMode::PerLayer ||
         mode == DecodeKvEvalMode::DeferToLogits) {
         return;
     }
     std::vector<array> eval_arrays;
     eval_arrays.reserve(target_kv->layers.size() * 2);
+    std::vector<array> full_attention_arrays;
+    std::vector<array> sliding_arrays;
+    if (decode_profile != nullptr) {
+        full_attention_arrays.reserve(16);
+        sliding_arrays.reserve(target_kv->layers.size() * 2);
+        decode_profile->deferred_kv_eval_sequence_len = sequence_len;
+    }
     for (const NativeKvState::Impl::Layer& layer : target_kv->layers) {
         if (!eval_decode_kv_at_end(mode, layer.full_attention)) {
             continue;
         }
+        std::vector<array>* profile_arrays = nullptr;
+        uint64_t* profile_array_count = nullptr;
+        uint64_t* profile_byte_count = nullptr;
+        if (decode_profile != nullptr) {
+            if (layer.full_attention) {
+                profile_arrays = &full_attention_arrays;
+                profile_array_count = &decode_profile->deferred_kv_eval_full_attention_arrays;
+                profile_byte_count = &decode_profile->deferred_kv_eval_full_attention_bytes;
+            } else {
+                profile_arrays = &sliding_arrays;
+                profile_array_count = &decode_profile->deferred_kv_eval_sliding_arrays;
+                profile_byte_count = &decode_profile->deferred_kv_eval_sliding_bytes;
+            }
+        }
         if (layer.key.has_value()) {
             eval_arrays.push_back(*layer.key);
+            if (profile_arrays != nullptr) {
+                append_deferred_decode_kv_array(
+                    *profile_arrays,
+                    *layer.key,
+                    profile_array_count,
+                    profile_byte_count);
+            }
         }
         if (layer.value.has_value()) {
             eval_arrays.push_back(*layer.value);
+            if (profile_arrays != nullptr) {
+                append_deferred_decode_kv_array(
+                    *profile_arrays,
+                    *layer.value,
+                    profile_array_count,
+                    profile_byte_count);
+            }
         }
     }
-    if (!eval_arrays.empty()) {
+    if (eval_arrays.empty()) {
+        return;
+    }
+    if (decode_profile != nullptr) {
+        if (!full_attention_arrays.empty()) {
+            const auto full_started = std::chrono::steady_clock::now();
+            mlx::core::eval(full_attention_arrays);
+            decode_profile->deferred_kv_eval_full_attention_ms = profile_elapsed_ms(full_started);
+        }
+        if (!sliding_arrays.empty()) {
+            const auto sliding_started = std::chrono::steady_clock::now();
+            mlx::core::eval(sliding_arrays);
+            decode_profile->deferred_kv_eval_sliding_ms = profile_elapsed_ms(sliding_started);
+        }
+    } else {
         mlx::core::eval(eval_arrays);
     }
 }
@@ -1441,7 +1512,11 @@ NativeForwardArrays decode_last_logits(
     const auto deferred_kv_started = decode_profile != nullptr
                                          ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
-    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    eval_deferred_decode_kv(
+        target_kv,
+        decode_kv_eval_mode(),
+        decode_profile,
+        previous_sequence_len + 1);
     if (decode_profile != nullptr) {
         decode_profile->deferred_kv_eval_ms = profile_elapsed_ms(deferred_kv_started);
     }

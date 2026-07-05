@@ -83,8 +83,55 @@ KV tensor each generated token.
 
 ## Verification Commands
 
-Pending implementation.
+Static/profile ABI gates:
+
+```text
+cargo fmt --all --check
+git diff --check
+cargo test -p gemma4d-ffi --lib
+GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example xr06_native_decode_tail_latency_ab --no-run
+```
+
+Baseline profiler run:
+
+```text
+GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 GEMMA4D_NATIVE_DECODE_PROFILE=1 GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY=long_context_256 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- --out-dir benchmarks/out/XR69-native-kv-materialization-probe/baseline-deferred-kv-split --trials 3 --max-new-tokens 64 --clear-workload-ids --workload-id chat_short_1k_001 --workload-id tool_json_1k_001 --workload-id code_review_rust_4k_001 --workload-id code_review_rust_8k_001 --workload-id benchmark_qa_16k_001 --variant native_decode_runtime_default
+```
 
 ## Result
 
-Pending.
+Profile slice complete; no runtime default or candidate KV representation changed.
+
+XR69 widened the env-gated native decode profile ABI to version `7` and added
+full-attention/sliding attribution for deferred decode KV eval. When profiling
+is disabled, runtime-default decode still uses the prior single grouped
+`mlx::core::eval` call. When profiling is enabled, the harness evaluates
+full-attention and sliding arrays separately to attribute the grouped barrier.
+
+The baseline run wrote:
+
+```text
+benchmarks/out/XR69-native-kv-materialization-probe/baseline-deferred-kv-split/{records.jsonl,summary.json,report.md,blockers.md,decision.md,profile.json,profile.md}
+```
+
+It completed with `needs_more_data`, as expected for a baseline-only profile
+with no candidate variant. All selected rows passed (`15/15` records), no
+blockers were recorded, and the 16K sentinel stayed under the tiny16 gate at
+`7.929 GB` peak MLX with `GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY=long_context_256`.
+
+The split profile identifies full-attention KV materialization as the dominant
+lane:
+
+| Workload | Deferred KV eval mean ms | Full-attn mean ms | Sliding mean ms | Eval arrays | Eval bytes | Eval seq len |
+|---|---:|---:|---:|---:|---:|---:|
+| `chat_short_1k_001` | `68.274` | `68.256` | `0.009` | `96` | `352845824` | `1056` |
+| `tool_json_1k_001` | `63.136` | `63.118` | `0.009` | `96` | `352845824` | `1056` |
+| `code_review_rust_4k_001` | `64.165` | `64.152` | `0.006` | `96` | `403177472` | `4128` |
+| `code_review_rust_8k_001` | `78.003` | `77.984` | `0.009` | `96` | `470286336` | `8224` |
+| `benchmark_qa_16k_001` | `71.018` | `71.001` | `0.009` | `96` | `604504064` | `16416` |
+
+`attention_kv_mutation_ms` remains sub-millisecond (`0.254..0.272 ms` mean),
+and sliding-window KV eval is effectively noise in this profile. The next
+implementation goal should therefore target full-attention active-KV
+materialization/update semantics first, not a sliding-window-only fixed-capacity
+slab and not another MTP policy sweep.
