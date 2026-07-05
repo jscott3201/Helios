@@ -45,6 +45,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_DECODE_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
 ];
 const INHERITED_GLOBAL_ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY",
@@ -52,6 +53,7 @@ const INHERITED_GLOBAL_ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_DECODE_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -698,6 +700,13 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             0,
             [("GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET", "1")],
         ),
+        native_default_variant_with_extra_env(
+            "native_decode_full_attention_kv_update",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE", "1")],
+        ),
     ];
     if !options.variant_names.is_empty() {
         let requested = options
@@ -744,6 +753,22 @@ fn native_default_variant(
     immediate_layer_kv_eval_count: usize,
     grouped_end_kv_eval_count: usize,
 ) -> Variant {
+    native_default_variant_with_extra_env(
+        name,
+        baseline_variant,
+        immediate_layer_kv_eval_count,
+        grouped_end_kv_eval_count,
+        [],
+    )
+}
+
+fn native_default_variant_with_extra_env<const N: usize>(
+    name: &str,
+    baseline_variant: Option<&str>,
+    immediate_layer_kv_eval_count: usize,
+    grouped_end_kv_eval_count: usize,
+    extra_env: [(&str, &str); N],
+) -> Variant {
     let mut config = BTreeMap::new();
     config.insert("decode_kv_eval".to_owned(), "runtime_default".to_owned());
     config.insert(
@@ -759,6 +784,10 @@ fn native_default_variant(
     env.insert("GEMMA4D_REQUIRE_MLX".to_owned(), "1".to_owned());
     env.insert("GEMMA4D_USE_NATIVE_GRAPH".to_owned(), "1".to_owned());
     inherit_global_variant_env(&mut config, &mut env);
+    for (key, value) in extra_env {
+        config.insert(key.to_owned(), value.to_owned());
+        env.insert(key.to_owned(), value.to_owned());
+    }
     Variant {
         name: name.to_owned(),
         config,

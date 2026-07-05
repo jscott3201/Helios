@@ -50,6 +50,10 @@ struct NativeKvState::Impl {
         bool full_attention = false;
         std::optional<mlx::core::array> key;
         std::optional<mlx::core::array> value;
+        std::optional<mlx::core::array> full_attention_key_storage;
+        std::optional<mlx::core::array> full_attention_value_storage;
+        int full_attention_capacity_tokens = 0;
+        int full_attention_visible_tokens = 0;
     };
     std::vector<Layer> layers;
 #endif
@@ -93,6 +97,7 @@ struct NativeTextModel::Impl {
     bool native_prefill_policy_long_context_256 = false;
     bool experimental_skip_decode_peak_reset = false;
     bool native_decode_profile = false;
+    bool experimental_full_attention_kv_update = false;
 };
 
 struct NativeMtpAssistantModel::Impl {
@@ -445,6 +450,7 @@ enum class DecodeKvEvalMode {
 constexpr int kTargetLayerCount = 48;
 constexpr int kHiddenSize = 3840;
 constexpr int kSlidingWindowSize = 1024;
+constexpr int kFullAttentionKvUpdateCapacityStep = 256;
 constexpr uint64_t kBf16Bytes = 2;
 
 std::optional<array> decode_block_causal_mask(
@@ -542,6 +548,115 @@ uint64_t estimate_target_kv_bytes(uint64_t sequence_len) {
     return full_layer_count * full_layer_bytes + sliding_layer_count * sliding_layer_bytes;
 }
 
+int full_attention_kv_update_capacity(int required_tokens) {
+    if (required_tokens <= 0) {
+        return kFullAttentionKvUpdateCapacityStep;
+    }
+    return ((required_tokens + kFullAttentionKvUpdateCapacityStep - 1) /
+        kFullAttentionKvUpdateCapacityStep) *
+        kFullAttentionKvUpdateCapacityStep;
+}
+
+array full_attention_kv_visible_slice(
+    const array& storage,
+    int visible_tokens,
+    int n_kv_heads,
+    int head_dim) {
+    return mlx::core::slice(storage, {0, 0, 0, 0}, {1, n_kv_heads, visible_tokens, head_dim});
+}
+
+void materialize_full_attention_kv_update_storage(
+    NativeKvState::Impl::Layer* layer,
+    const array& keys,
+    const array& values,
+    int n_kv_heads,
+    int head_dim,
+    int min_capacity_tokens) {
+    if (layer == nullptr) {
+        return;
+    }
+    const auto& key_shape = keys.shape();
+    if (key_shape.size() < 3) {
+        throw std::runtime_error("native full-attention KV update received malformed key shape");
+    }
+    const int visible_tokens = key_shape[2];
+    const int capacity_tokens =
+        full_attention_kv_update_capacity(std::max(visible_tokens, min_capacity_tokens));
+    array key_storage = mlx::core::zeros({1, n_kv_heads, capacity_tokens, head_dim}, keys.dtype());
+    array value_storage = mlx::core::zeros({1, n_kv_heads, capacity_tokens, head_dim}, values.dtype());
+    key_storage = mlx::core::slice_update(
+        key_storage,
+        keys,
+        {0, 0, 0, 0},
+        {1, n_kv_heads, visible_tokens, head_dim});
+    value_storage = mlx::core::slice_update(
+        value_storage,
+        values,
+        {0, 0, 0, 0},
+        {1, n_kv_heads, visible_tokens, head_dim});
+    layer->full_attention = true;
+    layer->full_attention_key_storage = key_storage;
+    layer->full_attention_value_storage = value_storage;
+    layer->full_attention_capacity_tokens = capacity_tokens;
+    layer->full_attention_visible_tokens = visible_tokens;
+    layer->key = full_attention_kv_visible_slice(
+        *layer->full_attention_key_storage,
+        visible_tokens,
+        n_kv_heads,
+        head_dim);
+    layer->value = full_attention_kv_visible_slice(
+        *layer->full_attention_value_storage,
+        visible_tokens,
+        n_kv_heads,
+        head_dim);
+}
+
+void ensure_full_attention_kv_update_capacity(
+    NativeKvState::Impl::Layer* layer,
+    int required_tokens,
+    int n_kv_heads,
+    int head_dim) {
+    if (layer == nullptr || !layer->key.has_value() || !layer->value.has_value()) {
+        throw std::runtime_error("native full-attention KV update requires materialized KV");
+    }
+    if (!layer->full_attention_key_storage.has_value() ||
+        !layer->full_attention_value_storage.has_value() ||
+        layer->full_attention_capacity_tokens <= 0) {
+        materialize_full_attention_kv_update_storage(
+            layer,
+            *layer->key,
+            *layer->value,
+            n_kv_heads,
+            head_dim,
+            required_tokens);
+        return;
+    }
+    if (required_tokens <= layer->full_attention_capacity_tokens) {
+        return;
+    }
+    const int visible_tokens = layer->full_attention_visible_tokens > 0
+        ? layer->full_attention_visible_tokens
+        : layer->key->shape()[2];
+    const int capacity_tokens = full_attention_kv_update_capacity(required_tokens);
+    array key_storage =
+        mlx::core::zeros({1, n_kv_heads, capacity_tokens, head_dim}, layer->key->dtype());
+    array value_storage =
+        mlx::core::zeros({1, n_kv_heads, capacity_tokens, head_dim}, layer->value->dtype());
+    key_storage = mlx::core::slice_update(
+        key_storage,
+        *layer->key,
+        {0, 0, 0, 0},
+        {1, n_kv_heads, visible_tokens, head_dim});
+    value_storage = mlx::core::slice_update(
+        value_storage,
+        *layer->value,
+        {0, 0, 0, 0},
+        {1, n_kv_heads, visible_tokens, head_dim});
+    layer->full_attention_key_storage = key_storage;
+    layer->full_attention_value_storage = value_storage;
+    layer->full_attention_capacity_tokens = capacity_tokens;
+}
+
 void store_target_layer_kv(
     NativeKvState::Impl::Layer* layer,
     bool full_attention,
@@ -549,18 +664,35 @@ void store_target_layer_kv(
     const array& values,
     int sequence_len,
     int n_kv_heads,
-    int head_dim) {
+    int head_dim,
+    bool use_full_attention_kv_update = false) {
     if (layer == nullptr) {
         return;
     }
     layer->full_attention = full_attention;
-    if (full_attention || sequence_len <= kSlidingWindowSize) {
+    if (full_attention && use_full_attention_kv_update) {
+        materialize_full_attention_kv_update_storage(
+            layer,
+            keys,
+            values,
+            n_kv_heads,
+            head_dim,
+            sequence_len + 1);
+    } else if (full_attention || sequence_len <= kSlidingWindowSize) {
         layer->key = keys;
         layer->value = values;
+        layer->full_attention_key_storage.reset();
+        layer->full_attention_value_storage.reset();
+        layer->full_attention_capacity_tokens = 0;
+        layer->full_attention_visible_tokens = 0;
     } else {
         const int start = sequence_len - kSlidingWindowSize;
         layer->key = mlx::core::slice(keys, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
         layer->value = mlx::core::slice(values, {0, 0, start, 0}, {1, n_kv_heads, sequence_len, head_dim});
+        layer->full_attention_key_storage.reset();
+        layer->full_attention_value_storage.reset();
+        layer->full_attention_capacity_tokens = 0;
+        layer->full_attention_visible_tokens = 0;
     }
     if (eval_prefill_kv_when_stored(prefill_kv_eval_mode(), full_attention)) {
         mlx::core::eval({*layer->key, *layer->value});
@@ -695,7 +827,15 @@ array attention_forward(
     }
     trace_head_stats("layer0.q_rope", queries, sequence_len, head_dim, trace_layer0);
     capture_shared_kv(shared_kv, layer_idx, full_attention, keys, values);
-    store_target_layer_kv(target_kv, full_attention, keys, values, sequence_len, n_kv_heads, head_dim);
+    store_target_layer_kv(
+        target_kv,
+        full_attention,
+        keys,
+        values,
+        sequence_len,
+        n_kv_heads,
+        head_dim,
+        impl.experimental_full_attention_kv_update);
 
     const std::optional<array> mask = full_attention ? std::nullopt : sliding_causal_mask(sequence_len, 1024);
     const std::string mask_mode = sequence_len == 1 || mask.has_value() ? "" : "causal";
@@ -845,24 +985,60 @@ array target_attention_decode_forward(
     values = model_dtype(mlx::core::fast::rms_norm(values, std::nullopt, 1e-6f));
     values = mlx::core::transpose(values, {0, 2, 1, 3});
 
-    array cached_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
-    array cached_values = mlx::core::concatenate({*target_kv->value, values}, 2);
-    if (!full_attention) {
-        const uint64_t combined_len = std::min<uint64_t>(previous_sequence_len, kSlidingWindowSize) + 1;
-        if (combined_len > kSlidingWindowSize) {
-            cached_keys = mlx::core::slice(
-                cached_keys,
-                {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
-                {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
-            cached_values = mlx::core::slice(
-                cached_values,
-                {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
-                {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+    if (full_attention && impl.experimental_full_attention_kv_update) {
+        const auto& previous_key_shape = target_kv->key->shape();
+        if (previous_key_shape.size() < 3) {
+            throw std::runtime_error("native full-attention KV update received malformed cached key shape");
         }
+        const int previous_key_len = previous_key_shape[2];
+        const int updated_len = previous_key_len + 1;
+        ensure_full_attention_kv_update_capacity(target_kv, updated_len, n_kv_heads, head_dim);
+        target_kv->full_attention_key_storage = mlx::core::slice_update(
+            *target_kv->full_attention_key_storage,
+            keys,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->full_attention_value_storage = mlx::core::slice_update(
+            *target_kv->full_attention_value_storage,
+            values,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->full_attention = true;
+        target_kv->full_attention_visible_tokens = updated_len;
+        target_kv->key = full_attention_kv_visible_slice(
+            *target_kv->full_attention_key_storage,
+            updated_len,
+            n_kv_heads,
+            head_dim);
+        target_kv->value = full_attention_kv_visible_slice(
+            *target_kv->full_attention_value_storage,
+            updated_len,
+            n_kv_heads,
+            head_dim);
+    } else {
+        array cached_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
+        array cached_values = mlx::core::concatenate({*target_kv->value, values}, 2);
+        if (!full_attention) {
+            const uint64_t combined_len = std::min<uint64_t>(previous_sequence_len, kSlidingWindowSize) + 1;
+            if (combined_len > kSlidingWindowSize) {
+                cached_keys = mlx::core::slice(
+                    cached_keys,
+                    {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
+                    {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+                cached_values = mlx::core::slice(
+                    cached_values,
+                    {0, 0, static_cast<int>(combined_len - kSlidingWindowSize), 0},
+                    {1, n_kv_heads, static_cast<int>(combined_len), head_dim});
+            }
+        }
+        target_kv->full_attention = full_attention;
+        target_kv->key = cached_keys;
+        target_kv->value = cached_values;
+        target_kv->full_attention_key_storage.reset();
+        target_kv->full_attention_value_storage.reset();
+        target_kv->full_attention_capacity_tokens = 0;
+        target_kv->full_attention_visible_tokens = 0;
     }
-    target_kv->full_attention = full_attention;
-    target_kv->key = cached_keys;
-    target_kv->value = cached_values;
     if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
         mlx::core::eval({*target_kv->key, *target_kv->value});
     }
@@ -935,39 +1111,79 @@ array target_attention_decode_block_forward(
     values = model_dtype(mlx::core::fast::rms_norm(values, std::nullopt, 1e-6f));
     values = mlx::core::transpose(values, {0, 2, 1, 3});
 
-    // Attend over the unsliced cache plus new block keys; slice only the stored
-    // KV below so earlier queries in the block keep their valid sliding window.
-    array attention_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
-    array attention_values = mlx::core::concatenate({*target_kv->value, values}, 2);
-    array stored_keys = attention_keys;
-    array stored_values = attention_values;
-    const auto& attention_key_shape = attention_keys.shape();
-    if (attention_key_shape.size() < 3) {
-        throw std::runtime_error("native incremental block decode produced malformed KV key shape");
+    std::optional<array> attention_keys;
+    std::optional<array> attention_values;
+    int attention_key_len = 0;
+    if (full_attention && impl.experimental_full_attention_kv_update) {
+        const int updated_len = previous_key_len + block_len;
+        ensure_full_attention_kv_update_capacity(target_kv, updated_len, n_kv_heads, head_dim);
+        target_kv->full_attention_key_storage = mlx::core::slice_update(
+            *target_kv->full_attention_key_storage,
+            keys,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->full_attention_value_storage = mlx::core::slice_update(
+            *target_kv->full_attention_value_storage,
+            values,
+            {0, 0, previous_key_len, 0},
+            {1, n_kv_heads, updated_len, head_dim});
+        target_kv->full_attention = true;
+        target_kv->full_attention_visible_tokens = updated_len;
+        target_kv->key = full_attention_kv_visible_slice(
+            *target_kv->full_attention_key_storage,
+            updated_len,
+            n_kv_heads,
+            head_dim);
+        target_kv->value = full_attention_kv_visible_slice(
+            *target_kv->full_attention_value_storage,
+            updated_len,
+            n_kv_heads,
+            head_dim);
+        attention_keys = *target_kv->key;
+        attention_values = *target_kv->value;
+        attention_key_len = updated_len;
+    } else {
+        // Attend over the unsliced cache plus new block keys; slice only the stored
+        // KV below so earlier queries in the block keep their valid sliding window.
+        attention_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
+        attention_values = mlx::core::concatenate({*target_kv->value, values}, 2);
+        const auto& attention_key_shape = attention_keys->shape();
+        if (attention_key_shape.size() < 3) {
+            throw std::runtime_error("native incremental block decode produced malformed KV key shape");
+        }
+        attention_key_len = attention_key_shape[2];
+        array stored_keys = *attention_keys;
+        array stored_values = *attention_values;
+        if (!full_attention && attention_key_len > kSlidingWindowSize) {
+            stored_keys = mlx::core::slice(
+                *attention_keys,
+                {0, 0, attention_key_len - kSlidingWindowSize, 0},
+                {1, n_kv_heads, attention_key_len, head_dim});
+            stored_values = mlx::core::slice(
+                *attention_values,
+                {0, 0, attention_key_len - kSlidingWindowSize, 0},
+                {1, n_kv_heads, attention_key_len, head_dim});
+        }
+        target_kv->full_attention = full_attention;
+        target_kv->key = stored_keys;
+        target_kv->value = stored_values;
+        target_kv->full_attention_key_storage.reset();
+        target_kv->full_attention_value_storage.reset();
+        target_kv->full_attention_capacity_tokens = 0;
+        target_kv->full_attention_visible_tokens = 0;
     }
-    const int attention_key_len = attention_key_shape[2];
+    if (!attention_keys.has_value() || !attention_values.has_value()) {
+        throw std::runtime_error("native incremental block decode failed to build attention KV");
+    }
     if (prefix_source != nullptr) {
         prefix_source->full_attention = full_attention;
         prefix_source->n_kv_heads = n_kv_heads;
         prefix_source->head_dim = head_dim;
         prefix_source->previous_key_len = previous_key_len;
         prefix_source->attention_key_len = attention_key_len;
-        prefix_source->attention_keys = attention_keys;
-        prefix_source->attention_values = attention_values;
+        prefix_source->attention_keys = *attention_keys;
+        prefix_source->attention_values = *attention_values;
     }
-    if (!full_attention && attention_key_len > kSlidingWindowSize) {
-        stored_keys = mlx::core::slice(
-            attention_keys,
-            {0, 0, attention_key_len - kSlidingWindowSize, 0},
-            {1, n_kv_heads, attention_key_len, head_dim});
-        stored_values = mlx::core::slice(
-            attention_values,
-            {0, 0, attention_key_len - kSlidingWindowSize, 0},
-            {1, n_kv_heads, attention_key_len, head_dim});
-    }
-    target_kv->full_attention = full_attention;
-    target_kv->key = stored_keys;
-    target_kv->value = stored_values;
     if (eval_decode_kv_when_stored(decode_kv_eval_mode(), full_attention)) {
         mlx::core::eval({*target_kv->key, *target_kv->value});
     }
@@ -981,8 +1197,8 @@ array target_attention_decode_block_forward(
         full_attention);
     array output = mlx::core::fast::scaled_dot_product_attention(
         queries,
-        attention_keys,
-        attention_values,
+        *attention_keys,
+        *attention_values,
         1.0f,
         "",
         mask);
@@ -1891,6 +2107,11 @@ size_t selected_native_prefill_chunk_tokens(const NativeTextModel::Impl& impl, s
 
 bool experimental_skip_decode_peak_reset_env_enabled() {
     const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+bool experimental_full_attention_kv_update_env_enabled() {
+    const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
@@ -3107,6 +3328,8 @@ bool NativeTextModel::load(
         model->impl_->native_decode_profile = native_decode_profile_env_enabled();
         model->impl_->experimental_skip_decode_peak_reset =
             experimental_skip_decode_peak_reset_env_enabled();
+        model->impl_->experimental_full_attention_kv_update =
+            experimental_full_attention_kv_update_env_enabled();
 
         const std::vector<std::filesystem::path> files = safetensor_files(model_path);
         if (files.empty()) {
