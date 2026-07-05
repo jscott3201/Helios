@@ -118,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     apply_correctness_gates(&mut records);
     let aggregates = build_aggregates(&records);
     let first_token_aggregates = build_first_token_aggregates(&records);
+    let warmup_cost_aggregates = build_warmup_cost_aggregates(&records);
     let decode_profile = build_decode_profile(&records);
     let comparisons = build_comparisons(&aggregates, &variants);
     let failed_hypotheses = failed_hypotheses(&comparisons, &records);
@@ -176,6 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .count(),
         aggregates,
         first_token_aggregates,
+        warmup_cost_aggregates,
         decode_profile,
         comparisons,
         failed_hypotheses,
@@ -194,6 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "decode_token_traces records the committed input token, output greedy token, position before/after decode_one, latency, active KV bytes, peak MLX memory, eval-policy markers, and optional GEMMA4D_NATIVE_DECODE_PROFILE stage timings".to_owned(),
             "baseline is explicit native_decode_eval_per_layer; native_decode_runtime_default leaves GEMMA4D_NATIVE_DECODE_KV_EVAL unset".to_owned(),
             "steady decode statistics discard the first four decode_one samples when available, while raw p50/p95/p99 keep every decode sample".to_owned(),
+            "warmup-prefill/decode cost fields record discarded same-context warmup work for warmup variants; measured prefill/decode/total fields still cover only the measured record".to_owned(),
             "acceptance requires candidate-wide correctness, memory below the cliff, reproduced baseline tail latency on the workload, p95 or p99 improvement, and no p50 regression over the goal gate".to_owned(),
             "decode profile forward_graph_ms is split into attention_kv_mutation_ms, deferred_kv_eval_ms, and derived non_kv_forward_graph_ms; rust_ffi_overhead_ms is host decode_one latency minus native total, clamped at zero".to_owned(),
         ],
@@ -356,6 +359,7 @@ struct Summary {
     failed_records: usize,
     aggregates: Vec<Aggregate>,
     first_token_aggregates: Vec<FirstTokenAggregate>,
+    warmup_cost_aggregates: Vec<WarmupCostAggregate>,
     decode_profile: DecodeProfileSummary,
     comparisons: Vec<Comparison>,
     failed_hypotheses: Vec<String>,
@@ -453,6 +457,10 @@ struct Record {
     input_tokens: usize,
     generated_tokens: usize,
     model_load_ms: f64,
+    warmup_context_tokens: usize,
+    warmup_prefill_ms: f64,
+    warmup_decode_ms: f64,
+    warmup_total_ms: f64,
     prefill_ms: f64,
     ttft_ms: f64,
     decode_ms: f64,
@@ -704,6 +712,25 @@ struct FirstTokenAggregate {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct WarmupCostAggregate {
+    variant: String,
+    workload_id: String,
+    sample_count: usize,
+    context_tokens: Option<ScalarStats>,
+    prefill_ms: Option<LatencyStats>,
+    decode_ms: Option<LatencyStats>,
+    total_ms: Option<LatencyStats>,
+}
+
+#[derive(Debug, Clone)]
+struct WarmupCost {
+    context_tokens: usize,
+    prefill_ms: f64,
+    decode_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Comparison {
     candidate_variant: String,
     baseline_variant: String,
@@ -749,6 +776,12 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
         ),
         native_default_warmup_variant(
             "native_decode_runtime_default_warmup_probe",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+        ),
+        native_default_warmup_variant(
+            "native_decode_runtime_default_warmup_costed",
             Some("native_decode_runtime_default"),
             0,
             48,
@@ -933,6 +966,21 @@ fn native_default_warmup_variant(
         "warmup_decode_before_measurement".to_owned(),
         "true".to_owned(),
     );
+    variant
+        .config
+        .insert("warmup_cost_accounting".to_owned(), "recorded".to_owned());
+    variant.config.insert(
+        "warmup_context_scope".to_owned(),
+        "same_workload_exact_context".to_owned(),
+    );
+    variant.config.insert(
+        "warmup_shape_guard".to_owned(),
+        "exact_context_tokens".to_owned(),
+    );
+    variant.config.insert(
+        "warmup_cost_included_in_measured_total_ms".to_owned(),
+        "false".to_owned(),
+    );
     variant.warmup_decode_before_measurement = true;
     variant
 }
@@ -1098,22 +1146,27 @@ fn run_decode_record(
     model_load: Duration,
     target: &Target,
 ) -> Result<Record, Box<dyn std::error::Error>> {
-    if variant.warmup_decode_before_measurement
-        && let Err(error) = warmup_decode_once(target, &workload.token_ids)
-    {
-        return Ok(failed_record(
-            run_id,
-            git_sha,
-            git_status_short,
-            command,
-            _model_identity,
-            variant,
-            trial_index,
-            workload,
-            model_load,
-            format!("warmup decode failed: {error}"),
-        ));
-    }
+    let warmup_cost = if variant.warmup_decode_before_measurement {
+        match warmup_decode_once(target, &workload.token_ids) {
+            Ok(cost) => Some(cost),
+            Err(error) => {
+                return Ok(failed_record(
+                    run_id,
+                    git_sha,
+                    git_status_short,
+                    command,
+                    _model_identity,
+                    variant,
+                    trial_index,
+                    workload,
+                    model_load,
+                    format!("warmup decode failed: {error}"),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let total_started = Instant::now();
     let mut cache = KvCache::create(&KvPolicy::default())?;
     let prefill_started = Instant::now();
@@ -1141,6 +1194,12 @@ fn run_decode_record(
     let mut rss_mb = f64::from(step.peak_rss_mb);
     let mut active_kv_bytes = step.active_kv_bytes;
     let mut notes = Vec::new();
+    if let Some(cost) = warmup_cost.as_ref() {
+        notes.push(format!(
+            "discarded same-context warmup recorded: context_tokens={} prefill_ms={:.3} decode_ms={:.3} total_ms={:.3}",
+            cost.context_tokens, cost.prefill_ms, cost.decode_ms, cost.total_ms
+        ));
+    }
 
     let mut output_token_ids = Vec::with_capacity(options.max_new_tokens);
     let mut output_logits = Vec::with_capacity(options.max_new_tokens);
@@ -1233,6 +1292,22 @@ fn run_decode_record(
         input_tokens: workload.token_ids.len(),
         generated_tokens,
         model_load_ms: duration_ms(model_load),
+        warmup_context_tokens: warmup_cost
+            .as_ref()
+            .map(|cost| cost.context_tokens)
+            .unwrap_or(0),
+        warmup_prefill_ms: warmup_cost
+            .as_ref()
+            .map(|cost| cost.prefill_ms)
+            .unwrap_or(0.0),
+        warmup_decode_ms: warmup_cost
+            .as_ref()
+            .map(|cost| cost.decode_ms)
+            .unwrap_or(0.0),
+        warmup_total_ms: warmup_cost
+            .as_ref()
+            .map(|cost| cost.total_ms)
+            .unwrap_or(0.0),
         prefill_ms,
         ttft_ms: prefill_ms,
         decode_ms,
@@ -1266,11 +1341,22 @@ fn run_decode_record(
 fn warmup_decode_once(
     target: &Target,
     token_ids: &[i32],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<WarmupCost, Box<dyn std::error::Error>> {
+    let total_started = Instant::now();
     let mut cache = KvCache::create(&KvPolicy::default())?;
+    let prefill_started = Instant::now();
     let step = prefill(target, &mut cache, token_ids)?;
+    let prefill_ms = duration_ms(prefill_started.elapsed());
+    let decode_started = Instant::now();
     decode_one(target, &mut cache, step.greedy_token)?;
-    Ok(())
+    let decode_ms = duration_ms(decode_started.elapsed());
+    let total_ms = duration_ms(total_started.elapsed());
+    Ok(WarmupCost {
+        context_tokens: token_ids.len(),
+        prefill_ms,
+        decode_ms,
+        total_ms,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1308,6 +1394,10 @@ fn failed_record(
         input_tokens: workload.token_ids.len(),
         generated_tokens: 0,
         model_load_ms: duration_ms(model_load),
+        warmup_context_tokens: 0,
+        warmup_prefill_ms: 0.0,
+        warmup_decode_ms: 0.0,
+        warmup_total_ms: 0.0,
         prefill_ms: 0.0,
         ttft_ms: 0.0,
         decode_ms: 0.0,
@@ -1580,6 +1670,52 @@ fn build_first_token_aggregates(records: &[Record]) -> Vec<FirstTokenAggregate> 
             latency_ms: latency_stats(&latencies),
             peak_mlx_max_gb: max_value(&peaks),
             active_kv_max_bytes,
+        });
+    }
+    out
+}
+
+fn build_warmup_cost_aggregates(records: &[Record]) -> Vec<WarmupCostAggregate> {
+    let keys = records
+        .iter()
+        .filter(|record| record.status == "passed" && record.warmup_total_ms > 0.0)
+        .map(|record| (record.variant.clone(), record.workload_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    for (variant, workload_id) in keys {
+        let group = records
+            .iter()
+            .filter(|record| {
+                record.status == "passed"
+                    && record.variant == variant
+                    && record.workload_id == workload_id
+                    && record.warmup_total_ms > 0.0
+            })
+            .collect::<Vec<_>>();
+        let context_tokens = group
+            .iter()
+            .map(|record| record.warmup_context_tokens as f64)
+            .collect::<Vec<_>>();
+        let prefill_ms = group
+            .iter()
+            .map(|record| record.warmup_prefill_ms)
+            .collect::<Vec<_>>();
+        let decode_ms = group
+            .iter()
+            .map(|record| record.warmup_decode_ms)
+            .collect::<Vec<_>>();
+        let total_ms = group
+            .iter()
+            .map(|record| record.warmup_total_ms)
+            .collect::<Vec<_>>();
+        out.push(WarmupCostAggregate {
+            variant,
+            workload_id,
+            sample_count: group.len(),
+            context_tokens: scalar_stats(&context_tokens),
+            prefill_ms: latency_stats(&prefill_ms),
+            decode_ms: latency_stats(&decode_ms),
+            total_ms: latency_stats(&total_ms),
         });
     }
     out
@@ -2577,6 +2713,29 @@ fn render_report(summary: &Summary) -> String {
                 .unwrap_or_else(|| "n/a".to_owned())
         ));
     }
+
+    if !summary.warmup_cost_aggregates.is_empty() {
+        out.push_str("\n## Warmup Cost\n\n");
+        out.push_str("| Workload | Variant | Samples | Context Tokens p50 | Prefill p50 | Prefill p95 | Decode p50 | Decode p95 | Total p50 | Total p95 | Total max |\n");
+        out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        for aggregate in &summary.warmup_cost_aggregates {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                aggregate.workload_id,
+                aggregate.variant,
+                aggregate.sample_count,
+                fmt_scalar_p50(&aggregate.context_tokens),
+                fmt_stats_p50(&aggregate.prefill_ms),
+                fmt_stats_p95(&aggregate.prefill_ms),
+                fmt_stats_p50(&aggregate.decode_ms),
+                fmt_stats_p95(&aggregate.decode_ms),
+                fmt_stats_p50(&aggregate.total_ms),
+                fmt_stats_p95(&aggregate.total_ms),
+                fmt_stats_max(&aggregate.total_ms)
+            ));
+        }
+        out.push_str("\nWarmup costs are recorded for the discarded same-context prefill/decode pass and are not included in measured request `prefill_ms`, `decode_ms`, or `total_ms`.\n");
+    }
     out
 }
 
@@ -2726,6 +2885,7 @@ fn render_decision(summary: &Summary) -> String {
     out.push_str("\n## Claim Boundary\n\n");
     out.push_str("- XR06 is native decode tail-latency evidence only; it does not change defaults unless a later goal adopts a policy.\n");
     out.push_str("- Candidate acceptance requires no correctness or memory regression on any selected workload/trial for that variant.\n");
+    out.push_str("- Warmup variants record discarded same-context warmup cost separately; accepted tail comparisons do not include that discarded cost in measured request latency.\n");
     out.push_str("- Layer/eval markers are policy markers, not per-layer timing probes.\n");
     out
 }
@@ -2986,6 +3146,10 @@ fn fmt_stats_max(stats: &Option<LatencyStats>) -> String {
 
 fn fmt_scalar_mean(stats: &Option<ScalarStats>) -> String {
     fmt_opt(stats.as_ref().map(|stats| stats.mean))
+}
+
+fn fmt_scalar_p50(stats: &Option<ScalarStats>) -> String {
+    fmt_opt(stats.as_ref().map(|stats| stats.p50))
 }
 
 fn fmt_optional_ms(value: Option<f64>) -> String {
