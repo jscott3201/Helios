@@ -303,6 +303,14 @@ fn http_provider_renders_live_optimization_metrics() {
 
     assert_eq!(state.dashboard.live.server_health, "ok");
     assert!(state.dashboard.live.model_loaded);
+    assert_eq!(state.dashboard.backend, "stub");
+    assert!(state.dashboard.context_window.contains("32768"));
+    assert!(
+        state
+            .dashboard
+            .native_prefill_policy
+            .contains("policy none")
+    );
     assert!(state.dashboard.live.prefill_tokens_total > 0);
     assert!(state.dashboard.live.decode_tokens_total > 0);
     assert_eq!(state.mtp.status.label(), "disabled");
@@ -310,6 +318,8 @@ fn http_provider_renders_live_optimization_metrics() {
 
     let dashboard = render_snapshot(&state, 120, 40).unwrap();
     assert!(dashboard.contains("Health ok"));
+    assert!(dashboard.contains("Backend stub"));
+    assert!(dashboard.contains("Native prefill policy none"));
     assert!(dashboard.contains("Live load"));
     assert!(dashboard.contains("Peak MLX"));
 

@@ -57,8 +57,10 @@ impl RuntimeProvider for MockProvider {
         DashboardSnapshot {
             runtime_state: "mock-ready".to_owned(),
             provider: "mock".to_owned(),
+            backend: "mock".to_owned(),
             model_target: "mlx-community/gemma-4-12B-it-4bit".to_owned(),
             context_window: "32768 tokens".to_owned(),
+            native_prefill_policy: "mock server policy unavailable".to_owned(),
             memory_pressure: "42% mock pressure".to_owned(),
             active_task: format!("idle tick {}", self.tick),
             ttft_p50_ms: Some(118.4),
@@ -141,8 +143,10 @@ impl RuntimeProvider for FileProvider {
         DashboardSnapshot {
             runtime_state: "file-offline".to_owned(),
             provider: "file".to_owned(),
+            backend: "file".to_owned(),
             model_target: "from repository config files".to_owned(),
             context_window: "from tiny16-style config".to_owned(),
+            native_prefill_policy: "no live server policy".to_owned(),
             memory_pressure: "not sampled; no daemon connected".to_owned(),
             active_task: benchmark_state.to_owned(),
             ttft_p50_ms: None,
@@ -285,8 +289,10 @@ impl RuntimeProvider for HttpProvider {
                 return DashboardSnapshot {
                     runtime_state: "http-disconnected".to_owned(),
                     provider: "http".to_owned(),
+                    backend: "unknown".to_owned(),
                     model_target: "unknown".to_owned(),
                     context_window: "unknown".to_owned(),
+                    native_prefill_policy: "unknown".to_owned(),
                     memory_pressure: "not sampled".to_owned(),
                     active_task: error,
                     ttft_p50_ms: None,
@@ -303,15 +309,23 @@ impl RuntimeProvider for HttpProvider {
         let peak_mlx_bytes = metric_u64(&metrics, "gemma4d_memory_peak_mlx_bytes");
         let ttft_ms = metric_seconds_ms(&metrics, "gemma4d_ttft_seconds");
         let decode_tps = metric_option(&metrics, "gemma4d_tokens_per_second");
+        let backend = string_at(&health, "backend", "unknown");
+        let max_context_tokens = u64_at(&health, "max_context_tokens", 0);
         DashboardSnapshot {
             runtime_state: format!("http-{server_health}"),
             provider: format!("http {}", self.client.base_url()),
+            backend,
             model_target: health
                 .get("server")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("gemma4d")
                 .to_owned(),
-            context_window: "live control provider".to_owned(),
+            context_window: if max_context_tokens == 0 {
+                "live control provider".to_owned()
+            } else {
+                format!("{max_context_tokens} tokens")
+            },
+            native_prefill_policy: native_prefill_policy_summary(&health),
             memory_pressure: format!(
                 "rss {process_rss_bytes} bytes | peak mlx {peak_mlx_bytes} bytes"
             ),
@@ -756,6 +770,25 @@ fn bool_at(value: &serde_json::Value, key: &str, fallback: bool) -> bool {
         .get(key)
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(fallback)
+}
+
+fn native_prefill_policy_summary(value: &serde_json::Value) -> String {
+    let Some(native_prefill) = value.get("native_prefill") else {
+        return "native prefill policy unknown".to_owned();
+    };
+    let policy = native_prefill
+        .get("server_default_policy")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    let admission = native_prefill
+        .get("admission_prefill_chunked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let source = native_prefill
+        .get("state_source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    format!("policy {policy} | admission_chunked {admission} | source {source}")
 }
 
 #[cfg(test)]

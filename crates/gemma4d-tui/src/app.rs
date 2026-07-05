@@ -97,8 +97,10 @@ impl PageId {
 pub struct DashboardSnapshot {
     pub runtime_state: String,
     pub provider: String,
+    pub backend: String,
     pub model_target: String,
     pub context_window: String,
+    pub native_prefill_policy: String,
     pub memory_pressure: String,
     pub active_task: String,
     pub ttft_p50_ms: Option<f64>,
@@ -167,8 +169,10 @@ impl DashboardSnapshot {
         Self {
             runtime_state: "offline/mock".to_owned(),
             provider: provider.to_owned(),
+            backend: "unavailable".to_owned(),
             model_target: "Gemma 4 12B QAT target placeholder".to_owned(),
             context_window: "32768 tokens configured".to_owned(),
+            native_prefill_policy: "unavailable".to_owned(),
             memory_pressure: "not sampled".to_owned(),
             active_task: "no live runtime attached".to_owned(),
             ttft_p50_ms: None,

@@ -463,6 +463,9 @@ impl ServerRuntime {
                 "backend": self.config.backend.as_str(),
                 "model_loaded": self.backend_model_available(),
                 "bind": self.config.bind_addr.to_string(),
+                "max_context_tokens": self.config.max_context_tokens,
+                "admission_prefill_chunked": self.config.admission_prefill_chunked,
+                "native_prefill": self.native_prefill_config_json(),
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
             })),
             ("GET", "/v1/models") => self.json_ok(json!({
@@ -490,15 +493,7 @@ impl ServerRuntime {
                 "model_path": self.config.model_path.as_ref().map(|path| path.display().to_string()),
                 "max_context_tokens": self.config.max_context_tokens,
                 "admission_prefill_chunked": self.config.admission_prefill_chunked,
-                "native_prefill": {
-                    "admission_prefill_chunked": self.config.admission_prefill_chunked,
-                    "server_default_policy": if self.config.admission_prefill_chunked {
-                        Some("long_context_256")
-                    } else {
-                        None
-                    },
-                    "state_source": "server_config",
-                },
+                "native_prefill": self.native_prefill_config_json(),
                 "localhost_only": self.config.bind_addr.ip().is_loopback(),
             })),
             ("POST", "/v1/config/validate") => self.json_ok(json!({
@@ -913,6 +908,18 @@ impl ServerRuntime {
             "object": "adapter",
             "data": adapter,
         }))
+    }
+
+    fn native_prefill_config_json(&self) -> serde_json::Value {
+        json!({
+            "admission_prefill_chunked": self.config.admission_prefill_chunked,
+            "server_default_policy": if self.config.admission_prefill_chunked {
+                Some("long_context_256")
+            } else {
+                None
+            },
+            "state_source": "server_config",
+        })
     }
 
     fn runtime_snapshot_response(&self) -> HttpResponse {
@@ -2179,6 +2186,28 @@ mod tests {
         let response = runtime.handle_request("GET", "/v1/config", b"");
         assert_eq!(response.status, 200);
         let value: serde_json::Value = serde_json::from_str(&response.body).expect("json");
+        assert_eq!(value["native_prefill"]["admission_prefill_chunked"], true);
+        assert_eq!(
+            value["native_prefill"]["server_default_policy"],
+            "long_context_256"
+        );
+        assert_eq!(value["native_prefill"]["state_source"], "server_config");
+    }
+
+    #[test]
+    fn health_endpoint_exposes_backend_and_native_prefill_policy_hint() {
+        let runtime = ServerRuntime::new(ServerConfig {
+            backend: ServerBackend::PersistentNative,
+            admission_prefill_chunked: true,
+            max_context_tokens: 32_768,
+            ..ServerConfig::default()
+        });
+        let response = runtime.handle_request("GET", "/health", b"");
+        assert_eq!(response.status, 200);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("json");
+
+        assert_eq!(value["backend"], "persistent_native");
+        assert_eq!(value["max_context_tokens"], 32_768);
         assert_eq!(value["native_prefill"]["admission_prefill_chunked"], true);
         assert_eq!(
             value["native_prefill"]["server_default_policy"],

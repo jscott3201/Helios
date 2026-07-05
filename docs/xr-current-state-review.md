@@ -3,30 +3,31 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR73 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR74 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
 
-The next high-value goal is XR74: native default-readiness sweep.
+The next high-value goal is a native full-attention group-eval follow-up.
 
 XR72 closed the immediate native diagnostic question: the remaining
 full-attention tail is dominated by MLX full-attention group eval, especially
 chat first-token outliers, not host collection, capacity growth, or final sync.
 XR73 accepted the repeatedly strong chat/tool MTP lane as an explicit scoped
 opt-in, while rejecting broad default-on because the protected aggregate remains
-below the release gate. The next useful step is therefore not another speed
-candidate; it is a readiness sweep over defaults, guardrails, observability, and
-rollback surfaces.
+below the release gate. XR74 then closed the readiness sweep for the current
+local persistent-native default surface: server default selection, admission
+guardrails, 8K/16K/24K sentinels, operator visibility, rollback flags, and
+ledger separation now have concrete evidence. The next useful step is therefore
+the narrower native group-eval/JIT/scheduling lane identified by XR72.
 
 Recommended order:
 
-1. XR74: run a native default-readiness sweep.
-2. Native full-attention group-eval follow-up if kernel/JIT/scheduling work is
+1. Native full-attention group-eval follow-up if kernel/JIT/scheduling work is
    still needed after the readiness pass.
-3. Keep broader MTP promotion parked until protected aggregate speed clears the
+2. Keep broader MTP promotion parked until protected aggregate speed clears the
    release gate.
-4. Keep DSpark parked until native readiness is cleaner.
+3. Keep DSpark parked until native group-eval and MTP gates are cleaner.
 
 ## Evidence summary
 
@@ -68,6 +69,12 @@ Recommended order:
   Protected aggregate improved `7523.808 -> 6076.627 ms` (`+19.235%`), below
   the `25%` broad default-on gate; selected chat/tool lanes alone improved
   `+28.820%`.
+- XR74 added backend/native-prefill policy visibility to `/health` and the TUI
+  dashboard, with tests covering `backend`, `max_context_tokens`, and native
+  prefill policy state. Static gates passed: `cargo fmt --all --check`,
+  `git diff --check`, `cargo test -p gemma4d-server --lib`,
+  `cargo test -p gemma4d-tui --all-targets`, and
+  `GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example xr06_native_decode_tail_latency_ab --no-run`.
 
 ## System map
 
@@ -79,23 +86,26 @@ Recommended order:
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker |
 | Runtime sync point | `native/gemma4_mlx/src/native_model.cc::decode_one` | Runs logits, greedy selection, and final `mlx::core::eval({greedy, max_logit})` | XR72 showed chat outliers are not primarily final eval sync tails |
 | MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py`, `scripts/xr73_scoped_mtp_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, default-overhead, and aggregate gates | XR73 accepts only explicit scoped chat/tool opt-in; broad default remains unsupported |
+| Server default/readiness | `crates/gemma4d-server/src/lib.rs`, `crates/gemma4d-server/src/http.rs`, `crates/gemma4d-bench/examples/xr11_persistent_native_server_ab.rs` | Selects persistent-native for `serve --model-path`, applies long-context native prefill default, exposes admission/default state, and runs sentinels | XR74 ready for local persistent-native default surface; explicit rollback flags remain available |
+| Operator visibility | `crates/gemma4d-tui/src/{app,provider,ui}.rs`, `crates/gemma4d-tui/tests/m05_acceptance.rs` | Surfaces backend, context, native prefill policy, MTP, cache, adapter, and live metrics state through provider-backed pages | XR74 added dashboard backend/native-prefill visibility |
 
 ## Findings
 
-### high: XR74 is the next value lane
+### high: Native full-attention group eval is the next value lane
 
 Evidence: XR72 accepted runtime default against explicit per-layer on all five
 rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
-holdout, memory, and default-overhead gates. Broad MTP default-on remains below
-the protected aggregate gate, and XR70/XR71 full-attention update candidates
-remain default-off.
+holdout, memory, and default-overhead gates. XR74 closed the readiness sweep for
+the current local persistent-native default surface. Broad MTP default-on
+remains below the protected aggregate gate, and XR70/XR71 full-attention update
+candidates remain default-off.
 
-Impact: Another speed patch is less valuable than proving the current native
-default surface can be operated safely: server default selection, admission
-guards, tiny16 sentinels, observability, rollback flags, and clear docs.
+Impact: The fastest remaining route toward the theoretical max is no longer
+another readiness/doc pass. The remaining native speed evidence points directly
+at full-attention group eval, especially chat first-token outliers.
 
-Recommendation: Do XR74 next. Treat it as a readiness gate, not a kernel
-optimization milestone.
+Recommendation: Scope the next native patch around MLX group eval scheduling,
+warm/JIT/cache behavior, or lower-level full-attention materialization.
 
 ### high: Broad MTP default-on is still unsupported
 
@@ -109,19 +119,18 @@ would promote a narrower result than the evidence supports.
 Recommendation: Keep MTP explicit/scoped/default-off. Broader promotion should
 wait for protected aggregate evidence above the release gate.
 
-### medium: Native default-readiness is a separate gate from speed
+### medium: Native default-readiness is complete for the local default surface
 
 Evidence: Server default sentinels passed, runtime default decode is accepted
-against explicit per-layer, and XR70/XR71 candidates remain default-off.
-Operator
-observability, rollback flags, admission/tokenizer guardrails, and benchmark
-ledger cleanup are readiness work, not kernel work.
+against explicit per-layer, XR70/XR71 candidates remain default-off, and XR74
+added health/dashboard visibility for backend and native prefill policy state.
 
-Impact: A faster native path can still be unsafe to broaden if guardrails and
-rollback surfaces are incomplete.
+Impact: The current local persistent-native default can be treated as ready
+within the documented scope. This is not production internet-facing serving
+readiness and does not promote MTP or default-off experimental native candidates.
 
-Recommendation: Run XR74 now. Treat it as a readiness sweep rather than an
-optimization patch.
+Recommendation: Keep rollback flags and accepted/default-off boundaries
+explicit in docs while moving speed work back to the native group-eval lane.
 
 ### info: CI workflow removal is already true in this checkout
 
@@ -137,23 +146,15 @@ rewrite old milestone reports.
 
 ## Next work items
 
-### XR74: native default-readiness sweep
-
-Audit server/default wiring, admission and tokenizer guardrails,
-tiny16 8K/16K/24K sentinels, operator observability, rollback flags, MTP/native
-experimental-state reporting, and benchmark ledger cleanup. The output should
-be a readiness decision, not just a speed table.
-
 ### Native full-attention group-eval follow-up
 
 XR72 isolated chat first-token tails to the full-attention group eval path. If
-more native optimization is needed after XR74, scope it to MLX group eval
+more native optimization is needed, scope it to MLX group eval
 scheduling, warm/JIT/cache behavior, or a lower-level full-attention materialized
 KV path. Do not spend more time on capacity growth or visible-slice overhead
 without new evidence.
 
 ## Gaps and unknowns
 
-- XR74 still needs exact sentinel commands and the final readiness decision.
 - Native full-attention group-eval kernel work remains unscoped beyond XR72's
   diagnostic profile artifacts.

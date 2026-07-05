@@ -104,12 +104,20 @@ fn render_dashboard(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             Span::raw(snapshot.provider.clone()),
         ]),
         Line::from(vec![
+            Span::styled("Backend ", Style::default().fg(Color::Gray)),
+            Span::raw(snapshot.backend.clone()),
+        ]),
+        Line::from(vec![
             Span::styled("Model ", Style::default().fg(Color::Gray)),
             Span::raw(snapshot.model_target.clone()),
         ]),
         Line::from(vec![
             Span::styled("Context ", Style::default().fg(Color::Gray)),
             Span::raw(snapshot.context_window.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Native prefill ", Style::default().fg(Color::Gray)),
+            Span::raw(snapshot.native_prefill_policy.clone()),
         ]),
         Line::from(vec![
             Span::styled("Memory ", Style::default().fg(Color::Gray)),

@@ -150,14 +150,11 @@ Not claimed yet:
 
 The next high-value sequence is:
 
-1. XR74: native default-readiness sweep. Cover server/default wiring, admission
-   and tokenizer guardrails, tiny16 8K/16K/24K sentinels, operator
-   observability, rollback flags, and benchmark ledger cleanup.
-2. Native full-attention group-eval follow-up. XR72 showed chat first-token
+1. Native full-attention group-eval follow-up. XR72 showed chat first-token
    tails are dominated by full-attention group eval rather than collection or
-   final sync; treat kernel/JIT/scheduling work as a scoped follow-up after the
-   readiness gate.
-3. Broader MTP promotion remains parked until protected aggregate speed clears
+   final sync; XR74 closed the default-readiness sweep for the current local
+   persistent-native surface.
+2. Broader MTP promotion remains parked until protected aggregate speed clears
    the release threshold. XR73 accepts only explicit scoped chat/tool opt-in.
 
 DSpark stays parked for now. XR60 alignment remains useful background evidence,
@@ -167,8 +164,10 @@ but it is not the shortest path to the current theoretical maximum.
 
 - `BENCHMARKS.md` records benchmark commands, outputs, interpretation, and
   default/experimental decisions.
-- `docs/xr-current-state-review.md` records the current next-goal review and
-  XR74 recommendation.
+- `docs/xr-current-state-review.md` records the current next-goal review after
+  XR74 readiness.
+- `docs/evidence/XR74-native-default-readiness.md` records the XR74 readiness
+  decision.
 - `docs/evidence/` holds release and milestone evidence packets.
 - `codex/milestones/` and `codex/goals/` hold milestone contracts.
 - `AGENTS.md` defines repository operating constraints for Codex agents.
