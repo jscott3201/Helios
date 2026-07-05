@@ -2,9 +2,9 @@
 
 ## Objective
 
-After XR72, decide whether the native graph/runtime path is ready for broader
-defaulting from an operational and guardrail perspective. XR74 is not a kernel
-optimization goal; it is a readiness gate.
+After XR72/XR73, decide whether the native graph/runtime path is ready for
+broader defaulting from an operational and guardrail perspective. XR74 is not a
+kernel optimization goal; it is a readiness gate.
 
 ## Current Evidence
 
@@ -13,10 +13,15 @@ optimization goal; it is a readiness gate.
 - `serve --model-path PATH` selects `persistent-native` when `--backend` is
   omitted.
 - XR65 made native grouped end-of-decode KV eval the runtime default.
+- XR72 accepted runtime default against explicit per-layer on the five-workload
+  native decode matrix and isolated remaining chat first-token tails to
+  full-attention group eval, not collection or final sync.
+- XR73 accepted scoped chat/tool MTP opt-in only, with exactness, oracle,
+  default-overhead, and holdout gates clean.
 - XR70/XR71 full-attention update candidates remain default-off because tail
   gates are not clean enough.
-- MTP remains default-off; broad default-on is not supported by protected
-  aggregate evidence.
+- MTP remains default-off broadly; XR73 protected aggregate speedup was
+  `+19.235%`, below the `25%` broad default-on gate.
 
 ## Scope
 
@@ -31,7 +36,7 @@ optimization goal; it is a readiness gate.
 
 ## Non-Goals
 
-- Do not promote XR70/XR71 candidates unless XR72 produces cleaner evidence.
+- Do not promote XR70/XR71 candidates from XR74.
 - Do not enable broad MTP default-on.
 - Do not add multimodal support.
 - Do not claim production internet-facing serving readiness.
@@ -63,8 +68,8 @@ cargo test -p gemma4d-tui --all-targets
 GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example xr06_native_decode_tail_latency_ab --no-run
 ```
 
-Add the exact 8K/16K/24K sentinel commands after XR72 determines which native
-decode policy is under readiness review.
+Add the exact 8K/16K/24K sentinel commands for the current proven native
+runtime default and explicit scoped MTP/default-off surfaces.
 
 ## Completion Rule
 

@@ -106,10 +106,50 @@ cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- \
   --workload-id chat_short_1k_001 \
   --workload-id tool_json_1k_001 \
   --workload-id mtp_candidate_1k_001
-```
 
-Add an explicit default-overhead command once the concrete opt-in surface is
-chosen.
+GEMMA4D_REQUIRE_MLX=1 \
+GEMMA4D_USE_NATIVE_GRAPH=1 \
+cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- \
+  --out-dir benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/default-overhead-mtp-disabled \
+  --source-replay benchmarks/out/XR56-repair-cost/candidate-retro-prefix/summary.json \
+  --trials 3 \
+  --warmups 1 \
+  --max-new-tokens 32 \
+  --block-sizes 1,2,3,4,6,8 \
+  --disable-mtp \
+  --clear-workload-ids \
+  --workload-id chat_short_1k_001 \
+  --workload-id tool_json_1k_001 \
+  --workload-id mtp_candidate_1k_001
+
+GEMMA4D_REQUIRE_MLX=1 \
+GEMMA4D_USE_NATIVE_GRAPH=1 \
+GEMMA4D_EXPERIMENTAL_MTP_BLOCK_PREFIX_ROLLBACK=1 \
+GEMMA4D_EXPERIMENTAL_MTP_LAZY_SECOND_DRAFT=1 \
+GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS=1 \
+GEMMA4D_EXPERIMENTAL_MTP_ADAPTIVE_N=1 \
+cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- \
+  --out-dir benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/holdout-bypass-4k \
+  --source-replay benchmarks/out/XR56-repair-cost/candidate-retro-prefix/summary.json \
+  --trials 3 \
+  --warmups 1 \
+  --max-new-tokens 32 \
+  --block-sizes 1,2,3,4,6,8 \
+  --adaptive-policy xr61-real-margin-v1 \
+  --adaptive-zero-accept-run 3 \
+  --adaptive-min-generated-tokens 12 \
+  --clear-workload-ids \
+  --workload-id benchmark_qa_4k_001 \
+  --workload-id code_review_rust_4k_001 \
+  --workload-id mtp_candidate_4k_001
+
+python3 scripts/xr73_scoped_mtp_report.py \
+  --candidate-summary benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/candidate-scoped-chat-tool/summary.json \
+  --oracle-summary benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/sequential-oracle-scoped-chat-tool/summary.json \
+  --default-overhead-summary benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/default-overhead-mtp-disabled/summary.json \
+  --holdout-summary benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/holdout-bypass-4k/summary.json \
+  --out-dir benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in
+```
 
 ## Completion Rule
 
@@ -117,3 +157,54 @@ Complete XR73 when the scoped MTP decision is recorded as `accept_candidate`,
 `keep_experimental`, `reject_candidate`, `needs_more_data`, or
 `blocked_with_evidence`, with exact commands, artifacts, protected aggregate,
 selected-lane aggregate, default-overhead evidence, and holdout/oracle status.
+
+## Result - 2026-07-05
+
+Status: `accept_candidate` for explicit scoped chat/tool opt-in only. Broad
+default-on remains rejected because the protected aggregate is still below the
+`25%` release gate.
+
+XR73 added `--disable-mtp` to the XR15 benchmark as a default-overhead probe and
+added `scripts/xr73_scoped_mtp_report.py` to combine scoped candidate, oracle,
+default-overhead, protected aggregate, selected-lane aggregate, and holdout
+status. Runtime/server defaults were not changed; MTP remains explicit,
+scoped, and default-off.
+
+Evidence:
+
+- Candidate:
+  `benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/candidate-scoped-chat-tool/`
+- Sequential oracle:
+  `benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/sequential-oracle-scoped-chat-tool/`
+- Default-overhead probe:
+  `benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/default-overhead-mtp-disabled/`
+- 4K holdout probe:
+  `benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/holdout-bypass-4k/`
+- Combined decision:
+  `benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/xr73-scoped-mtp-summary.md`
+  and `benchmarks/out/XR73-scoped-mtp-chat-tool-opt-in/xr73-scoped-mtp-summary.json`
+
+Gate status:
+
+- Candidate run wrote `12/12` exact records with no blockers.
+- Scoped selected workloads were `chat_short_1k_001:adaptive` and
+  `tool_json_1k_001:adaptive`; protected `mtp_candidate_1k_001` was
+  baseline-bypassed.
+- Protected aggregate improved `7523.808 -> 6076.627 ms` (`+19.235%`), with
+  weighted acceptance `144/204 = 0.706` and peak MLX `8.008 GB`.
+- Selected chat/tool lanes alone improved `+28.820%`: chat `+30.203%` with
+  `69/96` accepted/attempted and tool `+27.499%` with `75/108`.
+- Sequential oracle compared `9` measured records with no missing, extra, or
+  generated-token mismatches.
+- Default-overhead probe wrote `12/12` exact records and `9` measured rows with
+  `--disable-mtp`; it had zero attempted drafts, zero drafter/draft/verify/repair
+  work, no MTP events, and `-0.000%` overhead.
+- 4K holdout probe wrote `12/12` exact records and intentionally selected no MTP
+  workloads for `benchmark_qa_4k_001`, `code_review_rust_4k_001`, and
+  `mtp_candidate_4k_001`; all were baseline-bypassed with zero attempted drafts.
+- Combined report scoped gates passed and broad default support was `false`
+  because `protected_speed_ge_gate` was `false`.
+
+Next input: XR74 should run the native default-readiness sweep over server
+default wiring, admission/tokenizer guardrails, tiny16 sentinels, operator
+observability, rollback/env flags, and benchmark-ledger cleanup.

@@ -136,11 +136,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|source| source.decision.clone())
             .unwrap_or_else(|| "unavailable".to_owned()),
-        source_policy_name: args
-            .adaptive_policy
-            .as_ref()
-            .map(|policy| format!("adaptive_policy_{policy}"))
-            .unwrap_or_else(|| "net_latency_guarded_5pct".to_owned()),
+        source_policy_name: if args.disable_mtp {
+            "mtp_disabled_default_overhead_probe".to_owned()
+        } else {
+            args.adaptive_policy
+                .as_ref()
+                .map(|policy| format!("adaptive_policy_{policy}"))
+                .unwrap_or_else(|| "net_latency_guarded_5pct".to_owned())
+        },
         workloads_path: args.workloads_path.display().to_string(),
         out_dir: args.out_dir.display().to_string(),
         records_path: records_path.display().to_string(),
@@ -169,6 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mtp_real_margins_enabled: env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS"),
         adaptive_zero_accept_run: args.adaptive_zero_accept_run,
         adaptive_min_generated_tokens: args.adaptive_min_generated_tokens,
+        mtp_disabled: args.disable_mtp,
         low_n: args.trials < 3,
         record_count: records.len(),
         measured_record_count: records.iter().filter(|record| record.measured).count(),
@@ -225,6 +229,7 @@ struct Args {
     adaptive_policy: Option<String>,
     adaptive_zero_accept_run: Option<usize>,
     adaptive_min_generated_tokens: usize,
+    disable_mtp: bool,
 }
 
 impl Args {
@@ -257,6 +262,7 @@ impl Args {
             adaptive_policy: None,
             adaptive_zero_accept_run: None,
             adaptive_min_generated_tokens: 0,
+            disable_mtp: false,
         };
         let mut args = args.into_iter().map(Into::into).peekable();
         while let Some(arg) = args.next() {
@@ -342,6 +348,7 @@ impl Args {
                         "--adaptive-min-generated-tokens",
                     )?
                 }
+                "--disable-mtp" => out.disable_mtp = true,
                 "-h" | "--help" => return Err(CliError::Usage(usage())),
                 other => {
                     return Err(CliError::Usage(format!(
@@ -378,12 +385,13 @@ impl Args {
     }
 
     fn adaptive_policy_enabled(&self) -> bool {
-        self.adaptive_policy.as_deref() == Some(XR61_ADAPTIVE_POLICY)
+        !self.disable_mtp
+            && self.adaptive_policy.as_deref() == Some(XR61_ADAPTIVE_POLICY)
             && env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_ADAPTIVE_N")
     }
 
     fn execution_block_sizes(&self) -> Vec<usize> {
-        if self.adaptive_policy_enabled() {
+        if self.disable_mtp || self.adaptive_policy_enabled() {
             vec![self.block_sizes.iter().copied().max().unwrap_or(1).max(1)]
         } else {
             self.block_sizes.clone()
@@ -443,6 +451,7 @@ struct Summary {
     mtp_real_margins_enabled: bool,
     adaptive_zero_accept_run: Option<usize>,
     adaptive_min_generated_tokens: usize,
+    mtp_disabled: bool,
     low_n: bool,
     record_count: usize,
     measured_record_count: usize,
@@ -648,11 +657,18 @@ fn run_mtp_record(
     block_size: usize,
     baseline: GreedyRun,
 ) -> Result<Record, Box<dyn std::error::Error>> {
-    let mtp = if args.adaptive_policy_enabled() {
+    let mtp = if args.disable_mtp {
+        bypassed_mtp_run(
+            args,
+            &baseline,
+            "MTP disabled by --disable-mtp default-overhead probe",
+            false,
+        )
+    } else if args.adaptive_policy_enabled() {
         if let Some(reason) =
             xr61_adaptive_policy_bypass_reason(workload.record.workload_id.as_str())
         {
-            baseline_bypassed_mtp_run(args, &baseline, reason)
+            bypassed_mtp_run(args, &baseline, reason, true)
         } else {
             run_mtp(args, workload, block_size)?
         }
@@ -715,11 +731,18 @@ fn xr61_adaptive_policy_bypass_reason(workload_id: &str) -> Option<&'static str>
     }
 }
 
-fn baseline_bypassed_mtp_run(args: &Args, baseline: &GreedyRun, reason: &str) -> MtpRun {
+fn bypassed_mtp_run(
+    args: &Args,
+    baseline: &GreedyRun,
+    reason: &str,
+    adaptive_policy_enabled: bool,
+) -> MtpRun {
     MtpRun {
         generated_tokens: baseline.generated_tokens.clone(),
-        adaptive_policy_name: args.adaptive_policy.clone(),
-        adaptive_policy_enabled: true,
+        adaptive_policy_name: adaptive_policy_enabled
+            .then(|| args.adaptive_policy.clone())
+            .flatten(),
+        adaptive_policy_enabled,
         chosen_block_size_counts: Vec::new(),
         model_load_ms: baseline.model_load_ms,
         drafter_load_ms: 0.0,
@@ -1281,6 +1304,9 @@ fn policy_summaries(args: &Args, records: &[Record]) -> Vec<PolicySummary> {
     }
     let mut summaries = Vec::new();
     summaries.push(policy_summary_for(args, &measured, "disabled_baseline"));
+    if args.disable_mtp {
+        return summaries;
+    }
     if args.adaptive_policy_enabled() {
         summaries.push(policy_summary_for(
             args,
@@ -1653,6 +1679,12 @@ fn decision_for(
             .any(|record| !record.comparison.byte_identical)
     {
         "blocked_with_evidence".to_owned()
+    } else if args.disable_mtp {
+        if default_overhead_probe_clean(records) {
+            "default_overhead_clean".to_owned()
+        } else {
+            "blocked_with_evidence".to_owned()
+        }
     } else if args.trials < 3 {
         "needs_more_data".to_owned()
     } else {
@@ -1667,6 +1699,21 @@ fn decision_for(
             .map(|summary| summary.decision.clone())
             .unwrap_or_else(|| "needs_more_data".to_owned())
     }
+}
+
+fn default_overhead_probe_clean(records: &[Record]) -> bool {
+    records.iter().all(|record| {
+        record.comparison.byte_identical
+            && record.mtp.attempted_draft_tokens == 0
+            && record.mtp.accepted_draft_tokens == 0
+            && record.mtp.target_verify_passes == 0
+            && record.mtp.rollback_count == 0
+            && record.mtp.drafter_load_ms == 0.0
+            && record.mtp.draft_ms == 0.0
+            && record.mtp.verify_ms == 0.0
+            && record.mtp.events.is_empty()
+            && (record.mtp.decode_phase_ms - record.baseline.decode_ms).abs() <= 0.001
+    })
 }
 
 fn record_blockers(records: &[Record]) -> Vec<String> {
@@ -1977,6 +2024,10 @@ fn render_report(summary: &Summary) -> String {
         "| Adaptive min generated tokens | `{}` |\n",
         summary.adaptive_min_generated_tokens
     ));
+    out.push_str(&format!(
+        "| MTP disabled probe | `{}` |\n",
+        summary.mtp_disabled
+    ));
     out.push_str(&format!("| Low-N | `{}` |\n\n", summary.low_n));
 
     out.push_str("## Policy Results\n\n");
@@ -2051,6 +2102,10 @@ fn render_decision(summary: &Summary) -> String {
     let mut out = String::new();
     out.push_str("# XR15 Decision\n\n");
     out.push_str(&format!("Decision: `{}`\n\n", summary.decision));
+    if summary.mtp_disabled {
+        out.push_str("This is a default-overhead probe: MTP is disabled by `--disable-mtp`, no drafter/verify work should run, and the MTP result mirrors native greedy baseline tokens.\n\n");
+        return out;
+    }
     out.push_str("MTP remains opt-in. This goal validates a policy candidate with fresh measured trials; it does not change runtime defaults.\n\n");
     if let Some(policy) = summary
         .policy_summaries
@@ -2075,6 +2130,7 @@ fn measurement_notes() -> Vec<String> {
         "terminal no-lookahead mode only calls the experimental verifier on a final draft block whose returned draft count can satisfy the remaining generation budget".to_owned(),
         "real per-slot target top-5, drafter logits, and drafter margins are captured only when GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS is truthy; the default path records target top-1 and zero draft score fields to preserve the XR57 performance guard".to_owned(),
         "adaptive zero-accept fallback is disabled unless --adaptive-zero-accept-run is passed; when active it uses native decode_one for the remaining tail after the gate fires".to_owned(),
+        "--disable-mtp is a default-overhead probe: it bypasses drafter load, draft, verify, and repair work while recording baseline-equivalent generated tokens".to_owned(),
         "warmup records remain in records.jsonl and summary.json but policy summaries use measured records only".to_owned(),
         "each evidence summary and record stamps git SHA, dirty-diff SHA-256, dirty-diff byte count, runner binary path, and runner binary link mtime; missing provenance aborts before measurement".to_owned(),
         "the net-latency guard requires exact MTP output, at least 5% decode-phase speedup, and peak MLX memory under the configured gate".to_owned(),
@@ -2144,7 +2200,7 @@ where
 
 fn usage() -> String {
     format!(
-        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--allow-missing-source-replay] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-policy xr61-real-margin-v1] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
+        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--allow-missing-source-replay] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-policy xr61-real-margin-v1] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--disable-mtp] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
     )
 }
 
