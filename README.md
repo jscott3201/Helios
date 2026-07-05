@@ -150,10 +150,10 @@ Not claimed yet:
 
 The next high-value sequence is:
 
-1. Native full-attention group-eval follow-up. XR72 showed chat first-token
-   tails are dominated by full-attention group eval rather than collection or
-   final sync; XR74 closed the default-readiness sweep for the current local
-   persistent-native surface.
+1. Native non-profile first-token/full-attention tail isolation. XR75 rejected
+   simple serial full-attention group scheduling against the runtime default,
+   so the next native lane should separate true runtime behavior from profiling
+   perturbation and test warm/JIT/cache hypotheses.
 2. Broader MTP promotion remains parked until protected aggregate speed clears
    the release threshold. XR73 accepts only explicit scoped chat/tool opt-in.
 

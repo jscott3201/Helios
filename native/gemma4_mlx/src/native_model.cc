@@ -98,6 +98,7 @@ struct NativeTextModel::Impl {
     bool experimental_skip_decode_peak_reset = false;
     bool native_decode_profile = false;
     bool native_decode_full_attention_profile = false;
+    bool experimental_full_attention_group_eval = false;
     bool experimental_full_attention_kv_update = false;
     int experimental_full_attention_kv_update_capacity_step = 256;
 };
@@ -155,6 +156,13 @@ bool native_decode_profile_env_enabled() {
 
 bool native_decode_full_attention_profile_env_enabled() {
     const char* value = std::getenv("GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+        std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
+bool experimental_full_attention_group_eval_env_enabled() {
+    const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_GROUP_EVAL");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
         std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
         std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
@@ -1390,29 +1398,40 @@ void eval_deferred_decode_kv(
     DecodeKvEvalMode mode,
     Gemma4DecodeProfileInfo* decode_profile = nullptr,
     uint64_t sequence_len = 0,
+    bool full_attention_group_eval = false,
     bool full_attention_group_profile = false) {
     if (target_kv == nullptr || mode == DecodeKvEvalMode::PerLayer ||
         mode == DecodeKvEvalMode::DeferToLogits) {
         return;
     }
-    full_attention_group_profile = full_attention_group_profile && decode_profile != nullptr;
+    const bool profile_group_eval = full_attention_group_profile && decode_profile != nullptr;
+    full_attention_group_eval = full_attention_group_eval || profile_group_eval;
+    const bool collect_split_arrays = decode_profile != nullptr || full_attention_group_eval;
+    const bool record_full_attention_groups =
+        full_attention_group_eval && decode_profile != nullptr;
     std::vector<array> eval_arrays;
     eval_arrays.reserve(target_kv->layers.size() * 2);
     std::vector<array> full_attention_arrays;
     std::vector<array> sliding_arrays;
     std::vector<std::vector<array>> full_attention_group_arrays;
     std::chrono::steady_clock::time_point collection_started;
-    if (decode_profile != nullptr) {
-        collection_started = std::chrono::steady_clock::now();
+    if (collect_split_arrays) {
         full_attention_arrays.reserve(16);
         sliding_arrays.reserve(target_kv->layers.size() * 2);
+    }
+    if (full_attention_group_eval) {
+        full_attention_group_arrays.resize(kFullAttentionProfileGroups);
+        for (int group = 0; group < kFullAttentionProfileGroups; ++group) {
+            full_attention_group_arrays[group].reserve(2);
+        }
+    }
+    if (decode_profile != nullptr) {
+        collection_started = std::chrono::steady_clock::now();
         decode_profile->deferred_kv_eval_sequence_len = sequence_len;
-        if (full_attention_group_profile) {
+        if (record_full_attention_groups) {
             decode_profile->deferred_kv_eval_full_attention_group_count =
                 kFullAttentionProfileGroups;
-            full_attention_group_arrays.resize(kFullAttentionProfileGroups);
             for (int group = 0; group < kFullAttentionProfileGroups; ++group) {
-                full_attention_group_arrays[group].reserve(2);
                 decode_profile->deferred_kv_eval_full_attention_group_layers[group] =
                     static_cast<uint32_t>(group * 6 + 5);
             }
@@ -1426,28 +1445,34 @@ void eval_deferred_decode_kv(
         std::vector<array>* profile_arrays = nullptr;
         uint64_t* profile_array_count = nullptr;
         uint64_t* profile_byte_count = nullptr;
-        std::vector<array>* profile_group_arrays = nullptr;
-        uint64_t* profile_group_array_count = nullptr;
-        uint64_t* profile_group_byte_count = nullptr;
-        if (decode_profile != nullptr) {
+        std::vector<array>* group_eval_arrays = nullptr;
+        uint64_t* group_array_count = nullptr;
+        uint64_t* group_byte_count = nullptr;
+        if (collect_split_arrays) {
             if (layer.full_attention) {
                 profile_arrays = &full_attention_arrays;
-                profile_array_count = &decode_profile->deferred_kv_eval_full_attention_arrays;
-                profile_byte_count = &decode_profile->deferred_kv_eval_full_attention_bytes;
-                if (full_attention_group_profile) {
+                if (decode_profile != nullptr) {
+                    profile_array_count = &decode_profile->deferred_kv_eval_full_attention_arrays;
+                    profile_byte_count = &decode_profile->deferred_kv_eval_full_attention_bytes;
+                }
+                if (full_attention_group_eval) {
                     const int group = full_attention_profile_group(static_cast<uint32_t>(layer_idx));
                     if (group >= 0 && group < kFullAttentionProfileGroups) {
-                        profile_group_arrays = &full_attention_group_arrays[group];
-                        profile_group_array_count =
-                            &decode_profile->deferred_kv_eval_full_attention_group_arrays[group];
-                        profile_group_byte_count =
-                            &decode_profile->deferred_kv_eval_full_attention_group_bytes[group];
+                        group_eval_arrays = &full_attention_group_arrays[group];
+                        if (record_full_attention_groups) {
+                            group_array_count =
+                                &decode_profile->deferred_kv_eval_full_attention_group_arrays[group];
+                            group_byte_count =
+                                &decode_profile->deferred_kv_eval_full_attention_group_bytes[group];
+                        }
                     }
                 }
             } else {
                 profile_arrays = &sliding_arrays;
-                profile_array_count = &decode_profile->deferred_kv_eval_sliding_arrays;
-                profile_byte_count = &decode_profile->deferred_kv_eval_sliding_bytes;
+                if (decode_profile != nullptr) {
+                    profile_array_count = &decode_profile->deferred_kv_eval_sliding_arrays;
+                    profile_byte_count = &decode_profile->deferred_kv_eval_sliding_bytes;
+                }
             }
         }
         if (layer.key.has_value()) {
@@ -1458,12 +1483,12 @@ void eval_deferred_decode_kv(
                     *layer.key,
                     profile_array_count,
                     profile_byte_count);
-                if (profile_group_arrays != nullptr) {
+                if (group_eval_arrays != nullptr) {
                     append_deferred_decode_kv_array(
-                        *profile_group_arrays,
+                        *group_eval_arrays,
                         *layer.key,
-                        profile_group_array_count,
-                        profile_group_byte_count);
+                        group_array_count,
+                        group_byte_count);
                 }
             }
         }
@@ -1475,12 +1500,12 @@ void eval_deferred_decode_kv(
                     *layer.value,
                     profile_array_count,
                     profile_byte_count);
-                if (profile_group_arrays != nullptr) {
+                if (group_eval_arrays != nullptr) {
                     append_deferred_decode_kv_array(
-                        *profile_group_arrays,
+                        *group_eval_arrays,
                         *layer.value,
-                        profile_group_array_count,
-                        profile_group_byte_count);
+                        group_array_count,
+                        group_byte_count);
                 }
             }
         }
@@ -1491,28 +1516,41 @@ void eval_deferred_decode_kv(
     if (eval_arrays.empty()) {
         return;
     }
-    if (decode_profile != nullptr) {
+    if (collect_split_arrays) {
         if (!full_attention_arrays.empty()) {
-            const auto full_started = std::chrono::steady_clock::now();
-            if (full_attention_group_profile) {
+            const auto full_started = decode_profile != nullptr
+                                          ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+            if (full_attention_group_eval) {
                 for (int group = 0; group < kFullAttentionProfileGroups; ++group) {
                     if (full_attention_group_arrays[group].empty()) {
                         continue;
                     }
-                    const auto group_started = std::chrono::steady_clock::now();
+                    const auto group_started = record_full_attention_groups
+                                                   ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
                     mlx::core::eval(full_attention_group_arrays[group]);
-                    decode_profile->deferred_kv_eval_full_attention_group_ms[group] =
-                        profile_elapsed_ms(group_started);
+                    if (record_full_attention_groups) {
+                        decode_profile->deferred_kv_eval_full_attention_group_ms[group] =
+                            profile_elapsed_ms(group_started);
+                    }
                 }
             } else {
                 mlx::core::eval(full_attention_arrays);
             }
-            decode_profile->deferred_kv_eval_full_attention_ms = profile_elapsed_ms(full_started);
+            if (decode_profile != nullptr) {
+                decode_profile->deferred_kv_eval_full_attention_ms =
+                    profile_elapsed_ms(full_started);
+            }
         }
         if (!sliding_arrays.empty()) {
-            const auto sliding_started = std::chrono::steady_clock::now();
+            const auto sliding_started = decode_profile != nullptr
+                                             ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
             mlx::core::eval(sliding_arrays);
-            decode_profile->deferred_kv_eval_sliding_ms = profile_elapsed_ms(sliding_started);
+            if (decode_profile != nullptr) {
+                decode_profile->deferred_kv_eval_sliding_ms = profile_elapsed_ms(sliding_started);
+            }
         }
     } else {
         mlx::core::eval(eval_arrays);
@@ -1680,7 +1718,12 @@ NativeHiddenArrays decode_block_hidden(
         h,
         std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
         1e-6f));
-    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    eval_deferred_decode_kv(
+        target_kv,
+        decode_kv_eval_mode(),
+        nullptr,
+        0,
+        impl.experimental_full_attention_group_eval);
     target_kv->sequence_len = previous_sequence_len + token_count;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
     return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
@@ -1857,6 +1900,7 @@ NativeForwardArrays decode_last_logits(
         decode_kv_eval_mode(),
         decode_profile,
         previous_sequence_len + 1,
+        impl.experimental_full_attention_group_eval,
         impl.native_decode_full_attention_profile);
     if (decode_profile != nullptr) {
         decode_profile->deferred_kv_eval_ms = profile_elapsed_ms(deferred_kv_started);
@@ -1896,7 +1940,12 @@ NativeHiddenArrays decode_last_hidden(
         h,
         std::optional<array>(tensor_or_throw(impl, "language_model.model.norm.weight")),
         1e-6f));
-    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    eval_deferred_decode_kv(
+        target_kv,
+        decode_kv_eval_mode(),
+        nullptr,
+        0,
+        impl.experimental_full_attention_group_eval);
     target_kv->sequence_len = previous_sequence_len + 1;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
     return NativeHiddenArrays{std::move(h), std::move(shared_kv)};
@@ -1957,7 +2006,12 @@ NativeForwardArrays decode_block_logits(
     array logits = target_logits_for_hidden(impl, h);
     const int stop = static_cast<int>(token_count);
     array last_hidden = mlx::core::slice(h, {0, stop - 1, 0}, {1, stop, 3840});
-    eval_deferred_decode_kv(target_kv, decode_kv_eval_mode());
+    eval_deferred_decode_kv(
+        target_kv,
+        decode_kv_eval_mode(),
+        nullptr,
+        0,
+        impl.experimental_full_attention_group_eval);
     target_kv->sequence_len = previous_sequence_len + token_count;
     target_kv->active_bytes = estimate_target_kv_bytes(target_kv->sequence_len);
     BlockPrefixSources captured_sources;
@@ -1974,7 +2028,8 @@ NativeForwardArrays decode_block_logits(
 void materialize_block_prefix_kv(
     const BlockPrefixSources& sources,
     size_t prefix_token_count,
-    NativeKvState::Impl* prefix_kv) {
+    NativeKvState::Impl* prefix_kv,
+    bool full_attention_group_eval = false) {
     if (prefix_kv == nullptr) {
         throw std::runtime_error("native incremental block prefix materialization requires output KV state");
     }
@@ -2019,7 +2074,7 @@ void materialize_block_prefix_kv(
         }
     }
 
-    eval_deferred_decode_kv(prefix_kv, mode);
+    eval_deferred_decode_kv(prefix_kv, mode, nullptr, 0, full_attention_group_eval);
     prefix_kv->sequence_len = sources.previous_sequence_len + prefix_token_count;
     prefix_kv->active_bytes = estimate_target_kv_bytes(prefix_kv->sequence_len);
 }
@@ -3478,6 +3533,8 @@ bool NativeTextModel::load(
         model->impl_->native_decode_profile = native_decode_profile_env_enabled();
         model->impl_->native_decode_full_attention_profile =
             native_decode_full_attention_profile_env_enabled();
+        model->impl_->experimental_full_attention_group_eval =
+            experimental_full_attention_group_eval_env_enabled();
         model->impl_->experimental_skip_decode_peak_reset =
             experimental_skip_decode_peak_reset_env_enabled();
         model->impl_->experimental_full_attention_kv_update =
@@ -4218,7 +4275,8 @@ bool NativeTextModel::decode_incremental_block_with_retroactive_prefix(
             materialize_block_prefix_kv(
                 forward.prefix_sources,
                 accepted_prefix_count,
-                prefix_kv_state->impl_.get());
+                prefix_kv_state->impl_.get(),
+                impl_->experimental_full_attention_group_eval);
         }
 
         std::unique_ptr<NativeHiddenState> hidden;

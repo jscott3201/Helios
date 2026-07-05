@@ -46,6 +46,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_GROUP_EVAL",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
 ];
@@ -56,6 +57,7 @@ const INHERITED_GLOBAL_ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_GROUP_EVAL",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
 ];
@@ -722,6 +724,13 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             Some("native_decode_eval_per_layer"),
             0,
             48,
+        ),
+        native_default_variant_with_extra_env(
+            "native_decode_full_attention_group_eval",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_GROUP_EVAL", "1")],
         ),
         native_variant(
             "native_decode_eval_selective_full_attention",
@@ -1753,7 +1762,7 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             "deferred_kv_eval_ms is the grouped end-of-decode KV eval path when the selected KV eval mode defers layer KV synchronization".to_owned(),
             "XR69 profile fields split deferred KV eval into full-attention and sliding-window groups; when profiling is enabled these groups are evaluated separately for attribution, while non-profile runtime behavior keeps the original grouped eval call".to_owned(),
             "XR72 collection timing measures the host-side deferred KV array collection loop before MLX eval calls".to_owned(),
-            "XR72 full-attention group timings are emitted only with GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE=1 before target load; each group corresponds to one full-attention target layer".to_owned(),
+            "Full-attention group timings are emitted with GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE=1 or the XR75 experimental group-eval variant before target load; each group corresponds to one full-attention target layer".to_owned(),
             "deferred KV eval array and byte counts are shape/dtype estimates for the arrays submitted to MLX eval at the current decode sequence length".to_owned(),
             "XR71 profile fields split the default-off full-attention KV update candidate into capacity-growth, slice-update, and visible-slice buckets; eval-sync impact remains visible through deferred_kv_eval_* and eval_sync_ms".to_owned(),
             "eval_sync_ms is the explicit MLX eval call on greedy token and max-logit arrays".to_owned(),

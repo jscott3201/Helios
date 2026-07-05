@@ -3,31 +3,36 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR74 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR75 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
 
-The next high-value goal is a native full-attention group-eval follow-up.
+The next high-value goal is native non-profile first-token/full-attention tail
+isolation.
 
 XR72 closed the immediate native diagnostic question: the remaining
-full-attention tail is dominated by MLX full-attention group eval, especially
-chat first-token outliers, not host collection, capacity growth, or final sync.
-XR73 accepted the repeatedly strong chat/tool MTP lane as an explicit scoped
-opt-in, while rejecting broad default-on because the protected aggregate remains
-below the release gate. XR74 then closed the readiness sweep for the current
-local persistent-native default surface: server default selection, admission
-guardrails, 8K/16K/24K sentinels, operator visibility, rollback flags, and
-ledger separation now have concrete evidence. The next useful step is therefore
-the narrower native group-eval/JIT/scheduling lane identified by XR72.
+full-attention tail is dominated by MLX full-attention eval, especially chat
+first-token outliers, not host collection, capacity growth, or final sync. XR75
+then falsified the simplest follow-up: serializing deferred full-attention KV
+eval by stable layer group did not beat the current runtime default on the
+3-trial chat follow-up. XR73 accepted the repeatedly strong chat/tool MTP lane
+as an explicit scoped opt-in, while rejecting broad default-on because the
+protected aggregate remains below the release gate. XR74 closed the readiness
+sweep for the current local persistent-native default surface. The next useful
+step is therefore not another serial group-eval pass, but a narrower native
+measurement/candidate pass that separates true non-profile runtime behavior
+from profile-mode scheduling and tests warm/JIT/cache behavior around the
+first-token full-attention tail.
 
 Recommended order:
 
-1. Native full-attention group-eval follow-up if kernel/JIT/scheduling work is
-   still needed after the readiness pass.
+1. Native non-profile first-token/full-attention tail isolation, with any
+   candidate kept default-off until it beats runtime default without profiling
+   perturbation.
 2. Keep broader MTP promotion parked until protected aggregate speed clears the
    release gate.
-3. Keep DSpark parked until native group-eval and MTP gates are cleaner.
+3. Keep DSpark parked until native and MTP gates are cleaner.
 
 ## Evidence summary
 
@@ -60,6 +65,14 @@ Recommended order:
   `406.584..511.937 ms`, full-attention eval was `397.454..503.863 ms`,
   collection was `0.010..0.308 ms`, and final eval sync was about
   `6.337..7.000 ms`.
+- XR75 added default-off
+  `GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_GROUP_EVAL=1` and rejected serial
+  full-attention group scheduling as a promotion lane. The decisive
+  `chat_short_1k_001` follow-up wrote `9/9` correct records and `567/567`
+  profiled samples with peak `7.321 GB`, but the candidate regressed p50
+  `69.655 -> 71.448 ms` (`+2.574%`), regressed p95
+  `70.191 -> 72.057 ms`, and improved p99 only
+  `163.705 -> 162.719 ms` (`+0.602%`) versus runtime default.
 - Post-XR70 MTP kept exactness and oracle checks, but protected aggregate speedup
   was `+19.845%`, below the `25%` broad default-on gate. Selected chat/tool lanes
   remain attractive at about `+30.784%`.
@@ -80,9 +93,9 @@ Recommended order:
 
 | Area | Files / symbols | Responsibility | Notes |
 |---|---|---|---|
-| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default and full-attention KV update capacity candidates |
+| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, full-attention KV update capacity, and XR75 group-eval candidates |
 | Native profile ABI | `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs` | Carries per-token decode profile fields across C ABI and Rust | Current fields split broad forward, deferred KV eval, full-attention/sliding eval, update/capacity/slice/visible-slice, group eval attribution, and eval sync |
-| Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention group eval; future kernel/JIT/scheduling work should stay scoped |
+| Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention eval; XR75 rejected simple serial group scheduling |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker |
 | Runtime sync point | `native/gemma4_mlx/src/native_model.cc::decode_one` | Runs logits, greedy selection, and final `mlx::core::eval({greedy, max_logit})` | XR72 showed chat outliers are not primarily final eval sync tails |
 | MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py`, `scripts/xr73_scoped_mtp_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, default-overhead, and aggregate gates | XR73 accepts only explicit scoped chat/tool opt-in; broad default remains unsupported |
@@ -91,21 +104,25 @@ Recommended order:
 
 ## Findings
 
-### high: Native full-attention group eval is the next value lane
+### high: Non-profile first-token tail isolation is the next value lane
 
 Evidence: XR72 accepted runtime default against explicit per-layer on all five
 rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
 holdout, memory, and default-overhead gates. XR74 closed the readiness sweep for
-the current local persistent-native default surface. Broad MTP default-on
-remains below the protected aggregate gate, and XR70/XR71 full-attention update
-candidates remain default-off.
+the current local persistent-native default surface. XR75 rejected the simple
+serial group-eval candidate against runtime default on the 3-trial chat
+follow-up. Broad MTP default-on remains below the protected aggregate gate, and
+XR70/XR71 full-attention update candidates remain default-off.
 
 Impact: The fastest remaining route toward the theoretical max is no longer
-another readiness/doc pass. The remaining native speed evidence points directly
-at full-attention group eval, especially chat first-token outliers.
+another readiness/doc pass or a serial group-eval full matrix. The remaining
+native speed evidence points at first-token/full-attention runtime behavior that
+profile-mode scheduling may perturb.
 
-Recommendation: Scope the next native patch around MLX group eval scheduling,
-warm/JIT/cache behavior, or lower-level full-attention materialization.
+Recommendation: Scope the next native patch around no-profile timing evidence,
+warm/JIT/cache behavior, or lower-level full-attention materialization. Treat
+serial group eval as rejected unless a new kernel-level implementation changes
+the cost model.
 
 ### high: Broad MTP default-on is still unsupported
 
@@ -130,7 +147,8 @@ within the documented scope. This is not production internet-facing serving
 readiness and does not promote MTP or default-off experimental native candidates.
 
 Recommendation: Keep rollback flags and accepted/default-off boundaries
-explicit in docs while moving speed work back to the native group-eval lane.
+explicit in docs while moving speed work back to the native first-token tail
+lane.
 
 ### info: CI workflow removal is already true in this checkout
 
@@ -146,15 +164,17 @@ rewrite old milestone reports.
 
 ## Next work items
 
-### Native full-attention group-eval follow-up
+### Native non-profile first-token/full-attention tail isolation
 
-XR72 isolated chat first-token tails to the full-attention group eval path. If
-more native optimization is needed, scope it to MLX group eval
-scheduling, warm/JIT/cache behavior, or a lower-level full-attention materialized
-KV path. Do not spend more time on capacity growth or visible-slice overhead
-without new evidence.
+XR72 isolated chat first-token tails to the full-attention eval path, and XR75
+showed serial group scheduling is not enough. The next task should measure the
+actual non-profile runtime path and test warm/JIT/cache hypotheses or a
+lower-level full-attention materialized KV path. Do not spend more time on
+capacity growth, visible-slice overhead, or serial group scheduling without new
+evidence.
 
 ## Gaps and unknowns
 
-- Native full-attention group-eval kernel work remains unscoped beyond XR72's
-  diagnostic profile artifacts.
+- Native non-profile first-token timing remains less directly attributed than
+  profile-mode timing because the current profile path splits deferred full
+  attention and sliding eval for attribution.
