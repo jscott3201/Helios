@@ -150,15 +150,16 @@ Not claimed yet:
 
 The next high-value sequence is:
 
-1. XR72: isolate full-attention deferred-eval tail jitter. Profile per
-   full-attention layer/group, separate MLX scheduling, sync, JIT, cache, and
-   shape-stability effects, then explain p95/p99 before adding kernels.
-2. XR73: scoped MTP chat/tool opt-in. Preserve exactness, oracle, holdout
+1. XR73: scoped MTP chat/tool opt-in. Preserve exactness, oracle, holdout
    protection, and default-path overhead gates. Do not pursue broad default-on
    MTP until the protected aggregate clears the release threshold.
-3. XR74: native default-readiness sweep after XR72. Cover server/default wiring,
-   admission and tokenizer guardrails, tiny16 8K/16K/24K sentinels, operator
+2. XR74: native default-readiness sweep. Cover server/default wiring, admission
+   and tokenizer guardrails, tiny16 8K/16K/24K sentinels, operator
    observability, rollback flags, and benchmark ledger cleanup.
+3. Native full-attention group-eval follow-up. XR72 showed chat first-token
+   tails are dominated by full-attention group eval rather than collection or
+   final sync; treat kernel/JIT/scheduling work as a scoped follow-up after the
+   MTP/readiness gates.
 
 DSpark stays parked for now. XR60 alignment remains useful background evidence,
 but it is not the shortest path to the current theoretical maximum.
@@ -168,7 +169,7 @@ but it is not the shortest path to the current theoretical maximum.
 - `BENCHMARKS.md` records benchmark commands, outputs, interpretation, and
   default/experimental decisions.
 - `docs/xr-current-state-review.md` records the current next-goal review and
-  XR72/XR73/XR74 recommendation.
+  XR73/XR74 recommendation.
 - `docs/evidence/` holds release and milestone evidence packets.
 - `codex/milestones/` and `codex/goals/` hold milestone contracts.
 - `AGENTS.md` defines repository operating constraints for Codex agents.

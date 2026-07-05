@@ -98,6 +98,7 @@ GEMMA4D_REQUIRE_MLX=1 cargo test -p gemma4d-bench --example xr06_native_decode_t
 GEMMA4D_REQUIRE_MLX=1 \
 GEMMA4D_USE_NATIVE_GRAPH=1 \
 GEMMA4D_NATIVE_DECODE_PROFILE=1 \
+GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE=1 \
 GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY=long_context_256 \
 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- \
   --out-dir benchmarks/out/XR72-full-attention-deferred-eval-tail-jitter/smoke-chat-1k \
@@ -110,6 +111,7 @@ cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- \
 GEMMA4D_REQUIRE_MLX=1 \
 GEMMA4D_USE_NATIVE_GRAPH=1 \
 GEMMA4D_NATIVE_DECODE_PROFILE=1 \
+GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE=1 \
 GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY=long_context_256 \
 cargo run -p gemma4d-bench --example xr06_native_decode_tail_latency_ab -- \
   --out-dir benchmarks/out/XR72-full-attention-deferred-eval-tail-jitter/full-matrix \
@@ -133,3 +135,39 @@ Complete XR72 only when the artifacts explain the full-attention deferred-eval
 tail behavior and the decision is recorded as `accept_candidate`,
 `keep_experimental`, `reject_candidate`, `needs_more_data`, or
 `blocked_with_evidence` with exact commands, paths, gate status, and next input.
+
+## Result - 2026-07-05
+
+Status: `accept_candidate`; profiling complete, no default behavior change.
+
+XR72 added profile-only `GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE=1` and
+widened the decode profile ABI to version `8` with deferred collection timing
+plus eight full-attention group/layer eval, array, and byte buckets.
+Runtime/server/MTP defaults remain unchanged when the flag is disabled.
+
+Evidence:
+
+- Smoke artifacts:
+  `benchmarks/out/XR72-full-attention-deferred-eval-tail-jitter/smoke-chat-1k/`
+- Full matrix artifacts:
+  `benchmarks/out/XR72-full-attention-deferred-eval-tail-jitter/full-matrix/`
+- Full matrix wrote `45/45` passed/correct records and `2835/2835` profiled
+  decode samples with no blockers.
+- Runtime default was accepted versus explicit per-layer on all five workloads;
+  p95/p99 improvements were `15.654/31.353%` at 16K, `11.230/28.917%` on
+  `chat_short_1k_001`, `9.638/18.941%` at 4K, `17.626/91.951%` at 8K, and
+  `7.309/36.844%` on `tool_json_1k_001`.
+- Peak MLX stayed under the tiny16 gate: `7.321..7.929 GB`.
+- Collection time was not the tail source: runtime-default deferred collection
+  means were `0.006..0.009 ms`.
+- `chat_short_1k_001` first-token outliers were dominated by full-attention
+  group eval, not host collection or final sync. Runtime-default first-token
+  host latency was `406.584..511.937 ms`; full-attention eval was
+  `397.454..503.863 ms`; collection was `0.010..0.308 ms`; final eval sync
+  was about `6.337..7.000 ms`.
+- The `native_decode_full_attention_kv_update_256` candidate did not beat
+  `native_decode_runtime_default` and remains default-off.
+
+Next input: XR73 should focus on scoped MTP chat/tool opt-in with default-path
+overhead and holdout/oracle gates. XR74 should follow as a native
+default-readiness sweep.

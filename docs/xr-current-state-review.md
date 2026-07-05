@@ -3,25 +3,28 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR71 native graph evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR72 native graph evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
 
-The next high-value goal is XR72: full-attention deferred-eval tail jitter.
+The next high-value goal is XR73: scoped MTP chat/tool opt-in.
 
-Native graph work should stay ahead of MTP. XR71 showed that capacity growth,
-`slice_update`, and visible-slice overhead are not the remaining bottleneck; the
-dominant unresolved lane is the grouped full-attention deferred eval barrier and
-its tail behavior. MTP still has strong selected chat/tool lanes, but the broad
-protected aggregate remains below the default-on gate.
+XR72 closed the immediate native diagnostic question: the remaining
+full-attention tail is dominated by MLX full-attention group eval, especially
+chat first-token outliers, not host collection, capacity growth, or final sync.
+The broad native runtime default is already accepted against explicit
+per-layer. The best near-term path to the theoretical max is therefore to
+productize the repeatedly strong chat/tool MTP lane behind an explicit opt-in
+or workload gate, then run a native default-readiness sweep.
 
 Recommended order:
 
-1. XR72: isolate full-attention deferred-eval p95/p99 jitter.
-2. XR73: add scoped MTP chat/tool opt-in or workload-gated behavior.
-3. XR74: run a native default-readiness sweep after XR72.
-4. Keep DSpark parked until native tail behavior and scoped MTP are cleaner.
+1. XR73: add scoped MTP chat/tool opt-in or workload-gated behavior.
+2. XR74: run a native default-readiness sweep.
+3. Native full-attention group-eval follow-up if kernel/JIT/scheduling work is
+   still needed after the readiness pass.
+4. Keep DSpark parked until native readiness and scoped MTP are cleaner.
 
 ## Evidence summary
 
@@ -45,6 +48,15 @@ Recommended order:
 - XR71 profile fields show full-attention update overhead is about
   `0.010 ms/token`. Capacity growth, slice update, and visible-slice creation
   should not drive the next optimization.
+- XR72 added profile-only full-attention group attribution and accepted the
+  runtime default against explicit per-layer on all five rows. The full matrix
+  wrote `45/45` correct records, `2835/2835` profiled samples, no blockers, and
+  peak MLX `7.321..7.929 GB`. Collection time was `0.006..0.009 ms` mean on
+  runtime default. Chat first-token outliers were dominated by full-attention
+  group eval: runtime-default first-token host latency was
+  `406.584..511.937 ms`, full-attention eval was `397.454..503.863 ms`,
+  collection was `0.010..0.308 ms`, and final eval sync was about
+  `6.337..7.000 ms`.
 - Post-XR70 MTP kept exactness and oracle checks, but protected aggregate speedup
   was `+19.845%`, below the `25%` broad default-on gate. Selected chat/tool lanes
   remain attractive at about `+30.784%`.
@@ -54,28 +66,29 @@ Recommended order:
 | Area | Files / symbols | Responsibility | Notes |
 |---|---|---|---|
 | Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default and full-attention KV update capacity candidates |
-| Native profile ABI | `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs` | Carries per-token decode profile fields across C ABI and Rust | Current fields split broad forward, deferred KV eval, full-attention/sliding eval, update/capacity/slice/visible-slice, and eval sync |
-| Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 should add finer attribution here before kernel changes |
+| Native profile ABI | `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs` | Carries per-token decode profile fields across C ABI and Rust | Current fields split broad forward, deferred KV eval, full-attention/sliding eval, update/capacity/slice/visible-slice, group eval attribution, and eval sync |
+| Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention group eval; future kernel/JIT/scheduling work should stay scoped |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker |
-| Runtime sync point | `native/gemma4_mlx/src/native_model.cc::decode_one` | Runs logits, greedy selection, and final `mlx::core::eval({greedy, max_logit})` | XR72 must distinguish deferred KV eval tails from final eval sync tails |
-| MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, and aggregate gates | Use for XR73 after XR72 clarifies native baseline behavior |
+| Runtime sync point | `native/gemma4_mlx/src/native_model.cc::decode_one` | Runs logits, greedy selection, and final `mlx::core::eval({greedy, max_logit})` | XR72 showed chat outliers are not primarily final eval sync tails |
+| MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, and aggregate gates | Use next for XR73 scoped opt-in/default-overhead evidence |
 
 ## Findings
 
-### high: Full-attention deferred eval is now the limiting native lane
+### high: XR73 is the next speed/value lane
 
-Evidence: XR69 split the deferred barrier and found sliding eval at
-`0.006..0.009 ms`, while full-attention eval accounts for almost all
-`63..78 ms/token`. XR70 and XR71 both improved aggregate decode but left
-`chat_short_1k_001` tail regressions.
+Evidence: XR72 accepted runtime default against explicit per-layer on all five
+rows and showed the remaining chat tail is in full-attention group eval, not
+collection, capacity growth, visible-slice work, or final sync. The
+`native_decode_full_attention_kv_update_256` candidate did not beat runtime
+default.
 
-Impact: More capacity or visible-slice tuning is unlikely to close the tail
-gate. The next change needs attribution around the MLX eval barrier itself:
-layer/group contribution, eval scheduling, sync, shape stability, and warm/JIT
-effects.
+Impact: More capacity tuning is low value. A deeper native kernel/JIT/scheduler
+change may still be useful, but it is a narrower research lane than converting
+the already-proven MTP chat/tool speedup into a controlled opt-in.
 
-Recommendation: Do XR72 as profiling-first work. Do not promote the XR70/XR71
-candidate or add kernels until the p95/p99 source is explained.
+Recommendation: Do XR73 next. Make MTP explicit and scoped, prove default-path
+overhead is zero or indistinguishable, and keep broad default-on off unless the
+protected aggregate clears the release gate.
 
 ### high: Broad MTP default-on is still unsupported
 
@@ -92,16 +105,17 @@ chat/tool behavior, with no default-path overhead and the existing
 
 ### medium: Native default-readiness is a separate gate from speed
 
-Evidence: Server default sentinels passed, but XR70/XR71 candidates remain
-default-off and the next native work is still a tail investigation. Operator
+Evidence: Server default sentinels passed, runtime default decode is accepted
+against explicit per-layer, and XR70/XR71 candidates remain default-off.
+Operator
 observability, rollback flags, admission/tokenizer guardrails, and benchmark
 ledger cleanup are readiness work, not kernel work.
 
 Impact: A faster native path can still be unsafe to broaden if guardrails and
 rollback surfaces are incomplete.
 
-Recommendation: Keep XR74 after XR72, and treat it as a readiness sweep rather
-than an optimization patch.
+Recommendation: Keep XR74 after XR73 unless the team wants to freeze MTP for a
+release. Treat XR74 as a readiness sweep rather than an optimization patch.
 
 ### info: CI workflow removal is already true in this checkout
 
@@ -117,51 +131,31 @@ rewrite old milestone reports.
 
 ## Next work items
 
-### XR72: full-attention deferred-eval tail jitter
-
-Scope the first patch to profile attribution. Extend the profile surface around
-`eval_deferred_decode_kv` so profile artifacts can show whether p95/p99 tails
-come from specific full-attention layers/groups, array count/shape churn,
-`mlx::core::eval` scheduling, final sync, or warm/JIT/cache effects.
-
-Required matrix:
-
-- `chat_short_1k_001`
-- `tool_json_1k_001`
-- `code_review_rust_4k_001`
-- `code_review_rust_8k_001`
-- `benchmark_qa_16k_001`
-
-Required gates:
-
-- token/logit exactness on every row;
-- no default runtime/server/API behavior change;
-- 16K peak MLX below `14 GB` with `long_context_256`;
-- p95/p99 explanation before kernel changes;
-- candidate promotion only if no row regresses over `5%` and at least three of
-  five rows clear the XR06 tail gate.
-
 ### XR73: scoped MTP chat/tool opt-in
 
-Use the existing XR66/XR70 evidence to ship a narrow opt-in path only after the
-native baseline is stable enough. Preserve exactness, sequential oracle,
-holdout, memory, and no-default-overhead gates. Do not chase broad default-on
-unless the protected aggregate clears `25%`.
+Use the existing XR66/XR70 evidence to ship a narrow opt-in path. Preserve
+exactness, sequential oracle, holdout, memory, and no-default-overhead gates.
+Do not chase broad default-on unless the protected aggregate clears `25%`.
 
 ### XR74: native default-readiness sweep
 
-After XR72, audit server/default wiring, admission and tokenizer guardrails,
-tiny16 8K/16K/24K sentinels, operator observability, rollback flags, and
-benchmark ledger cleanup. The output should be a readiness decision, not just a
-speed table.
+After XR73, audit server/default wiring, admission and tokenizer guardrails,
+tiny16 8K/16K/24K sentinels, operator observability, rollback flags, MTP/native
+experimental-state reporting, and benchmark ledger cleanup. The output should
+be a readiness decision, not just a speed table.
+
+### Native full-attention group-eval follow-up
+
+XR72 isolated chat first-token tails to the full-attention group eval path. If
+more native optimization is needed after XR73/XR74, scope it to MLX group eval
+scheduling, warm/JIT/cache behavior, or a lower-level full-attention materialized
+KV path. Do not spend more time on capacity growth or visible-slice overhead
+without new evidence.
 
 ## Gaps and unknowns
 
-- XR72 does not yet have committed profile artifacts because the goal contract
-  is newly defined.
-- Fine-grained full-attention layer/group timing may require a C ABI profile
-  extension and Rust report-field updates.
-- The existing XR06 harness can run the right workload matrix, but it may need
-  new variant/profile labels to make XR72 artifacts self-describing.
 - MTP selected-lane value is clear, but the correct operator/server opt-in
   surface still needs a product decision during XR73.
+- XR74 still needs exact sentinel commands and the final readiness decision.
+- Native full-attention group-eval kernel work remains unscoped beyond XR72's
+  diagnostic profile artifacts.

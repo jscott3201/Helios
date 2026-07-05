@@ -79,6 +79,7 @@ typedef struct Gemma4KvPolicy {
 #define GEMMA4_MTP_MAX_COMMITTED_TOKENS GEMMA4_MTP_TRACE_MAX_POSITIONS
 #define GEMMA4_MTP_TRACE_TOP_K 5
 #define GEMMA4_MTP_TRACE_MAX_RANK 4
+#define GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS 8
 
 typedef struct Gemma4MtpTraceInfo {
     uint32_t position_count;
@@ -119,11 +120,18 @@ typedef struct Gemma4DecodeProfileInfo {
     double deferred_kv_eval_ms;
     double deferred_kv_eval_full_attention_ms;
     double deferred_kv_eval_sliding_ms;
+    double deferred_kv_eval_collection_ms;
     uint64_t deferred_kv_eval_full_attention_arrays;
     uint64_t deferred_kv_eval_sliding_arrays;
     uint64_t deferred_kv_eval_full_attention_bytes;
     uint64_t deferred_kv_eval_sliding_bytes;
     uint64_t deferred_kv_eval_sequence_len;
+    uint32_t deferred_kv_eval_full_attention_group_count;
+    uint32_t reserved1;
+    uint32_t deferred_kv_eval_full_attention_group_layers[GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS];
+    double deferred_kv_eval_full_attention_group_ms[GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS];
+    uint64_t deferred_kv_eval_full_attention_group_arrays[GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS];
+    uint64_t deferred_kv_eval_full_attention_group_bytes[GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS];
     double full_attention_kv_update_ms;
     double full_attention_kv_update_capacity_ms;
     double full_attention_kv_update_slice_update_ms;

@@ -97,6 +97,7 @@ struct NativeTextModel::Impl {
     bool native_prefill_policy_long_context_256 = false;
     bool experimental_skip_decode_peak_reset = false;
     bool native_decode_profile = false;
+    bool native_decode_full_attention_profile = false;
     bool experimental_full_attention_kv_update = false;
     int experimental_full_attention_kv_update_capacity_step = 256;
 };
@@ -147,6 +148,13 @@ bool experimental_mtp_real_margins_enabled() {
 
 bool native_decode_profile_env_enabled() {
     const char* value = std::getenv("GEMMA4D_NATIVE_DECODE_PROFILE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+        std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+        std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
+bool native_decode_full_attention_profile_env_enabled() {
+    const char* value = std::getenv("GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
         std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
         std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
@@ -452,6 +460,7 @@ constexpr int kTargetLayerCount = 48;
 constexpr int kHiddenSize = 3840;
 constexpr int kSlidingWindowSize = 1024;
 constexpr int kFullAttentionKvUpdateCapacityStep = 256;
+constexpr int kFullAttentionProfileGroups = GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS;
 constexpr uint64_t kBf16Bytes = 2;
 
 std::optional<array> decode_block_causal_mask(
@@ -478,6 +487,14 @@ std::optional<array> decode_block_causal_mask(
 
 bool target_layer_full_attention(uint32_t layer_idx) {
     return ((layer_idx + 1) % 6) == 0;
+}
+
+int full_attention_profile_group(uint32_t layer_idx) {
+    if (!target_layer_full_attention(layer_idx)) {
+        return -1;
+    }
+    const int group = static_cast<int>(layer_idx / 6);
+    return group >= 0 && group < kFullAttentionProfileGroups ? group : -1;
 }
 
 PrefillKvEvalMode prefill_kv_eval_mode() {
@@ -1372,32 +1389,61 @@ void eval_deferred_decode_kv(
     NativeKvState::Impl* target_kv,
     DecodeKvEvalMode mode,
     Gemma4DecodeProfileInfo* decode_profile = nullptr,
-    uint64_t sequence_len = 0) {
+    uint64_t sequence_len = 0,
+    bool full_attention_group_profile = false) {
     if (target_kv == nullptr || mode == DecodeKvEvalMode::PerLayer ||
         mode == DecodeKvEvalMode::DeferToLogits) {
         return;
     }
+    full_attention_group_profile = full_attention_group_profile && decode_profile != nullptr;
     std::vector<array> eval_arrays;
     eval_arrays.reserve(target_kv->layers.size() * 2);
     std::vector<array> full_attention_arrays;
     std::vector<array> sliding_arrays;
+    std::vector<std::vector<array>> full_attention_group_arrays;
+    std::chrono::steady_clock::time_point collection_started;
     if (decode_profile != nullptr) {
+        collection_started = std::chrono::steady_clock::now();
         full_attention_arrays.reserve(16);
         sliding_arrays.reserve(target_kv->layers.size() * 2);
         decode_profile->deferred_kv_eval_sequence_len = sequence_len;
+        if (full_attention_group_profile) {
+            decode_profile->deferred_kv_eval_full_attention_group_count =
+                kFullAttentionProfileGroups;
+            full_attention_group_arrays.resize(kFullAttentionProfileGroups);
+            for (int group = 0; group < kFullAttentionProfileGroups; ++group) {
+                full_attention_group_arrays[group].reserve(2);
+                decode_profile->deferred_kv_eval_full_attention_group_layers[group] =
+                    static_cast<uint32_t>(group * 6 + 5);
+            }
+        }
     }
-    for (const NativeKvState::Impl::Layer& layer : target_kv->layers) {
+    for (size_t layer_idx = 0; layer_idx < target_kv->layers.size(); ++layer_idx) {
+        const NativeKvState::Impl::Layer& layer = target_kv->layers[layer_idx];
         if (!eval_decode_kv_at_end(mode, layer.full_attention)) {
             continue;
         }
         std::vector<array>* profile_arrays = nullptr;
         uint64_t* profile_array_count = nullptr;
         uint64_t* profile_byte_count = nullptr;
+        std::vector<array>* profile_group_arrays = nullptr;
+        uint64_t* profile_group_array_count = nullptr;
+        uint64_t* profile_group_byte_count = nullptr;
         if (decode_profile != nullptr) {
             if (layer.full_attention) {
                 profile_arrays = &full_attention_arrays;
                 profile_array_count = &decode_profile->deferred_kv_eval_full_attention_arrays;
                 profile_byte_count = &decode_profile->deferred_kv_eval_full_attention_bytes;
+                if (full_attention_group_profile) {
+                    const int group = full_attention_profile_group(static_cast<uint32_t>(layer_idx));
+                    if (group >= 0 && group < kFullAttentionProfileGroups) {
+                        profile_group_arrays = &full_attention_group_arrays[group];
+                        profile_group_array_count =
+                            &decode_profile->deferred_kv_eval_full_attention_group_arrays[group];
+                        profile_group_byte_count =
+                            &decode_profile->deferred_kv_eval_full_attention_group_bytes[group];
+                    }
+                }
             } else {
                 profile_arrays = &sliding_arrays;
                 profile_array_count = &decode_profile->deferred_kv_eval_sliding_arrays;
@@ -1412,6 +1458,13 @@ void eval_deferred_decode_kv(
                     *layer.key,
                     profile_array_count,
                     profile_byte_count);
+                if (profile_group_arrays != nullptr) {
+                    append_deferred_decode_kv_array(
+                        *profile_group_arrays,
+                        *layer.key,
+                        profile_group_array_count,
+                        profile_group_byte_count);
+                }
             }
         }
         if (layer.value.has_value()) {
@@ -1422,8 +1475,18 @@ void eval_deferred_decode_kv(
                     *layer.value,
                     profile_array_count,
                     profile_byte_count);
+                if (profile_group_arrays != nullptr) {
+                    append_deferred_decode_kv_array(
+                        *profile_group_arrays,
+                        *layer.value,
+                        profile_group_array_count,
+                        profile_group_byte_count);
+                }
             }
         }
+    }
+    if (decode_profile != nullptr) {
+        decode_profile->deferred_kv_eval_collection_ms = profile_elapsed_ms(collection_started);
     }
     if (eval_arrays.empty()) {
         return;
@@ -1431,7 +1494,19 @@ void eval_deferred_decode_kv(
     if (decode_profile != nullptr) {
         if (!full_attention_arrays.empty()) {
             const auto full_started = std::chrono::steady_clock::now();
-            mlx::core::eval(full_attention_arrays);
+            if (full_attention_group_profile) {
+                for (int group = 0; group < kFullAttentionProfileGroups; ++group) {
+                    if (full_attention_group_arrays[group].empty()) {
+                        continue;
+                    }
+                    const auto group_started = std::chrono::steady_clock::now();
+                    mlx::core::eval(full_attention_group_arrays[group]);
+                    decode_profile->deferred_kv_eval_full_attention_group_ms[group] =
+                        profile_elapsed_ms(group_started);
+                }
+            } else {
+                mlx::core::eval(full_attention_arrays);
+            }
             decode_profile->deferred_kv_eval_full_attention_ms = profile_elapsed_ms(full_started);
         }
         if (!sliding_arrays.empty()) {
@@ -1781,7 +1856,8 @@ NativeForwardArrays decode_last_logits(
         target_kv,
         decode_kv_eval_mode(),
         decode_profile,
-        previous_sequence_len + 1);
+        previous_sequence_len + 1,
+        impl.native_decode_full_attention_profile);
     if (decode_profile != nullptr) {
         decode_profile->deferred_kv_eval_ms = profile_elapsed_ms(deferred_kv_started);
     }
@@ -3400,6 +3476,8 @@ bool NativeTextModel::load(
         model->impl_->native_prefill_policy_long_context_256 =
             native_prefill_policy_long_context_256_env_enabled();
         model->impl_->native_decode_profile = native_decode_profile_env_enabled();
+        model->impl_->native_decode_full_attention_profile =
+            native_decode_full_attention_profile_env_enabled();
         model->impl_->experimental_skip_decode_peak_reset =
             experimental_skip_decode_peak_reset_env_enabled();
         model->impl_->experimental_full_attention_kv_update =

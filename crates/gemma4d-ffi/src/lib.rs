@@ -27,6 +27,7 @@ mod raw {
     pub const GEMMA4_MTP_MAX_COMMITTED_TOKENS: usize = GEMMA4_MTP_TRACE_MAX_POSITIONS;
     pub const GEMMA4_MTP_TRACE_TOP_K: usize = 5;
     pub const GEMMA4_MTP_TRACE_MAX_RANK: usize = 4;
+    pub const GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS: usize = 8;
 
     #[repr(C)]
     pub struct Gemma4Target {
@@ -167,11 +168,22 @@ mod raw {
         pub deferred_kv_eval_ms: f64,
         pub deferred_kv_eval_full_attention_ms: f64,
         pub deferred_kv_eval_sliding_ms: f64,
+        pub deferred_kv_eval_collection_ms: f64,
         pub deferred_kv_eval_full_attention_arrays: u64,
         pub deferred_kv_eval_sliding_arrays: u64,
         pub deferred_kv_eval_full_attention_bytes: u64,
         pub deferred_kv_eval_sliding_bytes: u64,
         pub deferred_kv_eval_sequence_len: u64,
+        pub deferred_kv_eval_full_attention_group_count: u32,
+        pub reserved1: u32,
+        pub deferred_kv_eval_full_attention_group_layers:
+            [u32; GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+        pub deferred_kv_eval_full_attention_group_ms:
+            [f64; GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+        pub deferred_kv_eval_full_attention_group_arrays:
+            [u64; GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+        pub deferred_kv_eval_full_attention_group_bytes:
+            [u64; GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
         pub full_attention_kv_update_ms: f64,
         pub full_attention_kv_update_capacity_ms: f64,
         pub full_attention_kv_update_slice_update_ms: f64,
@@ -959,11 +971,21 @@ pub struct DecodeProfileInfo {
     pub deferred_kv_eval_ms: f64,
     pub deferred_kv_eval_full_attention_ms: f64,
     pub deferred_kv_eval_sliding_ms: f64,
+    pub deferred_kv_eval_collection_ms: f64,
     pub deferred_kv_eval_full_attention_arrays: u64,
     pub deferred_kv_eval_sliding_arrays: u64,
     pub deferred_kv_eval_full_attention_bytes: u64,
     pub deferred_kv_eval_sliding_bytes: u64,
     pub deferred_kv_eval_sequence_len: u64,
+    pub deferred_kv_eval_full_attention_group_count: u32,
+    pub deferred_kv_eval_full_attention_group_layers:
+        [u32; raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+    pub deferred_kv_eval_full_attention_group_ms:
+        [f64; raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+    pub deferred_kv_eval_full_attention_group_arrays:
+        [u64; raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+    pub deferred_kv_eval_full_attention_group_bytes:
+        [u64; raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
     pub full_attention_kv_update_ms: f64,
     pub full_attention_kv_update_capacity_ms: f64,
     pub full_attention_kv_update_slice_update_ms: f64,
@@ -992,11 +1014,21 @@ impl DecodeProfileInfo {
             deferred_kv_eval_ms: 0.0,
             deferred_kv_eval_full_attention_ms: 0.0,
             deferred_kv_eval_sliding_ms: 0.0,
+            deferred_kv_eval_collection_ms: 0.0,
             deferred_kv_eval_full_attention_arrays: 0,
             deferred_kv_eval_sliding_arrays: 0,
             deferred_kv_eval_full_attention_bytes: 0,
             deferred_kv_eval_sliding_bytes: 0,
             deferred_kv_eval_sequence_len: 0,
+            deferred_kv_eval_full_attention_group_count: 0,
+            deferred_kv_eval_full_attention_group_layers: [0;
+                raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+            deferred_kv_eval_full_attention_group_ms: [0.0;
+                raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+            deferred_kv_eval_full_attention_group_arrays: [0;
+                raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
+            deferred_kv_eval_full_attention_group_bytes: [0;
+                raw::GEMMA4_DECODE_PROFILE_FULL_ATTENTION_GROUPS],
             full_attention_kv_update_ms: 0.0,
             full_attention_kv_update_capacity_ms: 0.0,
             full_attention_kv_update_slice_update_ms: 0.0,
@@ -1086,11 +1118,21 @@ fn decode_profile_from_raw(raw: &raw::Gemma4DecodeProfileInfo) -> DecodeProfileI
         deferred_kv_eval_ms: raw.deferred_kv_eval_ms,
         deferred_kv_eval_full_attention_ms: raw.deferred_kv_eval_full_attention_ms,
         deferred_kv_eval_sliding_ms: raw.deferred_kv_eval_sliding_ms,
+        deferred_kv_eval_collection_ms: raw.deferred_kv_eval_collection_ms,
         deferred_kv_eval_full_attention_arrays: raw.deferred_kv_eval_full_attention_arrays,
         deferred_kv_eval_sliding_arrays: raw.deferred_kv_eval_sliding_arrays,
         deferred_kv_eval_full_attention_bytes: raw.deferred_kv_eval_full_attention_bytes,
         deferred_kv_eval_sliding_bytes: raw.deferred_kv_eval_sliding_bytes,
         deferred_kv_eval_sequence_len: raw.deferred_kv_eval_sequence_len,
+        deferred_kv_eval_full_attention_group_count: raw
+            .deferred_kv_eval_full_attention_group_count,
+        deferred_kv_eval_full_attention_group_layers: raw
+            .deferred_kv_eval_full_attention_group_layers,
+        deferred_kv_eval_full_attention_group_ms: raw.deferred_kv_eval_full_attention_group_ms,
+        deferred_kv_eval_full_attention_group_arrays: raw
+            .deferred_kv_eval_full_attention_group_arrays,
+        deferred_kv_eval_full_attention_group_bytes: raw
+            .deferred_kv_eval_full_attention_group_bytes,
         full_attention_kv_update_ms: raw.full_attention_kv_update_ms,
         full_attention_kv_update_capacity_ms: raw.full_attention_kv_update_capacity_ms,
         full_attention_kv_update_slice_update_ms: raw.full_attention_kv_update_slice_update_ms,
@@ -1420,7 +1462,7 @@ mod tests {
     #[test]
     fn runtime_version_reports_smoke_backend() {
         let version = runtime_version().expect("runtime version should be available");
-        assert_eq!(version.abi_version, 7);
+        assert_eq!(version.abi_version, 8);
         assert_eq!(version.backend_name, "gemma4_mlx");
         assert!(version.backend_version.starts_with("m03-"));
     }
@@ -1433,13 +1475,13 @@ mod tests {
 
     #[test]
     fn decode_profile_raw_layout_stays_pinned() {
-        assert_eq!(std::mem::size_of::<raw::Gemma4DecodeProfileInfo>(), 224);
+        assert_eq!(std::mem::size_of::<raw::Gemma4DecodeProfileInfo>(), 464);
         assert_eq!(std::mem::align_of::<raw::Gemma4DecodeProfileInfo>(), 8);
     }
 
     #[test]
     fn step_result_raw_layout_stays_pinned() {
-        assert_eq!(std::mem::size_of::<raw::Gemma4StepResult>(), 1712);
+        assert_eq!(std::mem::size_of::<raw::Gemma4StepResult>(), 1952);
         assert_eq!(std::mem::align_of::<raw::Gemma4StepResult>(), 8);
         assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, greedy_token), 0);
         assert_eq!(
@@ -1462,7 +1504,7 @@ mod tests {
             std::mem::offset_of!(raw::Gemma4StepResult, decode_profile),
             160
         );
-        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, mtp_trace), 384);
+        assert_eq!(std::mem::offset_of!(raw::Gemma4StepResult, mtp_trace), 624);
     }
 
     #[test]

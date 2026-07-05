@@ -43,6 +43,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS",
     "GEMMA4D_NATIVE_DECODE_KV_EVAL",
     "GEMMA4D_NATIVE_DECODE_PROFILE",
+    "GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
@@ -52,6 +53,7 @@ const INHERITED_GLOBAL_ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY",
     "GEMMA4D_NATIVE_PREFILL_CHUNK_TOKENS",
     "GEMMA4D_NATIVE_DECODE_PROFILE",
+    "GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE",
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
@@ -495,6 +497,7 @@ struct DecodeProfileTrace {
     deferred_kv_eval_ms: f64,
     deferred_kv_eval_full_attention_ms: f64,
     deferred_kv_eval_sliding_ms: f64,
+    deferred_kv_eval_collection_ms: f64,
     deferred_kv_eval_full_attention_arrays: u64,
     deferred_kv_eval_sliding_arrays: u64,
     deferred_kv_eval_total_arrays: u64,
@@ -502,6 +505,7 @@ struct DecodeProfileTrace {
     deferred_kv_eval_sliding_bytes: u64,
     deferred_kv_eval_total_bytes: u64,
     deferred_kv_eval_sequence_len: u64,
+    deferred_kv_eval_full_attention_groups: Vec<FullAttentionGroupTrace>,
     full_attention_kv_update_ms: f64,
     full_attention_kv_update_capacity_ms: f64,
     full_attention_kv_update_slice_update_ms: f64,
@@ -521,13 +525,36 @@ struct DecodeProfileTrace {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct FullAttentionGroupTrace {
+    group_index: usize,
+    layer_index: u32,
+    eval_ms: f64,
+    arrays: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct DecodeProfileSummary {
     schema_version: u32,
     profile_env_key: String,
     enabled_samples: usize,
     total_decode_samples: usize,
     aggregates: Vec<DecodeProfileAggregate>,
+    chat_short_outliers: Vec<DecodeProfileOutlier>,
     stage_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DecodeProfileOutlier {
+    workload_id: String,
+    variant: String,
+    trial_index: usize,
+    decode_index: usize,
+    latency_ms: f64,
+    deferred_kv_eval_full_attention_ms: Option<f64>,
+    deferred_kv_eval_collection_ms: Option<f64>,
+    eval_sync_ms: Option<f64>,
+    full_attention_group_ms: Vec<FullAttentionGroupTrace>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -545,6 +572,7 @@ struct DecodeProfileAggregate {
     deferred_kv_eval_ms: Option<LatencyStats>,
     deferred_kv_eval_full_attention_ms: Option<LatencyStats>,
     deferred_kv_eval_sliding_ms: Option<LatencyStats>,
+    deferred_kv_eval_collection_ms: Option<LatencyStats>,
     deferred_kv_eval_full_attention_arrays: Option<ScalarStats>,
     deferred_kv_eval_sliding_arrays: Option<ScalarStats>,
     deferred_kv_eval_total_arrays: Option<ScalarStats>,
@@ -552,6 +580,7 @@ struct DecodeProfileAggregate {
     deferred_kv_eval_sliding_bytes: Option<ScalarStats>,
     deferred_kv_eval_total_bytes: Option<ScalarStats>,
     deferred_kv_eval_sequence_len: Option<ScalarStats>,
+    deferred_kv_eval_full_attention_groups: Vec<FullAttentionGroupAggregate>,
     full_attention_kv_update_ms: Option<LatencyStats>,
     full_attention_kv_update_capacity_ms: Option<LatencyStats>,
     full_attention_kv_update_slice_update_ms: Option<LatencyStats>,
@@ -570,6 +599,16 @@ struct DecodeProfileAggregate {
     rust_ffi_overhead_ms: Option<LatencyStats>,
     largest_stage_by_mean: Option<String>,
     largest_stage_mean_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FullAttentionGroupAggregate {
+    group_index: usize,
+    layer_index: u32,
+    sample_count: usize,
+    eval_ms: Option<LatencyStats>,
+    arrays: Option<ScalarStats>,
+    bytes: Option<ScalarStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1430,6 +1469,17 @@ fn decode_profile_trace(
     let non_kv_forward_graph_ms =
         (profile.forward_graph_ms - profile.attention_kv_mutation_ms - profile.deferred_kv_eval_ms)
             .max(0.0);
+    let group_count = (profile.deferred_kv_eval_full_attention_group_count as usize)
+        .min(profile.deferred_kv_eval_full_attention_group_layers.len());
+    let deferred_kv_eval_full_attention_groups = (0..group_count)
+        .map(|index| FullAttentionGroupTrace {
+            group_index: index,
+            layer_index: profile.deferred_kv_eval_full_attention_group_layers[index],
+            eval_ms: profile.deferred_kv_eval_full_attention_group_ms[index],
+            arrays: profile.deferred_kv_eval_full_attention_group_arrays[index],
+            bytes: profile.deferred_kv_eval_full_attention_group_bytes[index],
+        })
+        .collect::<Vec<_>>();
     Some(DecodeProfileTrace {
         reset_peak_memory_ms: profile.reset_peak_memory_ms,
         forward_graph_ms: profile.forward_graph_ms,
@@ -1439,6 +1489,7 @@ fn decode_profile_trace(
         deferred_kv_eval_ms: profile.deferred_kv_eval_ms,
         deferred_kv_eval_full_attention_ms: profile.deferred_kv_eval_full_attention_ms,
         deferred_kv_eval_sliding_ms: profile.deferred_kv_eval_sliding_ms,
+        deferred_kv_eval_collection_ms: profile.deferred_kv_eval_collection_ms,
         deferred_kv_eval_full_attention_arrays: profile.deferred_kv_eval_full_attention_arrays,
         deferred_kv_eval_sliding_arrays: profile.deferred_kv_eval_sliding_arrays,
         deferred_kv_eval_total_arrays: profile.deferred_kv_eval_full_attention_arrays
@@ -1448,6 +1499,7 @@ fn decode_profile_trace(
         deferred_kv_eval_total_bytes: profile.deferred_kv_eval_full_attention_bytes
             + profile.deferred_kv_eval_sliding_bytes,
         deferred_kv_eval_sequence_len: profile.deferred_kv_eval_sequence_len,
+        deferred_kv_eval_full_attention_groups,
         full_attention_kv_update_ms: profile.full_attention_kv_update_ms,
         full_attention_kv_update_capacity_ms: profile.full_attention_kv_update_capacity_ms,
         full_attention_kv_update_slice_update_ms: profile.full_attention_kv_update_slice_update_ms,
@@ -1519,6 +1571,9 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
         let deferred_kv_eval_sliding_ms = latency_stats(&profile_values(&profiles, |profile| {
             profile.deferred_kv_eval_sliding_ms
         }));
+        let deferred_kv_eval_collection_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.deferred_kv_eval_collection_ms
+        }));
         let deferred_kv_eval_full_attention_arrays =
             scalar_stats(&profile_scalar_values(&profiles, |profile| {
                 profile.deferred_kv_eval_full_attention_arrays
@@ -1547,6 +1602,7 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             scalar_stats(&profile_scalar_values(&profiles, |profile| {
                 profile.deferred_kv_eval_sequence_len
             }));
+        let deferred_kv_eval_full_attention_groups = full_attention_group_aggregates(&profiles);
         let full_attention_kv_update_ms = latency_stats(&profile_values(&profiles, |profile| {
             profile.full_attention_kv_update_ms
         }));
@@ -1601,6 +1657,10 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             ("attention_kv_mutation_ms", &attention_kv_mutation_ms),
             ("deferred_kv_eval_ms", &deferred_kv_eval_ms),
             (
+                "deferred_kv_eval_collection_ms",
+                &deferred_kv_eval_collection_ms,
+            ),
+            (
                 "deferred_kv_eval_full_attention_ms",
                 &deferred_kv_eval_full_attention_ms,
             ),
@@ -1648,6 +1708,7 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             deferred_kv_eval_ms,
             deferred_kv_eval_full_attention_ms,
             deferred_kv_eval_sliding_ms,
+            deferred_kv_eval_collection_ms,
             deferred_kv_eval_full_attention_arrays,
             deferred_kv_eval_sliding_arrays,
             deferred_kv_eval_total_arrays,
@@ -1655,6 +1716,7 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             deferred_kv_eval_sliding_bytes,
             deferred_kv_eval_total_bytes,
             deferred_kv_eval_sequence_len,
+            deferred_kv_eval_full_attention_groups,
             full_attention_kv_update_ms,
             full_attention_kv_update_capacity_ms,
             full_attention_kv_update_slice_update_ms,
@@ -1682,6 +1744,7 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
         enabled_samples,
         total_decode_samples,
         aggregates,
+        chat_short_outliers: chat_short_profile_outliers(records),
         stage_notes: vec![
             "forward_graph_ms is the parent native decode_last_logits bucket and should not be treated as a patch lane by itself".to_owned(),
             "attention_kv_mutation_ms accumulates per-layer decode K/V projection, append/concat, sliding-window slice, target KV store, optional immediate KV eval, and shared-KV capture before attention".to_owned(),
@@ -1689,6 +1752,8 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             "layer_graph_ms includes the full per-layer decode loop, including attention KV mutation and non-KV attention/MLP work".to_owned(),
             "deferred_kv_eval_ms is the grouped end-of-decode KV eval path when the selected KV eval mode defers layer KV synchronization".to_owned(),
             "XR69 profile fields split deferred KV eval into full-attention and sliding-window groups; when profiling is enabled these groups are evaluated separately for attribution, while non-profile runtime behavior keeps the original grouped eval call".to_owned(),
+            "XR72 collection timing measures the host-side deferred KV array collection loop before MLX eval calls".to_owned(),
+            "XR72 full-attention group timings are emitted only with GEMMA4D_NATIVE_DECODE_FULL_ATTENTION_PROFILE=1 before target load; each group corresponds to one full-attention target layer".to_owned(),
             "deferred KV eval array and byte counts are shape/dtype estimates for the arrays submitted to MLX eval at the current decode sequence length".to_owned(),
             "XR71 profile fields split the default-off full-attention KV update candidate into capacity-growth, slice-update, and visible-slice buckets; eval-sync impact remains visible through deferred_kv_eval_* and eval_sync_ms".to_owned(),
             "eval_sync_ms is the explicit MLX eval call on greedy token and max-logit arrays".to_owned(),
@@ -1697,6 +1762,86 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             "profile timings are emitted only when GEMMA4D_NATIVE_DECODE_PROFILE is enabled before native target load".to_owned(),
         ],
     }
+}
+
+fn full_attention_group_aggregates(
+    profiles: &[&DecodeProfileTrace],
+) -> Vec<FullAttentionGroupAggregate> {
+    let keys = profiles
+        .iter()
+        .flat_map(|profile| {
+            profile
+                .deferred_kv_eval_full_attention_groups
+                .iter()
+                .map(|group| (group.group_index, group.layer_index))
+        })
+        .collect::<BTreeSet<_>>();
+    keys.into_iter()
+        .map(|(group_index, layer_index)| {
+            let groups = profiles
+                .iter()
+                .flat_map(|profile| &profile.deferred_kv_eval_full_attention_groups)
+                .filter(|group| {
+                    group.group_index == group_index && group.layer_index == layer_index
+                })
+                .collect::<Vec<_>>();
+            FullAttentionGroupAggregate {
+                group_index,
+                layer_index,
+                sample_count: groups.len(),
+                eval_ms: latency_stats(
+                    &groups.iter().map(|group| group.eval_ms).collect::<Vec<_>>(),
+                ),
+                arrays: scalar_stats(
+                    &groups
+                        .iter()
+                        .map(|group| group.arrays as f64)
+                        .collect::<Vec<_>>(),
+                ),
+                bytes: scalar_stats(
+                    &groups
+                        .iter()
+                        .map(|group| group.bytes as f64)
+                        .collect::<Vec<_>>(),
+                ),
+            }
+        })
+        .collect()
+}
+
+fn chat_short_profile_outliers(records: &[Record]) -> Vec<DecodeProfileOutlier> {
+    let mut outliers = records
+        .iter()
+        .filter(|record| record.workload_id == "chat_short_1k_001")
+        .flat_map(|record| {
+            record.decode_token_traces.iter().map(|trace| {
+                let profile = trace.decode_profile.as_ref();
+                DecodeProfileOutlier {
+                    workload_id: record.workload_id.clone(),
+                    variant: record.variant.clone(),
+                    trial_index: record.trial_index,
+                    decode_index: trace.decode_index,
+                    latency_ms: trace.latency_ms,
+                    deferred_kv_eval_full_attention_ms: profile
+                        .map(|profile| profile.deferred_kv_eval_full_attention_ms),
+                    deferred_kv_eval_collection_ms: profile
+                        .map(|profile| profile.deferred_kv_eval_collection_ms),
+                    eval_sync_ms: profile.map(|profile| profile.eval_sync_ms),
+                    full_attention_group_ms: profile
+                        .map(|profile| profile.deferred_kv_eval_full_attention_groups.clone())
+                        .unwrap_or_default(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    outliers.sort_by(|left, right| {
+        right
+            .latency_ms
+            .partial_cmp(&left.latency_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    outliers.truncate(12);
+    outliers
 }
 
 fn profile_values<F>(profiles: &[&DecodeProfileTrace], field: F) -> Vec<f64>
@@ -2301,11 +2446,11 @@ fn render_profile_report(summary: &Summary) -> String {
     out.push_str(&format!("- Records: `{}`\n\n", summary.record_count));
 
     out.push_str("## Stage Aggregates\n\n");
-    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Non-KV graph mean | KV mutation mean | Full-attn update mean | Update capacity mean | Update slice mean | Update visible-slice mean | Capacity growths mean | Capacity tokens mean | Deferred KV eval mean | Full-attn KV eval mean | Sliding KV eval mean | Eval arrays mean | Eval bytes mean | Eval seq len mean | LM head mean | Eval sync mean | Greedy select mean | Rust/FFI overhead mean | Largest stage |\n");
-    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Non-KV graph mean | KV mutation mean | Full-attn update mean | Update capacity mean | Update slice mean | Update visible-slice mean | Capacity growths mean | Capacity tokens mean | Deferred KV eval mean | Deferred collection mean | Full-attn KV eval mean | Sliding KV eval mean | Eval arrays mean | Eval bytes mean | Eval seq len mean | LM head mean | Eval sync mean | Greedy select mean | Rust/FFI overhead mean | Largest stage |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for aggregate in &summary.decode_profile.aggregates {
         out.push_str(&format!(
-            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
             aggregate.workload_id,
             aggregate.variant,
             aggregate.enabled_sample_count,
@@ -2322,6 +2467,7 @@ fn render_profile_report(summary: &Summary) -> String {
             fmt_scalar_mean(&aggregate.full_attention_kv_update_capacity_growths),
             fmt_scalar_mean(&aggregate.full_attention_kv_update_capacity_tokens),
             fmt_stats_mean(&aggregate.deferred_kv_eval_ms),
+            fmt_stats_mean(&aggregate.deferred_kv_eval_collection_ms),
             fmt_stats_mean(&aggregate.deferred_kv_eval_full_attention_ms),
             fmt_stats_mean(&aggregate.deferred_kv_eval_sliding_ms),
             fmt_scalar_mean(&aggregate.deferred_kv_eval_total_arrays),
@@ -2332,6 +2478,43 @@ fn render_profile_report(summary: &Summary) -> String {
             fmt_stats_mean(&aggregate.greedy_select_ms),
             fmt_stats_mean(&aggregate.rust_ffi_overhead_ms),
             aggregate.largest_stage_by_mean.as_deref().unwrap_or("n/a")
+        ));
+    }
+
+    out.push_str("\n## Full-Attention Group Aggregates\n\n");
+    out.push_str("| Workload | Variant | Group | Layer | Samples | Eval mean | Eval p95 | Arrays mean | Bytes mean |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    for aggregate in &summary.decode_profile.aggregates {
+        for group in &aggregate.deferred_kv_eval_full_attention_groups {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} |\n",
+                aggregate.workload_id,
+                aggregate.variant,
+                group.group_index,
+                group.layer_index,
+                group.sample_count,
+                fmt_stats_mean(&group.eval_ms),
+                fmt_stats_p95(&group.eval_ms),
+                fmt_scalar_mean(&group.arrays),
+                fmt_scalar_mean(&group.bytes)
+            ));
+        }
+    }
+
+    out.push_str("\n## Chat Short Latency Outliers\n\n");
+    out.push_str("| Variant | Trial | Decode index | Host latency | Full-attn eval | Collection | Eval sync | Group eval means |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---|\n");
+    for outlier in &summary.decode_profile.chat_short_outliers {
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {:.3} | {} | {} | {} | `{}` |\n",
+            outlier.variant,
+            outlier.trial_index,
+            outlier.decode_index,
+            outlier.latency_ms,
+            fmt_optional_ms(outlier.deferred_kv_eval_full_attention_ms),
+            fmt_optional_ms(outlier.deferred_kv_eval_collection_ms),
+            fmt_optional_ms(outlier.eval_sync_ms),
+            fmt_group_trace_means(&outlier.full_attention_group_ms)
         ));
     }
 
@@ -2637,8 +2820,32 @@ fn fmt_stats_mean(stats: &Option<LatencyStats>) -> String {
     fmt_opt(stats.as_ref().map(|stats| stats.mean_ms))
 }
 
+fn fmt_stats_p95(stats: &Option<LatencyStats>) -> String {
+    fmt_opt(stats.as_ref().map(|stats| stats.p95_ms))
+}
+
 fn fmt_scalar_mean(stats: &Option<ScalarStats>) -> String {
     fmt_opt(stats.as_ref().map(|stats| stats.mean))
+}
+
+fn fmt_optional_ms(value: Option<f64>) -> String {
+    fmt_opt(value)
+}
+
+fn fmt_group_trace_means(groups: &[FullAttentionGroupTrace]) -> String {
+    if groups.is_empty() {
+        return "n/a".to_owned();
+    }
+    groups
+        .iter()
+        .map(|group| {
+            format!(
+                "g{}:l{}:{:.3}",
+                group.group_index, group.layer_index, group.eval_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn parse_csv(value: &str) -> Vec<String> {
