@@ -3,33 +3,32 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR75 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR76 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
 
-The next high-value goal is native non-profile first-token/full-attention tail
-isolation.
+The next high-value goal is a native first-token warmup policy candidate.
 
 XR72 closed the immediate native diagnostic question: the remaining
 full-attention tail is dominated by MLX full-attention eval, especially chat
 first-token outliers, not host collection, capacity growth, or final sync. XR75
 then falsified the simplest follow-up: serializing deferred full-attention KV
 eval by stable layer group did not beat the current runtime default on the
-3-trial chat follow-up. XR73 accepted the repeatedly strong chat/tool MTP lane
+3-trial chat follow-up. XR76 separated non-profile runtime behavior from
+profile-mode scheduling and showed profiling is not the main source of the
+tail, while a harness-only same-shape warmup probe sharply reduced the chat
+first-token/raw p99 tail. XR73 accepted the repeatedly strong chat/tool MTP lane
 as an explicit scoped opt-in, while rejecting broad default-on because the
 protected aggregate remains below the release gate. XR74 closed the readiness
 sweep for the current local persistent-native default surface. The next useful
-step is therefore not another serial group-eval pass, but a narrower native
-measurement/candidate pass that separates true non-profile runtime behavior
-from profile-mode scheduling and tests warm/JIT/cache behavior around the
-first-token full-attention tail.
+step is therefore a real default-off warmup policy candidate with explicit
+warmup-cost and shape-scope guardrails.
 
 Recommended order:
 
-1. Native non-profile first-token/full-attention tail isolation, with any
-   candidate kept default-off until it beats runtime default without profiling
-   perturbation.
+1. Native first-token warmup policy candidate, default-off until it beats
+   runtime default with warmup cost and shape scope accounted for.
 2. Keep broader MTP promotion parked until protected aggregate speed clears the
    release gate.
 3. Keep DSpark parked until native and MTP gates are cleaner.
@@ -73,6 +72,18 @@ Recommended order:
   `69.655 -> 71.448 ms` (`+2.574%`), regressed p95
   `70.191 -> 72.057 ms`, and improved p99 only
   `163.705 -> 162.719 ms` (`+0.602%`) versus runtime default.
+- XR76 added first-token latency aggregates and two harness variants:
+  `native_decode_runtime_default_profiled` and
+  `native_decode_runtime_default_warmup_probe`. The profile-perturbation run
+  wrote `9/9` correct records and showed profile mode is not the main tail
+  source: first-token p50 moved `216.004 -> 218.580 ms`, and p95/max moved
+  `222.905 -> 229.669 ms` versus non-profile runtime default. The warmup probe
+  wrote `9/9` correct records and accepted as hypothesis evidence only:
+  raw p50 regressed `69.778 -> 70.460 ms` (`+0.977%`), raw p99/max improved
+  `177.571 -> 86.680 ms` (`+51.186%`), and first-token p50 improved
+  `177.571 -> 86.680 ms`. The warmup probe excludes discarded warmup cost from
+  the measured record, so it does not by itself justify a default or production
+  speed claim.
 - Post-XR70 MTP kept exactness and oracle checks, but protected aggregate speedup
   was `+19.845%`, below the `25%` broad default-on gate. Selected chat/tool lanes
   remain attractive at about `+30.784%`.
@@ -93,7 +104,7 @@ Recommended order:
 
 | Area | Files / symbols | Responsibility | Notes |
 |---|---|---|---|
-| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, full-attention KV update capacity, and XR75 group-eval candidates |
+| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, profile-perturbation, warmup-probe, full-attention KV update capacity, and XR75 group-eval candidates |
 | Native profile ABI | `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs` | Carries per-token decode profile fields across C ABI and Rust | Current fields split broad forward, deferred KV eval, full-attention/sliding eval, update/capacity/slice/visible-slice, group eval attribution, and eval sync |
 | Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention eval; XR75 rejected simple serial group scheduling |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker |
@@ -104,25 +115,28 @@ Recommended order:
 
 ## Findings
 
-### high: Non-profile first-token tail isolation is the next value lane
+### high: First-token warmup policy is the next value lane
 
 Evidence: XR72 accepted runtime default against explicit per-layer on all five
 rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
 holdout, memory, and default-overhead gates. XR74 closed the readiness sweep for
 the current local persistent-native default surface. XR75 rejected the simple
 serial group-eval candidate against runtime default on the 3-trial chat
-follow-up. Broad MTP default-on remains below the protected aggregate gate, and
-XR70/XR71 full-attention update candidates remain default-off.
+follow-up. XR76 showed profile-mode perturbation is not the main cause and a
+same-shape warmup probe cut chat first-token p50 `177.571 -> 86.680 ms` while
+raw p99 improved `51.186%`. Broad MTP default-on remains below the protected
+aggregate gate, and XR70/XR71 full-attention update candidates remain
+default-off.
 
 Impact: The fastest remaining route toward the theoretical max is no longer
 another readiness/doc pass or a serial group-eval full matrix. The remaining
-native speed evidence points at first-token/full-attention runtime behavior that
-profile-mode scheduling may perturb.
+native speed evidence points at first-token warm/JIT/cache behavior.
 
-Recommendation: Scope the next native patch around no-profile timing evidence,
-warm/JIT/cache behavior, or lower-level full-attention materialization. Treat
-serial group eval as rejected unless a new kernel-level implementation changes
-the cost model.
+Recommendation: Scope the next native patch around a real default-off warmup
+policy candidate that makes warmup cost explicit, limits shape/context scope,
+and compares against the non-profile runtime-default baseline. Treat profile
+mode and serial group eval as rejected promotion lanes unless new evidence
+changes their cost model.
 
 ### high: Broad MTP default-on is still unsupported
 
@@ -147,8 +161,7 @@ within the documented scope. This is not production internet-facing serving
 readiness and does not promote MTP or default-off experimental native candidates.
 
 Recommendation: Keep rollback flags and accepted/default-off boundaries
-explicit in docs while moving speed work back to the native first-token tail
-lane.
+explicit in docs while moving speed work to the native first-token warmup lane.
 
 ### info: CI workflow removal is already true in this checkout
 
@@ -164,17 +177,18 @@ rewrite old milestone reports.
 
 ## Next work items
 
-### Native non-profile first-token/full-attention tail isolation
+### Native first-token warmup policy candidate
 
-XR72 isolated chat first-token tails to the full-attention eval path, and XR75
-showed serial group scheduling is not enough. The next task should measure the
-actual non-profile runtime path and test warm/JIT/cache hypotheses or a
-lower-level full-attention materialized KV path. Do not spend more time on
-capacity growth, visible-slice overhead, or serial group scheduling without new
-evidence.
+XR76 showed the same-shape warmup hypothesis is live, but the current probe
+excludes warmup cost from the measured record. The next task should implement a
+real default-off policy candidate that can warm relevant decode shapes in a
+controlled way, records the warmup cost, and proves whether the first-token tail
+improvement survives across more than `chat_short_1k_001`. Do not spend more
+time on capacity growth, visible-slice overhead, profile-mode scheduling, or
+serial group scheduling without new evidence.
 
 ## Gaps and unknowns
 
-- Native non-profile first-token timing remains less directly attributed than
-  profile-mode timing because the current profile path splits deferred full
-  attention and sliding eval for attribution.
+- The warmup probe does not yet account for production warmup cost, context
+  shape selection, or whether the first-token tail improvement generalizes
+  beyond `chat_short_1k_001`.

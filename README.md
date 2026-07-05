@@ -150,10 +150,11 @@ Not claimed yet:
 
 The next high-value sequence is:
 
-1. Native non-profile first-token/full-attention tail isolation. XR75 rejected
-   simple serial full-attention group scheduling against the runtime default,
-   so the next native lane should separate true runtime behavior from profiling
-   perturbation and test warm/JIT/cache hypotheses.
+1. Native first-token warmup policy candidate. XR76 showed profile-mode
+   perturbation is not the main tail source and a harness-only same-shape warmup
+   probe cut `chat_short_1k_001` raw p99 from `177.571` to `86.680 ms`; the
+   next step is a real default-off policy that accounts for warmup cost and
+   shape scope.
 2. Broader MTP promotion remains parked until protected aggregate speed clears
    the release threshold. XR73 accepts only explicit scoped chat/tool opt-in.
 

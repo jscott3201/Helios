@@ -117,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     apply_correctness_gates(&mut records);
     let aggregates = build_aggregates(&records);
+    let first_token_aggregates = build_first_token_aggregates(&records);
     let decode_profile = build_decode_profile(&records);
     let comparisons = build_comparisons(&aggregates, &variants);
     let failed_hypotheses = failed_hypotheses(&comparisons, &records);
@@ -174,6 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|record| record.status != "passed")
             .count(),
         aggregates,
+        first_token_aggregates,
         decode_profile,
         comparisons,
         failed_hypotheses,
@@ -353,6 +355,7 @@ struct Summary {
     passed_records: usize,
     failed_records: usize,
     aggregates: Vec<Aggregate>,
+    first_token_aggregates: Vec<FirstTokenAggregate>,
     decode_profile: DecodeProfileSummary,
     comparisons: Vec<Comparison>,
     failed_hypotheses: Vec<String>,
@@ -417,6 +420,7 @@ struct Variant {
     immediate_layer_kv_eval_count: usize,
     grouped_end_kv_eval_count: usize,
     logits_sync_after_decode: bool,
+    warmup_decode_before_measurement: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -689,6 +693,17 @@ struct Aggregate {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct FirstTokenAggregate {
+    variant: String,
+    workload_id: String,
+    sample_count: usize,
+    profile_enabled_count: usize,
+    latency_ms: Option<LatencyStats>,
+    peak_mlx_max_gb: Option<f64>,
+    active_kv_max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Comparison {
     candidate_variant: String,
     baseline_variant: String,
@@ -722,6 +737,19 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
         native_default_variant(
             "native_decode_runtime_default",
             Some("native_decode_eval_per_layer"),
+            0,
+            48,
+        ),
+        native_default_variant_with_extra_env(
+            "native_decode_runtime_default_profiled",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [("GEMMA4D_NATIVE_DECODE_PROFILE", "1")],
+        ),
+        native_default_warmup_variant(
+            "native_decode_runtime_default_warmup_probe",
+            Some("native_decode_runtime_default"),
             0,
             48,
         ),
@@ -889,6 +917,26 @@ fn native_default_variant(
     )
 }
 
+fn native_default_warmup_variant(
+    name: &str,
+    baseline_variant: Option<&str>,
+    immediate_layer_kv_eval_count: usize,
+    grouped_end_kv_eval_count: usize,
+) -> Variant {
+    let mut variant = native_default_variant(
+        name,
+        baseline_variant,
+        immediate_layer_kv_eval_count,
+        grouped_end_kv_eval_count,
+    );
+    variant.config.insert(
+        "warmup_decode_before_measurement".to_owned(),
+        "true".to_owned(),
+    );
+    variant.warmup_decode_before_measurement = true;
+    variant
+}
+
 fn native_default_variant_with_extra_env<const N: usize>(
     name: &str,
     baseline_variant: Option<&str>,
@@ -923,6 +971,7 @@ fn native_default_variant_with_extra_env<const N: usize>(
         immediate_layer_kv_eval_count,
         grouped_end_kv_eval_count,
         logits_sync_after_decode: true,
+        warmup_decode_before_measurement: false,
     }
 }
 
@@ -965,6 +1014,7 @@ fn native_variant_with_extra_env<const N: usize>(
         immediate_layer_kv_eval_count,
         grouped_end_kv_eval_count,
         logits_sync_after_decode: true,
+        warmup_decode_before_measurement: false,
     }
 }
 
@@ -1048,6 +1098,22 @@ fn run_decode_record(
     model_load: Duration,
     target: &Target,
 ) -> Result<Record, Box<dyn std::error::Error>> {
+    if variant.warmup_decode_before_measurement
+        && let Err(error) = warmup_decode_once(target, &workload.token_ids)
+    {
+        return Ok(failed_record(
+            run_id,
+            git_sha,
+            git_status_short,
+            command,
+            _model_identity,
+            variant,
+            trial_index,
+            workload,
+            model_load,
+            format!("warmup decode failed: {error}"),
+        ));
+    }
     let total_started = Instant::now();
     let mut cache = KvCache::create(&KvPolicy::default())?;
     let prefill_started = Instant::now();
@@ -1195,6 +1261,16 @@ fn run_decode_record(
         correctness: Correctness::pending(),
         notes,
     })
+}
+
+fn warmup_decode_once(
+    target: &Target,
+    token_ids: &[i32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cache = KvCache::create(&KvPolicy::default())?;
+    let step = prefill(target, &mut cache, token_ids)?;
+    decode_one(target, &mut cache, step.greedy_token)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1463,6 +1539,47 @@ fn build_aggregates(records: &[Record]) -> Vec<Aggregate> {
                 .unwrap_or(false),
             low_n: passed.len() < 3,
             records: group,
+        });
+    }
+    out
+}
+
+fn build_first_token_aggregates(records: &[Record]) -> Vec<FirstTokenAggregate> {
+    let keys = records
+        .iter()
+        .map(|record| (record.variant.clone(), record.workload_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+    for (variant, workload_id) in keys {
+        let first_traces = records
+            .iter()
+            .filter(|record| {
+                record.status == "passed"
+                    && record.variant == variant
+                    && record.workload_id == workload_id
+            })
+            .filter_map(|record| record.decode_token_traces.first())
+            .collect::<Vec<_>>();
+        let latencies = first_traces
+            .iter()
+            .map(|trace| trace.latency_ms)
+            .collect::<Vec<_>>();
+        let peaks = first_traces
+            .iter()
+            .map(|trace| trace.peak_mlx_gb)
+            .collect::<Vec<_>>();
+        let active_kv_max_bytes = first_traces.iter().map(|trace| trace.active_kv_bytes).max();
+        out.push(FirstTokenAggregate {
+            variant,
+            workload_id,
+            sample_count: first_traces.len(),
+            profile_enabled_count: first_traces
+                .iter()
+                .filter(|trace| trace.decode_profile.is_some())
+                .count(),
+            latency_ms: latency_stats(&latencies),
+            peak_mlx_max_gb: max_value(&peaks),
+            active_kv_max_bytes,
         });
     }
     out
@@ -2438,6 +2555,28 @@ fn render_report(summary: &Summary) -> String {
             comparison.reason
         ));
     }
+
+    out.push_str("\n## First-Token Latency\n\n");
+    out.push_str("| Workload | Variant | Samples | Profiled | p50 | p95 | p99 | Max | Peak MLX GB | Active KV Bytes |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    for aggregate in &summary.first_token_aggregates {
+        out.push_str(&format!(
+            "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            aggregate.workload_id,
+            aggregate.variant,
+            aggregate.sample_count,
+            aggregate.profile_enabled_count,
+            fmt_stats_p50(&aggregate.latency_ms),
+            fmt_stats_p95(&aggregate.latency_ms),
+            fmt_stats_p99(&aggregate.latency_ms),
+            fmt_stats_max(&aggregate.latency_ms),
+            fmt_opt(aggregate.peak_mlx_max_gb),
+            aggregate
+                .active_kv_max_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_owned())
+        ));
+    }
     out
 }
 
@@ -2829,8 +2968,20 @@ fn fmt_stats_mean(stats: &Option<LatencyStats>) -> String {
     fmt_opt(stats.as_ref().map(|stats| stats.mean_ms))
 }
 
+fn fmt_stats_p50(stats: &Option<LatencyStats>) -> String {
+    fmt_opt(stats.as_ref().map(|stats| stats.p50_ms))
+}
+
 fn fmt_stats_p95(stats: &Option<LatencyStats>) -> String {
     fmt_opt(stats.as_ref().map(|stats| stats.p95_ms))
+}
+
+fn fmt_stats_p99(stats: &Option<LatencyStats>) -> String {
+    fmt_opt(stats.as_ref().map(|stats| stats.p99_ms))
+}
+
+fn fmt_stats_max(stats: &Option<LatencyStats>) -> String {
+    fmt_opt(stats.as_ref().map(|stats| stats.max_ms))
 }
 
 fn fmt_scalar_mean(stats: &Option<ScalarStats>) -> String {
