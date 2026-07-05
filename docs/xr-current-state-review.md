@@ -3,14 +3,15 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR79 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR81 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
 
-XR79 confirms the next high-value work is MTP protected-aggregate gap closure
-or productizing the accepted scoped chat/tool MTP opt-in, depending on whether
-the priority is broad theoretical max or shippable scoped value.
+XR81 converts the MTP protected-aggregate miss into a concrete runtime target:
+the first verifier-forward pass on selected chat/tool MTP rows. Productizing
+the accepted scoped chat/tool MTP opt-in remains the parallel shippable-value
+track.
 
 XR72 closed the immediate native diagnostic question: the remaining
 full-attention tail is dominated by MLX full-attention eval, especially chat
@@ -31,16 +32,18 @@ rejecting broad default-on because the protected aggregate remained below the
 release gate. XR79 reran that protected aggregate with the XR78 native warmup
 claim boundaries attached: scoped gates still pass, but protected speed is only
 `+19.482%`, so broad default-on is still parked behind the `25%` protected
-aggregate gate. XR74 closed the readiness sweep for the current local
-persistent-native default surface.
+aggregate gate. XR81 then attributed the gap: selected MTP decode phase is
+dominated by verifier forward time, and first verifier-pass excess is large
+enough on paper to cover the current protected aggregate gap. XR74 closed the
+readiness sweep for the current local persistent-native default surface.
 
 Recommended order:
 
-1. Productize the accepted scoped chat/tool MTP opt-in if the priority is
+1. If the priority is broad theoretical max, build a scoped runtime candidate
+   that isolates and reduces the first MTP verifier-forward pass while
+   preserving exactness, oracle, holdout, memory, and default-overhead gates.
+2. Productize the accepted scoped chat/tool MTP opt-in if the priority is
    shippable value.
-2. If the priority is broad theoretical max, attack the MTP protected aggregate
-   gap directly by reducing draft/verify overhead while preserving exactness,
-   oracle, holdout, memory, and default-overhead gates.
 3. Keep native warmup as out-of-request/load-time shape work unless a later
    server policy proves amortization without user-visible cost.
 4. Keep DSpark parked until native and MTP gates are cleaner.
@@ -134,6 +137,15 @@ Recommended order:
   aggregate improved `7479.958 -> 6022.716 ms` (`+19.482%`), still below the
   `25%` broad default-on gate; selected chat/tool lanes alone improved
   `+29.237%`.
+- XR81 attributed the XR79 protected aggregate miss without changing runtime
+  behavior. The broad gate target is `5609.968 ms`, leaving a `412.747 ms` gap.
+  If the protected bypass remains unchanged, selected chat/tool MTP must move
+  from `3527.062 -> 3114.315 ms`, requiring selected-lane speedup of
+  `+37.518%`. Selected MTP decode phase is dominated by verifier-forward cost:
+  `verify_forward_ms=3027.162 ms` (`85.827%` of selected phase), versus
+  `draft_ms=344.459 ms` and `repair_fallback_ms=144.962 ms`. First
+  verifier-pass excess versus later-pass p50 is `497.460 ms`, or `1.205x` the
+  current gate gap.
 - XR74 added backend/native-prefill policy visibility to `/health` and the TUI
   dashboard, with tests covering `backend`, `max_context_tokens`, and native
   prefill policy state. Static gates passed: `cargo fmt --all --check`,
@@ -150,13 +162,13 @@ Recommended order:
 | Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention eval; XR75 rejected simple serial group scheduling |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker |
 | Runtime sync point | `native/gemma4_mlx/src/native_model.cc::decode_one` | Runs logits, greedy selection, and final `mlx::core::eval({greedy, max_logit})` | XR72 showed chat outliers are not primarily final eval sync tails |
-| MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py`, `scripts/xr73_scoped_mtp_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, default-overhead, aggregate gates, and optional native warmup context | XR79 accepts scoped chat/tool evidence again; broad default remains unsupported |
+| MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py`, `scripts/xr73_scoped_mtp_report.py`, `scripts/xr81_mtp_overhead_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, default-overhead, aggregate gates, optional native warmup context, and XR81 overhead attribution | XR79 accepts scoped chat/tool evidence again; XR81 points broad-default work at first verifier-forward pass overhead |
 | Server default/readiness | `crates/gemma4d-server/src/lib.rs`, `crates/gemma4d-server/src/http.rs`, `crates/gemma4d-bench/examples/xr11_persistent_native_server_ab.rs` | Selects persistent-native for `serve --model-path`, applies long-context native prefill default, exposes admission/default state, and runs sentinels | XR74 ready for local persistent-native default surface; explicit rollback flags remain available |
 | Operator visibility | `crates/gemma4d-tui/src/{app,provider,ui}.rs`, `crates/gemma4d-tui/tests/m05_acceptance.rs` | Surfaces backend, context, native prefill policy, MTP, cache, adapter, and live metrics state through provider-backed pages | XR74 added dashboard backend/native-prefill visibility |
 
 ## Findings
 
-### high: XR79 leaves broad MTP default-on gated by protected speed
+### high: XR81 narrows broad MTP default-on to verifier-forward overhead
 
 Evidence: XR72 accepted runtime default against explicit per-layer on all five
 rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
@@ -173,33 +185,40 @@ raw p99 improved `76.155%`, first-token p50 moved `387.059 -> 92.292 ms`, and
 the 4K code workload did not reproduce a tail. XR79 then reran the protected
 MTP aggregate with those native warmup boundaries attached: scoped gates passed,
 default overhead was clean, oracle/holdouts passed, selected chat/tool lanes
-improved `+29.237%`, but protected aggregate speed was only `+19.482%`.
+improved `+29.237%`, but protected aggregate speed was only `+19.482%`. XR81
+then showed the miss is a `412.747 ms` gap to the `25%` gate. Selected
+chat/tool MTP would need to move `3527.062 -> 3114.315 ms`; verifier forward is
+`3027.162 ms` of selected phase, and first verifier-pass excess is
+`497.460 ms`.
 
 Impact: The fastest remaining route toward the theoretical max is no longer
 another readiness/doc pass or a serial group-eval full matrix. The remaining
 native speed evidence points at first-token warm/JIT/cache behavior, but the
-cost model rules out naive request-path warmup. The next broad-default blocker
-is now MTP protected aggregate speed, not native-tail evidence.
+cost model rules out naive request-path warmup. XR81 links that native-tail
+shape to MTP: the next broad-default blocker is specifically verifier-forward
+first-pass cost, not general acceptance rate or generic repair overhead.
 
 Recommendation: Keep native warmup as default-off out-of-request/load-time
-shape work. For theoretical max, directly reduce MTP draft/verify overhead while
-preserving exactness, oracle, holdout, memory, and default-overhead gates.
-Treat profile mode and serial group eval as rejected promotion lanes unless new
-evidence changes their cost model.
+shape work. For theoretical max, build a scoped runtime candidate around first
+verifier-forward pass isolation while preserving exactness, oracle, holdout,
+memory, and default-overhead gates. Treat profile mode and serial group eval as
+rejected promotion lanes unless new evidence changes their cost model.
 
 ### high: Broad MTP default-on is still unsupported
 
 Evidence: XR66 selected chat/tool lanes were `+31.033%`, XR70 selected lanes
 were `+30.784%`, XR73 selected lanes were `+28.820%`, and XR79 selected lanes
 were `+29.237%`; however, protected aggregate speed stayed below the `25%`
-broad gate, with XR79 at `+19.482%`.
+broad gate, with XR79 at `+19.482%`. XR81 identifies the required selected-lane
+target as `+37.518%` if the protected bypass remains unchanged.
 
 Impact: MTP is useful, but only for scoped workloads. Turning it on broadly
 would promote a narrower result than the evidence supports.
 
 Recommendation: Keep MTP explicit/scoped/default-off. Productize the scoped
 chat/tool opt-in if near-term value matters; broader promotion should wait for
-protected aggregate evidence above the release gate.
+protected aggregate evidence above the release gate and a rerun of exactness,
+oracle, default-overhead, holdout, and memory gates.
 
 ### medium: Native default-readiness is complete for the local default surface
 
@@ -239,15 +258,17 @@ MTP default-off.
 
 ### MTP protected aggregate gap
 
-For broad theoretical max, the next research task is to reduce draft/verify
-overhead enough that the protected aggregate clears `25%` without weakening the
-`mtp_candidate_1k_001` and 4K holdout protections. Selected-lane evidence alone
-is not sufficient for broad default-on.
+For broad theoretical max, the next runtime task is a scoped verifier-forward
+candidate: isolate why the first MTP verifier pass is much slower than later
+passes, then reduce that cost enough for the protected aggregate to clear `25%`
+without weakening the `mtp_candidate_1k_001` and 4K holdout protections.
+Selected-lane evidence alone is not sufficient for broad default-on.
 
 ## Gaps and unknowns
 
 - XR78 proves warm-state lifetime only within the same loaded target and
   same-shape fresh-cache benchmark path; a production server warmup policy
   would still need separate admission, scheduling, and observability work.
-- XR79 proves current scoped MTP gates, but it does not identify which specific
-  draft/verify cost component must move to clear the protected aggregate gate.
+- XR81 identifies first verifier-forward pass cost as the next target, but it
+  has not yet tested a runtime candidate or rerun exactness, oracle,
+  default-overhead, holdout, and memory gates after such a change.
