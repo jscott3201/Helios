@@ -3,12 +3,14 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR78 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR79 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
 
-The next high-value goal is a warmup-aware MTP protected aggregate rerun.
+XR79 confirms the next high-value work is MTP protected-aggregate gap closure
+or productizing the accepted scoped chat/tool MTP opt-in, depending on whether
+the priority is broad theoretical max or shippable scoped value.
 
 XR72 closed the immediate native diagnostic question: the remaining
 full-attention tail is dominated by MLX full-attention eval, especially chat
@@ -25,19 +27,23 @@ XR78 then showed the warm state survives repeated same-loaded-target,
 fresh-cache requests for the chat tail lane, while the 4K code workload did not
 reproduce the tail and gained no meaningful warmup benefit. XR73 accepted the
 repeatedly strong chat/tool MTP lane as an explicit scoped opt-in, while
-rejecting broad default-on because the protected aggregate remains below the
-release gate. XR74 closed the readiness sweep for the current local
-persistent-native default surface. The next useful step is therefore a
-warmup-aware protected MTP aggregate rerun, with broad MTP default-on still
-parked behind the protected aggregate gate.
+rejecting broad default-on because the protected aggregate remained below the
+release gate. XR79 reran that protected aggregate with the XR78 native warmup
+claim boundaries attached: scoped gates still pass, but protected speed is only
+`+19.482%`, so broad default-on is still parked behind the `25%` protected
+aggregate gate. XR74 closed the readiness sweep for the current local
+persistent-native default surface.
 
 Recommended order:
 
-1. Warmup-aware MTP protected aggregate rerun using the accepted scoped
-   chat/tool opt-in and the current native-tail claim boundaries.
-2. Keep native warmup as out-of-request/load-time shape work unless a later
+1. Productize the accepted scoped chat/tool MTP opt-in if the priority is
+   shippable value.
+2. If the priority is broad theoretical max, attack the MTP protected aggregate
+   gap directly by reducing draft/verify overhead while preserving exactness,
+   oracle, holdout, memory, and default-overhead gates.
+3. Keep native warmup as out-of-request/load-time shape work unless a later
    server policy proves amortization without user-visible cost.
-3. Keep DSpark parked until native and MTP gates are cleaner.
+4. Keep DSpark parked until native and MTP gates are cleaner.
 
 ## Evidence summary
 
@@ -121,6 +127,13 @@ Recommended order:
   Protected aggregate improved `7523.808 -> 6076.627 ms` (`+19.235%`), below
   the `25%` broad default-on gate; selected chat/tool lanes alone improved
   `+28.820%`.
+- XR79 reran the protected MTP aggregate with XR78 native warmup context and
+  preserved the same safety posture: candidate `12/12` exact, oracle `9/9`,
+  default-disabled overhead `12/12`, 4K holdout `12/12`, default overhead
+  `-0.000%`, peak MLX `8.008 GB`, and all scoped gates passed. Protected
+  aggregate improved `7479.958 -> 6022.716 ms` (`+19.482%`), still below the
+  `25%` broad default-on gate; selected chat/tool lanes alone improved
+  `+29.237%`.
 - XR74 added backend/native-prefill policy visibility to `/health` and the TUI
   dashboard, with tests covering `backend`, `max_context_tokens`, and native
   prefill policy state. Static gates passed: `cargo fmt --all --check`,
@@ -137,13 +150,13 @@ Recommended order:
 | Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention eval; XR75 rejected simple serial group scheduling |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker |
 | Runtime sync point | `native/gemma4_mlx/src/native_model.cc::decode_one` | Runs logits, greedy selection, and final `mlx::core::eval({greedy, max_logit})` | XR72 showed chat outliers are not primarily final eval sync tails |
-| MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py`, `scripts/xr73_scoped_mtp_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, default-overhead, and aggregate gates | XR73 accepts only explicit scoped chat/tool opt-in; broad default remains unsupported |
+| MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py`, `scripts/xr73_scoped_mtp_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, default-overhead, aggregate gates, and optional native warmup context | XR79 accepts scoped chat/tool evidence again; broad default remains unsupported |
 | Server default/readiness | `crates/gemma4d-server/src/lib.rs`, `crates/gemma4d-server/src/http.rs`, `crates/gemma4d-bench/examples/xr11_persistent_native_server_ab.rs` | Selects persistent-native for `serve --model-path`, applies long-context native prefill default, exposes admission/default state, and runs sentinels | XR74 ready for local persistent-native default surface; explicit rollback flags remain available |
 | Operator visibility | `crates/gemma4d-tui/src/{app,provider,ui}.rs`, `crates/gemma4d-tui/tests/m05_acceptance.rs` | Surfaces backend, context, native prefill policy, MTP, cache, adapter, and live metrics state through provider-backed pages | XR74 added dashboard backend/native-prefill visibility |
 
 ## Findings
 
-### high: Native tail is clean enough to rerun protected MTP
+### high: XR79 leaves broad MTP default-on gated by protected speed
 
 Evidence: XR72 accepted runtime default against explicit per-layer on all five
 rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
@@ -157,31 +170,36 @@ first-token p50 moved `188.836 -> 92.922 ms` and raw p99 improved `50.792%`,
 but discarded warmup total p50 was `3203.529 ms`. XR78 showed repeated
 same-loaded-target fresh-cache chat requests keep that first-token tail benefit:
 raw p99 improved `76.155%`, first-token p50 moved `387.059 -> 92.292 ms`, and
-the 4K code workload did not reproduce a tail. Broad MTP default-on remains
-below the protected aggregate gate, and XR70/XR71 full-attention update
-candidates remain default-off.
+the 4K code workload did not reproduce a tail. XR79 then reran the protected
+MTP aggregate with those native warmup boundaries attached: scoped gates passed,
+default overhead was clean, oracle/holdouts passed, selected chat/tool lanes
+improved `+29.237%`, but protected aggregate speed was only `+19.482%`.
 
 Impact: The fastest remaining route toward the theoretical max is no longer
 another readiness/doc pass or a serial group-eval full matrix. The remaining
 native speed evidence points at first-token warm/JIT/cache behavior, but the
-cost model rules out naive request-path warmup.
+cost model rules out naive request-path warmup. The next broad-default blocker
+is now MTP protected aggregate speed, not native-tail evidence.
 
 Recommendation: Keep native warmup as default-off out-of-request/load-time
-shape work and move the next optimization pass to MTP protected aggregate
-reruns. Treat profile mode and serial group eval as rejected promotion lanes
-unless new evidence changes their cost model.
+shape work. For theoretical max, directly reduce MTP draft/verify overhead while
+preserving exactness, oracle, holdout, memory, and default-overhead gates.
+Treat profile mode and serial group eval as rejected promotion lanes unless new
+evidence changes their cost model.
 
 ### high: Broad MTP default-on is still unsupported
 
 Evidence: XR66 selected chat/tool lanes were `+31.033%`, XR70 selected lanes
-were `+30.784%`, and XR73 selected lanes were `+28.820%`; however, protected
-aggregate speed stayed below the `25%` broad gate, with XR73 at `+19.235%`.
+were `+30.784%`, XR73 selected lanes were `+28.820%`, and XR79 selected lanes
+were `+29.237%`; however, protected aggregate speed stayed below the `25%`
+broad gate, with XR79 at `+19.482%`.
 
 Impact: MTP is useful, but only for scoped workloads. Turning it on broadly
 would promote a narrower result than the evidence supports.
 
-Recommendation: Keep MTP explicit/scoped/default-off. Broader promotion should
-wait for protected aggregate evidence above the release gate.
+Recommendation: Keep MTP explicit/scoped/default-off. Productize the scoped
+chat/tool opt-in if near-term value matters; broader promotion should wait for
+protected aggregate evidence above the release gate.
 
 ### medium: Native default-readiness is complete for the local default surface
 
@@ -194,7 +212,8 @@ within the documented scope. This is not production internet-facing serving
 readiness and does not promote MTP or default-off experimental native candidates.
 
 Recommendation: Keep rollback flags and accepted/default-off boundaries
-explicit in docs while moving speed work to the MTP protected aggregate lane.
+explicit in docs while moving speed work to scoped MTP productization or the
+MTP protected aggregate gap.
 
 ### info: CI workflow removal is already true in this checkout
 
@@ -210,17 +229,25 @@ rewrite old milestone reports.
 
 ## Next work items
 
-### Warmup-aware MTP protected aggregate
+### Scoped MTP opt-in productization
 
-XR78 showed same-loaded-target warm state survives repeated fresh-cache chat
-requests and that the tested 4K workload does not need warmup. The next task
-should rerun the protected MTP aggregate with explicit accounting for the native
-tail/warmup claim boundaries: scoped chat/tool opt-in may remain accepted, but
-broad default-on still requires protected aggregate speed above the release
-gate with exactness, oracle, holdout, memory, and default-overhead checks.
+The accepted XR73/XR79 chat/tool lane is repeatedly exact, oracle-clean,
+holdout-protected, default-overhead-clean, and roughly `+29%` on selected lanes.
+The next shippable-value task is to expose it as an explicit local opt-in with
+clear workload/request gating, observability, and rollback, while keeping broad
+MTP default-off.
+
+### MTP protected aggregate gap
+
+For broad theoretical max, the next research task is to reduce draft/verify
+overhead enough that the protected aggregate clears `25%` without weakening the
+`mtp_candidate_1k_001` and 4K holdout protections. Selected-lane evidence alone
+is not sufficient for broad default-on.
 
 ## Gaps and unknowns
 
 - XR78 proves warm-state lifetime only within the same loaded target and
   same-shape fresh-cache benchmark path; a production server warmup policy
   would still need separate admission, scheduling, and observability work.
+- XR79 proves current scoped MTP gates, but it does not identify which specific
+  draft/verify cost component must move to clear the protected aggregate gate.

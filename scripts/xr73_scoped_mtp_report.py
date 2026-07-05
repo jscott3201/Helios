@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the XR73 scoped MTP opt-in decision artifact."""
+"""Build a scoped MTP opt-in decision artifact."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 
 
 POLICY_NAME = "adaptive_policy_xr61-real-margin-v1"
+WARMUP_AMORTIZED_VARIANT = "native_decode_runtime_default_warmup_amortized_4"
 DEFAULT_SELECTED_WORKLOADS = ("chat_short_1k_001", "tool_json_1k_001")
 DEFAULT_PROTECTED_WORKLOADS = ("mtp_candidate_1k_001",)
 
@@ -291,11 +292,125 @@ def run_overview(label: str, summary: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def native_warmup_context(
+    summary: dict[str, Any] | None,
+    *,
+    summary_path: str | None,
+    report_path: str | None,
+    label: str,
+) -> dict[str, Any]:
+    if summary is None:
+        return {
+            "present": False,
+            "label": label,
+            "summary_path": summary_path,
+            "report_path": report_path,
+            "reason": "native warmup summary not provided",
+        }
+
+    comparisons = []
+    for comparison in summary.get("comparisons") or []:
+        if comparison.get("candidate_variant") != WARMUP_AMORTIZED_VARIANT:
+            continue
+        comparisons.append(
+            {
+                "workload_id": comparison.get("workload_id"),
+                "candidate_variant": comparison.get("candidate_variant"),
+                "baseline_variant": comparison.get("baseline_variant"),
+                "baseline_tail_reproduced": bool(comparison.get("baseline_tail_reproduced")),
+                "correctness_passed": bool(comparison.get("correctness_passed")),
+                "candidate_trials": int(comparison.get("candidate_trials") or 0),
+                "baseline_trials": int(comparison.get("baseline_trials") or 0),
+                "raw_p50_regression_percent": float(
+                    comparison.get("raw_p50_regression_percent") or 0.0
+                ),
+                "raw_p95_improvement_percent": float(
+                    comparison.get("raw_p95_improvement_percent") or 0.0
+                ),
+                "raw_p99_improvement_percent": float(
+                    comparison.get("raw_p99_improvement_percent") or 0.0
+                ),
+                "steady_p50_regression_percent": float(
+                    comparison.get("steady_p50_regression_percent") or 0.0
+                ),
+                "peak_mlx_delta_percent": float(comparison.get("peak_mlx_delta_percent") or 0.0),
+                "memory_gate_passed": bool(comparison.get("memory_gate_passed")),
+                "accepted": bool(comparison.get("accepted")),
+                "reason": comparison.get("reason"),
+            }
+        )
+
+    costs = []
+    for cost in summary.get("warmup_cost_aggregates") or []:
+        if cost.get("variant") != WARMUP_AMORTIZED_VARIANT:
+            continue
+        total = cost.get("total_ms") or {}
+        amortized_total = cost.get("amortized_total_ms") or {}
+        costs.append(
+            {
+                "workload_id": cost.get("workload_id"),
+                "warmup_event_count": int(cost.get("warmup_event_count") or 0),
+                "measured_request_count": int(cost.get("measured_request_count") or 0),
+                "context_tokens_p50": float((cost.get("context_tokens") or {}).get("p50") or 0.0),
+                "warmup_total_p50_ms": float(total.get("p50_ms") or 0.0),
+                "warmup_total_p95_ms": float(total.get("p95_ms") or 0.0),
+                "amortized_total_p50_ms": float(amortized_total.get("p50_ms") or 0.0),
+                "amortized_total_p95_ms": float(amortized_total.get("p95_ms") or 0.0),
+            }
+        )
+
+    first_tokens = []
+    for row in summary.get("first_token_aggregates") or []:
+        if row.get("variant") not in ("native_decode_runtime_default", WARMUP_AMORTIZED_VARIANT):
+            continue
+        latency = row.get("latency_ms") or {}
+        first_tokens.append(
+            {
+                "variant": row.get("variant"),
+                "workload_id": row.get("workload_id"),
+                "sample_count": int(row.get("sample_count") or 0),
+                "p50_ms": float(latency.get("p50_ms") or 0.0),
+                "p95_ms": float(latency.get("p95_ms") or 0.0),
+                "p99_ms": float(latency.get("p99_ms") or 0.0),
+                "max_ms": float(latency.get("max_ms") or 0.0),
+            }
+        )
+
+    return {
+        "present": True,
+        "label": label,
+        "decision": summary.get("decision"),
+        "status": summary.get("status"),
+        "run_id": summary.get("run_id"),
+        "git_sha": summary.get("git_sha"),
+        "git_status_short": summary.get("git_status_short"),
+        "summary_path": summary_path or summary.get("summary_path"),
+        "report_path": report_path or summary.get("report_path"),
+        "record_count": summary.get("record_count"),
+        "passed_records": summary.get("passed_records"),
+        "failed_records": summary.get("failed_records"),
+        "blockers": list(summary.get("blockers") or []),
+        "comparisons": comparisons,
+        "warmup_costs": costs,
+        "first_token_aggregates": first_tokens,
+        "claim_boundaries": [
+            "Native warmup evidence is out-of-request/load-time shape work only.",
+            "XR78 does not prove a request-path warmup policy.",
+            "Broad MTP default-on still depends on protected aggregate gates.",
+        ],
+    }
+
+
 def build_result(args: argparse.Namespace) -> dict[str, Any]:
     candidate_summary = load_json(Path(args.candidate_summary))
     oracle_summary = load_json(Path(args.oracle_summary))
     default_summary = load_json(Path(args.default_overhead_summary))
     holdout_summary = load_json(Path(args.holdout_summary), required=False) if args.holdout_summary else None
+    native_warmup_summary = (
+        load_json(Path(args.native_warmup_summary), required=False)
+        if args.native_warmup_summary
+        else None
+    )
 
     candidate_policy = policy_summary(candidate_summary)
     selected_ids = selected_workload_ids(candidate_policy)
@@ -359,7 +474,8 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "schema_version": 1,
-        "goal": "XR73-scoped-mtp-chat-tool-opt-in",
+        "goal": args.goal,
+        "title": args.title,
         "decision": decision,
         "scoped_gates_passed": scoped_gates_passed,
         "broad_default_supported": broad_default_supported,
@@ -385,6 +501,12 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
         "four_k_holdouts": holdout,
         "oracle": oracle,
         "default_overhead": overhead,
+        "native_warmup_context": native_warmup_context(
+            native_warmup_summary,
+            summary_path=args.native_warmup_summary,
+            report_path=args.native_warmup_report,
+            label=args.native_warmup_label,
+        ),
         "scoped_gates": gates,
         "broad_default_gates": broad_default_gates,
         "blockers": blockers,
@@ -393,6 +515,8 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
             "oracle_summary": args.oracle_summary,
             "default_overhead_summary": args.default_overhead_summary,
             "holdout_summary": args.holdout_summary,
+            "native_warmup_summary": args.native_warmup_summary,
+            "native_warmup_report": args.native_warmup_report,
         },
     }
 
@@ -403,7 +527,7 @@ def fmt(value: float) -> str:
 
 def render_markdown(result: dict[str, Any]) -> str:
     lines = [
-        "# XR73 Scoped MTP Chat/Tool Opt-in",
+        f"# {result['title']}",
         "",
         f"- Decision: `{result['decision']}`",
         f"- Scoped gates passed: `{result['scoped_gates_passed']}`",
@@ -455,6 +579,60 @@ def render_markdown(result: dict[str, Any]) -> str:
             "",
             f"Selected-lane aggregate speedup: `{fmt(result['selected_lane_aggregate']['aggregate_speedup_percent'])}%`",
             f"Selected-lane weighted acceptance: `{fmt(result['selected_lane_aggregate']['weighted_acceptance_rate'])}`",
+        ]
+    )
+    native_warmup = result.get("native_warmup_context") or {}
+    if native_warmup.get("present"):
+        lines.extend(
+            [
+                "",
+                "## Native Tail / Warmup Context",
+                "",
+                f"- Label: `{native_warmup['label']}`",
+                f"- Decision: `{native_warmup.get('decision')}`",
+                f"- Status: `{native_warmup.get('status')}`",
+                f"- Records: `{native_warmup.get('passed_records')}/{native_warmup.get('record_count')}`",
+                f"- Summary: `{native_warmup.get('summary_path')}`",
+                f"- Report: `{native_warmup.get('report_path')}`",
+                "",
+                "| Workload | Accepted | Baseline tail | p50 regression % | p95 improvement % | p99 improvement % | Reason |",
+                "|---|---:|---:|---:|---:|---:|---|",
+            ]
+        )
+        for comparison in native_warmup["comparisons"]:
+            lines.append(
+                "| `{workload_id}` | `{accepted}` | `{baseline_tail}` | {p50} | {p95} | {p99} | {reason} |".format(
+                    workload_id=comparison["workload_id"],
+                    accepted=comparison["accepted"],
+                    baseline_tail=comparison["baseline_tail_reproduced"],
+                    p50=fmt(comparison["raw_p50_regression_percent"]),
+                    p95=fmt(comparison["raw_p95_improvement_percent"]),
+                    p99=fmt(comparison["raw_p99_improvement_percent"]),
+                    reason=comparison["reason"],
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "| Workload | Warmup events | Measured requests | Context tokens p50 | Warmup total p50 ms | Amortized total p50 ms |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for cost in native_warmup["warmup_costs"]:
+            lines.append(
+                "| `{workload_id}` | {events} | {requests} | {context} | {warmup} | {amortized} |".format(
+                    workload_id=cost["workload_id"],
+                    events=cost["warmup_event_count"],
+                    requests=cost["measured_request_count"],
+                    context=fmt(cost["context_tokens_p50"]),
+                    warmup=fmt(cost["warmup_total_p50_ms"]),
+                    amortized=fmt(cost["amortized_total_p50_ms"]),
+                )
+            )
+        lines.extend(["", "Claim boundaries:"])
+        lines.extend(f"- {boundary}" for boundary in native_warmup["claim_boundaries"])
+    lines.extend(
+        [
             "",
             "## Default-Overhead Probe",
             "",
@@ -502,6 +680,11 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--out-md", default="xr73-scoped-mtp-summary.md")
     parser.add_argument("--out-json", default="xr73-scoped-mtp-summary.json")
+    parser.add_argument("--title", default="XR73 Scoped MTP Chat/Tool Opt-in")
+    parser.add_argument("--goal", default="XR73-scoped-mtp-chat-tool-opt-in")
+    parser.add_argument("--native-warmup-summary")
+    parser.add_argument("--native-warmup-report")
+    parser.add_argument("--native-warmup-label", default="XR78 native amortized warmup")
     parser.add_argument("--protected-workload", action="append", default=list(DEFAULT_PROTECTED_WORKLOADS))
     parser.add_argument(
         "--holdout-workload",
