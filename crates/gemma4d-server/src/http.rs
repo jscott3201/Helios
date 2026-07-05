@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     GenerateOptions, GenerateSummary, NativeServerDefaultPrefillChunkPolicySelection,
-    ResidentTarget, detokenize_tokens, generate,
+    PrefixWarmupSummary, ResidentTarget, detokenize_tokens, generate,
 };
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
@@ -193,6 +193,9 @@ pub struct ServerMetrics {
     pub model_load_count: u64,
     pub resident_model_loaded: u64,
     pub persistent_worker_requests_total: u64,
+    pub prefix_warmups_total: u64,
+    pub prefix_warmup_tokens_total: u64,
+    pub prefix_warmup_seconds: f64,
     pub prefill_tokens_total: u64,
     pub decode_tokens_total: u64,
     pub prefill_seconds: f64,
@@ -214,6 +217,7 @@ struct PersistentNativeState {
     errors_total: u64,
     last_error: Option<String>,
     native_prefill_policy: NativePrefillPolicyState,
+    native_prefix_warm_policy: NativePrefixWarmPolicyState,
 }
 
 impl PersistentNativeState {
@@ -227,6 +231,7 @@ impl PersistentNativeState {
             errors_total: 0,
             last_error: None,
             native_prefill_policy: NativePrefillPolicyState::pending(),
+            native_prefix_warm_policy: NativePrefixWarmPolicyState::idle(),
         }
     }
 }
@@ -281,16 +286,115 @@ impl NativePrefillPolicyState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct NativePrefixWarmPolicyState {
+    status: String,
+    policy: Option<String>,
+    reason: String,
+    requested_prefix_tokens: Option<usize>,
+    prompt_tokens: Option<usize>,
+    warmup_context_tokens: Option<usize>,
+    tokenize_ms: Option<f64>,
+    prefill_ms: Option<f64>,
+    decode_ms: Option<f64>,
+    total_ms: Option<f64>,
+    peak_memory_gb: Option<f32>,
+    active_kv_bytes: Option<u64>,
+    warmups_total: u64,
+    errors_total: u64,
+    last_error: Option<String>,
+}
+
+impl NativePrefixWarmPolicyState {
+    fn idle() -> Self {
+        Self {
+            status: "idle".to_owned(),
+            policy: None,
+            reason: "no prefix warmup requested".to_owned(),
+            requested_prefix_tokens: None,
+            prompt_tokens: None,
+            warmup_context_tokens: None,
+            tokenize_ms: None,
+            prefill_ms: None,
+            decode_ms: None,
+            total_ms: None,
+            peak_memory_gb: None,
+            active_kv_bytes: None,
+            warmups_total: 0,
+            errors_total: 0,
+            last_error: None,
+        }
+    }
+
+    fn mark_warming(&mut self, requested_prefix_tokens: usize) {
+        self.status = "warming".to_owned();
+        self.policy = Some(prefix_warm_policy_name(requested_prefix_tokens));
+        self.reason = "server-owned prefix warmup is running off request path".to_owned();
+        self.requested_prefix_tokens = Some(requested_prefix_tokens);
+        self.prompt_tokens = None;
+        self.warmup_context_tokens = None;
+        self.tokenize_ms = None;
+        self.prefill_ms = None;
+        self.decode_ms = None;
+        self.total_ms = None;
+        self.peak_memory_gb = None;
+        self.active_kv_bytes = None;
+        self.warmups_total = self.warmups_total.saturating_add(1);
+        self.last_error = None;
+    }
+
+    fn mark_applied(&mut self, summary: &PrefixWarmupSummary) {
+        self.status = "applied".to_owned();
+        self.policy = Some(prefix_warm_policy_name(summary.requested_prefix_tokens));
+        self.reason =
+            "server-owned prefix warmup completed before measured request handling".to_owned();
+        self.requested_prefix_tokens = Some(summary.requested_prefix_tokens);
+        self.prompt_tokens = Some(summary.prompt_tokens);
+        self.warmup_context_tokens = Some(summary.warmup_context_tokens);
+        self.tokenize_ms = Some(duration_ms(summary.tokenize));
+        self.prefill_ms = Some(duration_ms(summary.prefill));
+        self.decode_ms = Some(duration_ms(summary.decode));
+        self.total_ms = Some(duration_ms(summary.total));
+        self.peak_memory_gb = Some(summary.peak_memory_gb);
+        self.active_kv_bytes = Some(summary.active_kv_bytes);
+        self.last_error = None;
+    }
+
+    fn mark_failed(&mut self, requested_prefix_tokens: usize, error: String) {
+        self.status = "failed".to_owned();
+        self.policy = Some(prefix_warm_policy_name(requested_prefix_tokens));
+        self.reason = "server-owned prefix warmup failed".to_owned();
+        self.requested_prefix_tokens = Some(requested_prefix_tokens);
+        self.errors_total = self.errors_total.saturating_add(1);
+        self.last_error = Some(error);
+    }
+}
+
 #[derive(Clone)]
 struct PersistentNativeBackend {
-    sender: mpsc::Sender<PersistentNativeRequest>,
+    sender: mpsc::Sender<PersistentNativeCommand>,
     state: Arc<Mutex<PersistentNativeState>>,
 }
 
-struct PersistentNativeRequest {
+enum PersistentNativeCommand {
+    Generate(PersistentNativeGenerateRequest),
+    PrefixWarmup(PersistentNativePrefixWarmupRequest),
+}
+
+struct PersistentNativeGenerateRequest {
     prompt: String,
     max_new_tokens: usize,
     reply: mpsc::Sender<Result<GenerateSummary, String>>,
+}
+
+struct PersistentNativePrefixWarmupRequest {
+    prompt: String,
+    prefix_tokens: usize,
+    reply: mpsc::Sender<Result<PrefixWarmupSummary, String>>,
+}
+
+fn prefix_warm_policy_name(prefix_tokens: usize) -> String {
+    format!("prefix_{prefix_tokens}")
 }
 
 fn native_prefill_policy_warning(error: impl std::fmt::Display) -> String {
@@ -315,7 +419,7 @@ fn mark_persistent_native_ready(
 
 impl PersistentNativeBackend {
     fn start(model_path: PathBuf, max_context_tokens: NonZeroU32) -> Self {
-        let (sender, receiver) = mpsc::channel::<PersistentNativeRequest>();
+        let (sender, receiver) = mpsc::channel::<PersistentNativeCommand>();
         let state = Arc::new(Mutex::new(PersistentNativeState::loading()));
         let worker_state = Arc::clone(&state);
         thread::spawn(move || {
@@ -354,33 +458,77 @@ impl PersistentNativeBackend {
                 }
             };
 
-            while let Ok(request) = receiver.recv() {
-                {
-                    let mut state = worker_state.lock().expect("persistent state lock");
-                    state.requests_total = state.requests_total.saturating_add(1);
-                }
-                let result = match resident.as_ref() {
-                    Some(resident) => resident
-                        .generate_prompt(&request.prompt, request.max_new_tokens)
-                        .map_err(|error| error.to_string()),
-                    None => {
-                        let state = worker_state.lock().expect("persistent state lock");
-                        Err(state.last_error.clone().unwrap_or_else(|| {
-                            "persistent-native target failed to load".to_owned()
-                        }))
+            while let Ok(command) = receiver.recv() {
+                match command {
+                    PersistentNativeCommand::Generate(request) => {
+                        {
+                            let mut state = worker_state.lock().expect("persistent state lock");
+                            state.requests_total = state.requests_total.saturating_add(1);
+                        }
+                        let result = match resident.as_ref() {
+                            Some(resident) => resident
+                                .generate_prompt(&request.prompt, request.max_new_tokens)
+                                .map_err(|error| error.to_string()),
+                            None => {
+                                let state = worker_state.lock().expect("persistent state lock");
+                                Err(state.last_error.clone().unwrap_or_else(|| {
+                                    "persistent-native target failed to load".to_owned()
+                                }))
+                            }
+                        };
+                        if let Err(error) = result.as_ref() {
+                            let mut state = worker_state.lock().expect("persistent state lock");
+                            state.status = "error".to_owned();
+                            state.errors_total = state.errors_total.saturating_add(1);
+                            state.last_error = Some(error.clone());
+                        } else {
+                            let mut state = worker_state.lock().expect("persistent state lock");
+                            state.status = "ready".to_owned();
+                            state.last_error = None;
+                        }
+                        let _ = request.reply.send(result);
                     }
-                };
-                if let Err(error) = result.as_ref() {
-                    let mut state = worker_state.lock().expect("persistent state lock");
-                    state.status = "error".to_owned();
-                    state.errors_total = state.errors_total.saturating_add(1);
-                    state.last_error = Some(error.clone());
-                } else {
-                    let mut state = worker_state.lock().expect("persistent state lock");
-                    state.status = "ready".to_owned();
-                    state.last_error = None;
+                    PersistentNativeCommand::PrefixWarmup(request) => {
+                        {
+                            let mut state = worker_state.lock().expect("persistent state lock");
+                            state
+                                .native_prefix_warm_policy
+                                .mark_warming(request.prefix_tokens);
+                        }
+                        let result = match resident.as_ref() {
+                            Some(resident) => resident
+                                .warm_prompt_prefix(&request.prompt, request.prefix_tokens)
+                                .map_err(|error| error.to_string()),
+                            None => {
+                                let state = worker_state.lock().expect("persistent state lock");
+                                Err(state.last_error.clone().unwrap_or_else(|| {
+                                    "persistent-native target failed to load".to_owned()
+                                }))
+                            }
+                        };
+                        {
+                            let mut state = worker_state.lock().expect("persistent state lock");
+                            match result.as_ref() {
+                                Ok(summary) => {
+                                    state.status = "ready".to_owned();
+                                    state.last_error = None;
+                                    state.native_prefix_warm_policy.mark_applied(summary);
+                                }
+                                Err(error) => {
+                                    state
+                                        .native_prefix_warm_policy
+                                        .mark_failed(request.prefix_tokens, error.clone());
+                                    if resident.is_none() {
+                                        state.status = "error".to_owned();
+                                        state.errors_total = state.errors_total.saturating_add(1);
+                                        state.last_error = Some(error.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let _ = request.reply.send(result);
+                    }
                 }
-                let _ = request.reply.send(result);
             }
         });
         Self { sender, state }
@@ -389,11 +537,33 @@ impl PersistentNativeBackend {
     fn generate(&self, prompt: String, max_new_tokens: usize) -> Result<GenerateSummary, String> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(PersistentNativeRequest {
-                prompt,
-                max_new_tokens,
-                reply,
-            })
+            .send(PersistentNativeCommand::Generate(
+                PersistentNativeGenerateRequest {
+                    prompt,
+                    max_new_tokens,
+                    reply,
+                },
+            ))
+            .map_err(|error| format!("persistent-native worker is unavailable: {error}"))?;
+        receiver
+            .recv()
+            .map_err(|error| format!("persistent-native worker did not reply: {error}"))?
+    }
+
+    fn warm_prompt_prefix(
+        &self,
+        prompt: String,
+        prefix_tokens: usize,
+    ) -> Result<PrefixWarmupSummary, String> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(PersistentNativeCommand::PrefixWarmup(
+                PersistentNativePrefixWarmupRequest {
+                    prompt,
+                    prefix_tokens,
+                    reply,
+                },
+            ))
             .map_err(|error| format!("persistent-native worker is unavailable: {error}"))?;
         receiver
             .recv()
@@ -480,6 +650,7 @@ impl ServerRuntime {
             ("POST", "/v1/adapters/load") => self.adapter_mutation_response(body, true),
             ("POST", "/v1/adapters/unload") => self.adapter_mutation_response(body, false),
             ("POST", "/v1/chat/completions") => self.chat_completions_response(body),
+            ("POST", "/v1/runtime/warmup/prefix") => self.prefix_warmup_response(body),
             ("GET", "/metrics") => {
                 HttpResponse::ok("text/plain; version=0.0.4", self.metrics_text())
             }
@@ -527,6 +698,81 @@ impl ServerRuntime {
             }
             _ => self.error_response(404, "not_found", format!("no route for {method} {path}")),
         }
+    }
+
+    fn prefix_warmup_response(&self, body: &[u8]) -> HttpResponse {
+        if self.config.backend != ServerBackend::PersistentNative {
+            return self.error_response(
+                400,
+                "unsupported_model_config",
+                "prefix warmup requires the persistent-native backend",
+            );
+        }
+        let Some(backend) = self.persistent_backend.as_ref() else {
+            return self.error_response(
+                500,
+                "native_backend_error",
+                "persistent-native backend is unavailable",
+            );
+        };
+        let request = match serde_json::from_slice::<PrefixWarmupRequest>(body) {
+            Ok(request) => request,
+            Err(source) => {
+                return self.error_response(
+                    400,
+                    "unsupported_model_config",
+                    format!("invalid prefix warmup JSON: {source}"),
+                );
+            }
+        };
+        if let Some(model) = request.model.as_deref()
+            && model != self.config.model_id
+        {
+            return self.error_response(
+                400,
+                "unsupported_model_config",
+                format!("unsupported model {model}"),
+            );
+        }
+        let prefix_tokens = request.prefix_tokens.unwrap_or(128);
+        if prefix_tokens == 0 {
+            return self.error_response(
+                400,
+                "unsupported_model_config",
+                "prefix_tokens must be greater than zero",
+            );
+        }
+        if prefix_tokens > self.config.max_context_tokens {
+            return self.error_response(
+                400,
+                "context_too_large",
+                format!(
+                    "prefix warmup requested {prefix_tokens} tokens, max context is {}",
+                    self.config.max_context_tokens
+                ),
+            );
+        }
+        if self.active_generation.load(Ordering::SeqCst) && self.config.queue_capacity == 0 {
+            return self.error_response(
+                429,
+                "native_backend_error",
+                "single active generation already running and queue is full",
+            );
+        }
+        let prompt = render_chat_prompt(&request.messages);
+        let _guard = ActiveGenerationGuard::enter(self);
+        let summary = match backend.warm_prompt_prefix(prompt, prefix_tokens) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return self.error_response(
+                    500,
+                    "native_backend_error",
+                    format!("persistent-native prefix warmup failed: {error}"),
+                );
+            }
+        };
+        self.record_prefix_warmup(&summary);
+        self.json_ok(prefix_warmup_summary_json(&summary))
     }
 
     fn chat_completions_response(&self, body: &[u8]) -> HttpResponse {
@@ -1013,6 +1259,18 @@ impl ServerRuntime {
             metrics.persistent_worker_requests_total
         ));
         lines.push(format!(
+            "gemma4d_prefix_warmups_total {}",
+            metrics.prefix_warmups_total
+        ));
+        lines.push(format!(
+            "gemma4d_prefix_warmup_tokens_total {}",
+            metrics.prefix_warmup_tokens_total
+        ));
+        lines.push(format!(
+            "gemma4d_prefix_warmup_seconds {:.6}",
+            metrics.prefix_warmup_seconds
+        ));
+        lines.push(format!(
             "gemma4d_prefill_tokens_total {}",
             metrics.prefill_tokens_total
         ));
@@ -1161,6 +1419,21 @@ impl ServerRuntime {
         }
     }
 
+    fn record_prefix_warmup(&self, summary: &PrefixWarmupSummary) {
+        let mut metrics = self.metrics.lock().expect("metrics lock");
+        metrics.prefix_warmups_total = metrics.prefix_warmups_total.saturating_add(1);
+        metrics.prefix_warmup_tokens_total = metrics
+            .prefix_warmup_tokens_total
+            .saturating_add(summary.warmup_context_tokens as u64);
+        metrics.prefix_warmup_seconds += summary.total.as_secs_f64();
+        metrics.memory_process_rss_bytes = metrics
+            .memory_process_rss_bytes
+            .max(mb_to_bytes(summary.peak_rss_mb));
+        metrics.memory_peak_mlx_bytes = metrics
+            .memory_peak_mlx_bytes
+            .max(gb_to_bytes(summary.peak_memory_gb));
+    }
+
     fn record_error(&self, code: &str) {
         let mut metrics = self.metrics.lock().expect("metrics lock");
         *metrics.errors_total.entry(code.to_owned()).or_insert(0) += 1;
@@ -1256,6 +1529,15 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub adapter: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrefixWarmupRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub prefix_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1639,6 +1921,24 @@ fn real_generation_metrics_json(summary: &GenerateSummary) -> serde_json::Value 
     })
 }
 
+fn prefix_warmup_summary_json(summary: &PrefixWarmupSummary) -> serde_json::Value {
+    json!({
+        "object": "runtime.prefix_warmup",
+        "status": "applied",
+        "policy": prefix_warm_policy_name(summary.requested_prefix_tokens),
+        "requested_prefix_tokens": summary.requested_prefix_tokens,
+        "prompt_tokens": summary.prompt_tokens,
+        "warmup_context_tokens": summary.warmup_context_tokens,
+        "tokenize_ms": duration_ms(summary.tokenize),
+        "prefill_ms": duration_ms(summary.prefill),
+        "decode_ms": duration_ms(summary.decode),
+        "total_ms": duration_ms(summary.total),
+        "peak_memory_gb": summary.peak_memory_gb,
+        "peak_rss_mb": summary.peak_rss_mb,
+        "active_kv_bytes": summary.active_kv_bytes,
+    })
+}
+
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
@@ -1878,6 +2178,9 @@ mod tests {
             "gemma4d_model_load_count",
             "gemma4d_resident_model_loaded",
             "gemma4d_persistent_worker_requests_total",
+            "gemma4d_prefix_warmups_total",
+            "gemma4d_prefix_warmup_tokens_total",
+            "gemma4d_prefix_warmup_seconds",
             "gemma4d_prefill_tokens_total",
             "gemma4d_decode_tokens_total",
             "gemma4d_memory_peak_mlx_bytes",
@@ -2175,6 +2478,52 @@ mod tests {
             skipped.reason,
             "explicit native prefill env override is set"
         );
+    }
+
+    #[test]
+    fn native_prefix_warm_policy_state_records_lifecycle() {
+        let mut state = NativePrefixWarmPolicyState::idle();
+        assert_eq!(state.status, "idle");
+        assert_eq!(state.warmups_total, 0);
+
+        state.mark_warming(128);
+        assert_eq!(state.status, "warming");
+        assert_eq!(state.policy.as_deref(), Some("prefix_128"));
+        assert_eq!(state.warmups_total, 1);
+        assert_eq!(state.requested_prefix_tokens, Some(128));
+
+        state.mark_failed(128, "tokenizer failed".to_owned());
+        assert_eq!(state.status, "failed");
+        assert_eq!(state.errors_total, 1);
+        assert_eq!(state.last_error.as_deref(), Some("tokenizer failed"));
+    }
+
+    #[test]
+    fn prefix_warmup_endpoint_requires_persistent_native_backend() {
+        let response = runtime().handle_request(
+            "POST",
+            "/v1/runtime/warmup/prefix",
+            br#"{"messages":[{"role":"user","content":"hello"}],"prefix_tokens":128}"#,
+        );
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("unsupported_model_config"));
+        assert!(response.body.contains("persistent-native"));
+    }
+
+    #[test]
+    fn prefix_warmup_endpoint_rejects_zero_prefix_tokens_before_model_work() {
+        let runtime = ServerRuntime::new(ServerConfig {
+            backend: ServerBackend::PersistentNative,
+            model_path: Some(PathBuf::from("/tmp/gemma4d-missing-model")),
+            ..ServerConfig::default()
+        });
+        let response = runtime.handle_request(
+            "POST",
+            "/v1/runtime/warmup/prefix",
+            br#"{"messages":[{"role":"user","content":"hello"}],"prefix_tokens":0}"#,
+        );
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("prefix_tokens"));
     }
 
     #[test]

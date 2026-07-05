@@ -52,6 +52,20 @@ pub struct GenerateSummary {
     pub active_kv_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefixWarmupSummary {
+    pub requested_prefix_tokens: usize,
+    pub prompt_tokens: usize,
+    pub warmup_context_tokens: usize,
+    pub tokenize: Duration,
+    pub prefill: Duration,
+    pub decode: Duration,
+    pub total: Duration,
+    pub peak_memory_gb: f32,
+    pub peak_rss_mb: f32,
+    pub active_kv_bytes: u64,
+}
+
 #[derive(Debug)]
 pub struct ResidentTarget {
     model_path: PathBuf,
@@ -114,6 +128,55 @@ impl ResidentTarget {
             max_new_tokens,
             Duration::ZERO,
         )
+    }
+
+    pub fn warm_prompt_prefix(
+        &self,
+        prompt: &str,
+        prefix_tokens: usize,
+    ) -> Result<PrefixWarmupSummary, CliError> {
+        if prefix_tokens == 0 {
+            return Err(CliError::Usage(
+                "prefix warmup requires prefix_tokens greater than zero".to_owned(),
+            ));
+        }
+        let total_started = Instant::now();
+        let tokenize_started = Instant::now();
+        let token_ids = tokenize_prompt(&self.model_path, prompt)?;
+        let tokenize = tokenize_started.elapsed();
+        if token_ids.is_empty() {
+            return Err(CliError::Runtime(
+                "prefix warmup tokenizer returned no tokens".to_owned(),
+            ));
+        }
+        let prompt_tokens = token_ids.len();
+        let warmup_context_tokens = prompt_tokens.min(prefix_tokens);
+        let warmup_tokens = &token_ids[..warmup_context_tokens];
+
+        let mut cache = KvCache::create(&KvPolicy::default())
+            .map_err(|error| CliError::Runtime(format!("failed to create KV cache: {error}")))?;
+        let prefill_started = Instant::now();
+        let step = ffi::prefill(&self.target, &mut cache, warmup_tokens)
+            .map_err(|error| CliError::Runtime(format!("prefix warmup prefill failed: {error}")))?;
+        let prefill = prefill_started.elapsed();
+        let decode_started = Instant::now();
+        let decode_step = ffi::decode_one(&self.target, &mut cache, step.greedy_token)
+            .map_err(|error| CliError::Runtime(format!("prefix warmup decode failed: {error}")))?;
+        let decode = decode_started.elapsed();
+        let total = total_started.elapsed();
+
+        Ok(PrefixWarmupSummary {
+            requested_prefix_tokens: prefix_tokens,
+            prompt_tokens,
+            warmup_context_tokens,
+            tokenize,
+            prefill,
+            decode,
+            total,
+            peak_memory_gb: step.peak_memory_gb.max(decode_step.peak_memory_gb),
+            peak_rss_mb: step.peak_rss_mb.max(decode_step.peak_rss_mb),
+            active_kv_bytes: step.active_kv_bytes.max(decode_step.active_kv_bytes),
+        })
     }
 }
 

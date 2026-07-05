@@ -86,11 +86,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut records = Vec::new();
+    let mut candidate_warmups = Vec::new();
     let mut final_metrics = FinalMetrics::default();
     if blockers.is_empty() {
         match run_cases(&args, &selected, &run_id, &environment, &model_identity) {
             Ok(run) => {
                 records = run.records;
+                candidate_warmups = run.candidate_warmups;
                 final_metrics = run.final_metrics;
             }
             Err(error) => blockers.push(error.to_string()),
@@ -111,14 +113,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .flat_map(|record| record.blockers.iter().cloned())
         .collect::<Vec<_>>();
+    let warmup_blockers = candidate_warmups
+        .iter()
+        .filter(|warmup| warmup.status != "passed")
+        .map(|warmup| {
+            format!(
+                "{} candidate prefix warmup failed: {}",
+                warmup.workload_id,
+                warmup.error.as_deref().unwrap_or("unknown error")
+            )
+        })
+        .collect::<Vec<_>>();
     let mut all_blockers = blockers;
     all_blockers.extend(comparison_blockers);
+    all_blockers.extend(warmup_blockers);
     all_blockers.sort();
     all_blockers.dedup();
 
     let token_text_matches = records
         .iter()
         .all(|record| record.comparison_status == "tokens_and_text_match");
+    let candidate_warmups_ok = args.candidate_prefix_warmup_tokens.is_none()
+        || candidate_warmups
+            .iter()
+            .all(|warmup| warmup.status == "passed");
     let candidate_load_count_ok = final_metrics
         .candidate
         .as_ref()
@@ -130,7 +148,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let decision = if !all_blockers.is_empty() {
         "blocked_with_evidence"
-    } else if token_text_matches && candidate_load_count_ok && baseline_load_count_ok {
+    } else if token_text_matches
+        && candidate_warmups_ok
+        && candidate_load_count_ok
+        && baseline_load_count_ok
+    {
         "accept_candidate"
     } else if token_text_matches {
         "needs_more_data"
@@ -169,6 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_context_tokens: args.max_context_tokens,
         memory_budget_mb: args.memory_budget_mb,
         baseline_backend: args.baseline_backend,
+        candidate_prefix_warmup_tokens: args.candidate_prefix_warmup_tokens,
         selected_workloads: selected
             .iter()
             .map(|workload| workload.workload_id.clone())
@@ -178,11 +201,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         relevant_environment,
         final_metrics,
         blockers: all_blockers,
+        candidate_warmups,
         records: records.clone(),
         measurement_notes: vec![
             "The baseline backend is selected by --baseline-backend. The default baseline is ServerBackend::RealHelper; persistent-native baseline mode passes an explicit --backend persistent-native flag.",
             "Candidate is built from parse_serve_options with --model-path and no --backend flag; XR53 defaults that path to ServerBackend::PersistentNative.",
             "The persistent-native worker owns one ResidentTarget and creates fresh KV per request.",
+            "Optional candidate prefix warmup uses the local /v1/runtime/warmup/prefix control endpoint before measured candidate requests; warmup cost is recorded separately and is not included in request gemma4d_metrics.",
             "The benchmark compares response text and generated token ids from gemma4d_metrics.generated_token_ids.",
             "Tokenizer and detokenizer helper costs remain in request handling for both backends; XR11 only evaluates target-load residency.",
         ],
@@ -221,6 +246,7 @@ struct Args {
     max_context_tokens: usize,
     memory_budget_mb: u64,
     baseline_backend: ServerBackend,
+    candidate_prefix_warmup_tokens: Option<usize>,
 }
 
 impl Args {
@@ -239,6 +265,7 @@ impl Args {
         let mut max_context_tokens = 32_768usize;
         let mut memory_budget_mb = 12 * 1024u64;
         let mut baseline_backend = ServerBackend::RealHelper;
+        let mut candidate_prefix_warmup_tokens = None;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -287,9 +314,15 @@ impl Args {
                     baseline_backend =
                         parse_baseline_backend(&required(&mut args, "--baseline-backend")?)?;
                 }
+                "--candidate-prefix-warmup-tokens" => {
+                    candidate_prefix_warmup_tokens = Some(parse_positive_usize(
+                        &required(&mut args, "--candidate-prefix-warmup-tokens")?,
+                        "--candidate-prefix-warmup-tokens",
+                    )?);
+                }
                 "-h" | "--help" => {
                     println!(
-                        "usage: cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- [--out-dir PATH] [--model-path PATH] [--workloads PATH] [--workload-ids CSV] [--repeats N] [--max-new-tokens N] [--baseline-backend real-helper|persistent-native]"
+                        "usage: cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- [--out-dir PATH] [--model-path PATH] [--workloads PATH] [--workload-ids CSV] [--repeats N] [--max-new-tokens N] [--baseline-backend real-helper|persistent-native] [--candidate-prefix-warmup-tokens N]"
                     );
                     std::process::exit(0);
                 }
@@ -312,6 +345,7 @@ impl Args {
             max_context_tokens,
             memory_budget_mb,
             baseline_backend,
+            candidate_prefix_warmup_tokens,
         })
     }
 }
@@ -376,6 +410,26 @@ struct BackendRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PrefixWarmupRun {
+    workload_id: String,
+    backend: String,
+    status: String,
+    http_status: Option<u16>,
+    request_wall_ms: Option<f64>,
+    requested_prefix_tokens: Option<usize>,
+    prompt_tokens: Option<usize>,
+    warmup_context_tokens: Option<usize>,
+    tokenize_ms: Option<f64>,
+    prefill_ms: Option<f64>,
+    decode_ms: Option<f64>,
+    total_ms: Option<f64>,
+    peak_memory_gb: Option<f64>,
+    active_kv_bytes: Option<u64>,
+    runtime_snapshot: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UsageRecord {
     prompt_tokens: usize,
     completion_tokens: usize,
@@ -416,6 +470,9 @@ struct PrometheusSnapshot {
     tokens_per_second: Option<f64>,
     memory_peak_mlx_bytes: Option<f64>,
     memory_process_rss_bytes: Option<f64>,
+    prefix_warmups_total: Option<f64>,
+    prefix_warmup_tokens_total: Option<f64>,
+    prefix_warmup_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -442,12 +499,14 @@ struct Summary {
     max_context_tokens: usize,
     memory_budget_mb: u64,
     baseline_backend: ServerBackend,
+    candidate_prefix_warmup_tokens: Option<usize>,
     selected_workloads: Vec<String>,
     generated_files: Vec<String>,
     environment: Environment,
     relevant_environment: BTreeMap<String, Option<String>>,
     final_metrics: FinalMetrics,
     blockers: Vec<String>,
+    candidate_warmups: Vec<PrefixWarmupRun>,
     records: Vec<Xr11Record>,
     measurement_notes: Vec<&'static str>,
 }
@@ -463,6 +522,7 @@ struct Environment {
 
 struct RunOutput {
     records: Vec<Xr11Record>,
+    candidate_warmups: Vec<PrefixWarmupRun>,
     final_metrics: FinalMetrics,
 }
 
@@ -510,12 +570,21 @@ fn run_cases(
     drop(baseline_server);
 
     let candidate_server = start_server(args, ServerBackend::PersistentNative, false)?;
+    let mut candidate_warmups = Vec::new();
     let mut records = Vec::new();
     let mut baseline_iter = baseline.into_iter();
     for workload in workloads {
         let prompt = fs::read_to_string(&workload.prompt_path)?;
         let prompt_bytes = prompt.len();
         let computed_sha = sha256_hex(prompt.as_bytes());
+        if let Some(prefix_tokens) = args.candidate_prefix_warmup_tokens {
+            candidate_warmups.push(run_prefix_warmup(
+                candidate_server.addr,
+                &workload.workload_id,
+                &prompt,
+                prefix_tokens,
+            ));
+        }
         for repeat_index in 0..args.repeats {
             let Some((_, _, baseline_run)) = baseline_iter.next() else {
                 return Err("baseline record count did not match candidate loop".into());
@@ -563,6 +632,7 @@ fn run_cases(
 
     Ok(RunOutput {
         records,
+        candidate_warmups,
         final_metrics: FinalMetrics {
             baseline: Some(baseline_final_metrics),
             candidate: Some(candidate_final_metrics),
@@ -722,6 +792,115 @@ fn run_backend_request(
     }
 }
 
+fn run_prefix_warmup(
+    addr: std::net::SocketAddr,
+    workload_id: &str,
+    prompt: &str,
+    prefix_tokens: usize,
+) -> PrefixWarmupRun {
+    let body = json!({
+        "model": ServerConfig::default().model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "prefix_tokens": prefix_tokens,
+    });
+    let body = serde_json::to_string(&body).expect("warmup request serializes");
+    let started = Instant::now();
+    let response = http_request(addr, "POST", "/v1/runtime/warmup/prefix", Some(&body));
+    let request_wall_ms = duration_ms(started.elapsed());
+    let runtime_snapshot = fetch_runtime_snapshot(addr);
+
+    match response {
+        Ok(response) if response.status == 200 => {
+            match serde_json::from_str::<serde_json::Value>(&response.body) {
+                Ok(value) => PrefixWarmupRun {
+                    workload_id: workload_id.to_owned(),
+                    backend: ServerBackend::PersistentNative.as_str().to_owned(),
+                    status: "passed".to_owned(),
+                    http_status: Some(response.status),
+                    request_wall_ms: Some(request_wall_ms),
+                    requested_prefix_tokens: value
+                        .get("requested_prefix_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok()),
+                    prompt_tokens: value
+                        .get("prompt_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok()),
+                    warmup_context_tokens: value
+                        .get("warmup_context_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok()),
+                    tokenize_ms: value.get("tokenize_ms").and_then(serde_json::Value::as_f64),
+                    prefill_ms: value.get("prefill_ms").and_then(serde_json::Value::as_f64),
+                    decode_ms: value.get("decode_ms").and_then(serde_json::Value::as_f64),
+                    total_ms: value.get("total_ms").and_then(serde_json::Value::as_f64),
+                    peak_memory_gb: value
+                        .get("peak_memory_gb")
+                        .and_then(serde_json::Value::as_f64),
+                    active_kv_bytes: value
+                        .get("active_kv_bytes")
+                        .and_then(serde_json::Value::as_u64),
+                    runtime_snapshot,
+                    error: None,
+                },
+                Err(error) => PrefixWarmupRun::error(
+                    workload_id,
+                    Some(response.status),
+                    Some(request_wall_ms),
+                    format!(
+                        "warmup response JSON parse failed: {error}; body={}",
+                        response.body
+                    ),
+                    runtime_snapshot,
+                ),
+            }
+        }
+        Ok(response) => PrefixWarmupRun::error(
+            workload_id,
+            Some(response.status),
+            Some(request_wall_ms),
+            response.body,
+            runtime_snapshot,
+        ),
+        Err(error) => PrefixWarmupRun::error(
+            workload_id,
+            None,
+            Some(request_wall_ms),
+            error.to_string(),
+            runtime_snapshot,
+        ),
+    }
+}
+
+impl PrefixWarmupRun {
+    fn error(
+        workload_id: &str,
+        http_status: Option<u16>,
+        request_wall_ms: Option<f64>,
+        error: String,
+        runtime_snapshot: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            workload_id: workload_id.to_owned(),
+            backend: ServerBackend::PersistentNative.as_str().to_owned(),
+            status: "blocked".to_owned(),
+            http_status,
+            request_wall_ms,
+            requested_prefix_tokens: None,
+            prompt_tokens: None,
+            warmup_context_tokens: None,
+            tokenize_ms: None,
+            prefill_ms: None,
+            decode_ms: None,
+            total_ms: None,
+            peak_memory_gb: None,
+            active_kv_bytes: None,
+            runtime_snapshot,
+            error: Some(error),
+        }
+    }
+}
+
 impl BackendRun {
     fn error(
         backend: ServerBackend,
@@ -815,7 +994,7 @@ fn blocked_records(
             max_new_tokens: args.max_new_tokens,
             comparison_status: "blocked".to_owned(),
             baseline: BackendRun::error(
-                ServerBackend::RealHelper,
+                args.baseline_backend,
                 None,
                 None,
                 "pre-run blocker".to_owned(),
@@ -916,6 +1095,9 @@ fn parse_prometheus(body: &str) -> PrometheusSnapshot {
         tokens_per_second: values.get("gemma4d_tokens_per_second").copied(),
         memory_peak_mlx_bytes: values.get("gemma4d_memory_peak_mlx_bytes").copied(),
         memory_process_rss_bytes: values.get("gemma4d_memory_process_rss_bytes").copied(),
+        prefix_warmups_total: values.get("gemma4d_prefix_warmups_total").copied(),
+        prefix_warmup_tokens_total: values.get("gemma4d_prefix_warmup_tokens_total").copied(),
+        prefix_warmup_seconds: values.get("gemma4d_prefix_warmup_seconds").copied(),
     }
 }
 
@@ -930,6 +1112,9 @@ fn render_report(summary: &Summary) -> String {
         "- Baseline backend: `{}`\n",
         summary.baseline_backend.as_str()
     ));
+    if let Some(tokens) = summary.candidate_prefix_warmup_tokens {
+        out.push_str(&format!("- Candidate prefix warmup tokens: `{tokens}`\n"));
+    }
     out.push_str(&format!("- Command: `{}`\n\n", summary.command));
     out.push_str("## Model Identity\n\n");
     out.push_str("| Field | Value |\n");
@@ -978,6 +1163,27 @@ fn render_report(summary: &Summary) -> String {
             fmt_opt(metrics.and_then(|metrics| metrics.resident_model_loaded)),
             fmt_opt(metrics.and_then(|metrics| metrics.persistent_worker_requests_total)),
         ));
+    }
+    if !summary.candidate_warmups.is_empty() {
+        out.push_str("\n## Candidate Prefix Warmups\n\n");
+        out.push_str("| Workload | Status | Request wall ms | Prefix tokens | Prompt tokens | Warm context tokens | Tokenize ms | Prefill ms | Decode ms | Total ms | Peak MLX GB |\n");
+        out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        for warmup in &summary.candidate_warmups {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                warmup.workload_id,
+                warmup.status,
+                fmt_opt(warmup.request_wall_ms),
+                fmt_opt_usize(warmup.requested_prefix_tokens),
+                fmt_opt_usize(warmup.prompt_tokens),
+                fmt_opt_usize(warmup.warmup_context_tokens),
+                fmt_opt(warmup.tokenize_ms),
+                fmt_opt(warmup.prefill_ms),
+                fmt_opt(warmup.decode_ms),
+                fmt_opt(warmup.total_ms),
+                fmt_opt(warmup.peak_memory_gb),
+            ));
+        }
     }
     out.push_str("\n## Comparisons\n\n");
     out.push_str("| Workload | Repeat | Status | Baseline wall ms | Candidate wall ms | Baseline load ms | Candidate load ms | Tokens |\n");
@@ -1128,6 +1334,9 @@ fn baseline_load_count_ok(
 }
 
 fn mode_for_args(args: &Args) -> &'static str {
+    if args.candidate_prefix_warmup_tokens.is_some() {
+        return "server_persistent_native_prefix_warmup_policy";
+    }
     match args.baseline_backend {
         ServerBackend::RealHelper => MODE,
         ServerBackend::PersistentNative => {
@@ -1146,8 +1355,12 @@ fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> Result<(), Box<dyn s
 }
 
 fn command_display(args: &Args) -> String {
+    let candidate_warmup = args
+        .candidate_prefix_warmup_tokens
+        .map(|tokens| format!(" --candidate-prefix-warmup-tokens {tokens}"))
+        .unwrap_or_default();
     format!(
-        "cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- --out-dir {} --model-path {} --workloads {} --workload-ids {} --repeats {} --max-new-tokens {} --max-context-tokens {} --memory-budget-mb {} --baseline-backend {}",
+        "cargo run -p gemma4d-bench --example xr11_persistent_native_server_ab -- --out-dir {} --model-path {} --workloads {} --workload-ids {} --repeats {} --max-new-tokens {} --max-context-tokens {} --memory-budget-mb {} --baseline-backend {}{}",
         args.out_dir.display(),
         args.model_path.display(),
         args.workloads_path.display(),
@@ -1157,6 +1370,7 @@ fn command_display(args: &Args) -> String {
         args.max_context_tokens,
         args.memory_budget_mb,
         args.baseline_backend.cli_name(),
+        candidate_warmup,
     )
 }
 
@@ -1249,6 +1463,12 @@ fn usize_at(value: &serde_json::Value, key: &str) -> usize {
 fn fmt_opt(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.3}"))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn fmt_opt_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
         .unwrap_or_else(|| "n/a".to_owned())
 }
 

@@ -3,7 +3,7 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR84 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR85 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
@@ -12,13 +12,15 @@ XR82 confirms XR81's first verifier-forward spike is a real warm/JIT/cache
 effect, but rejects the request-path preverify warmup candidate once the warmup
 cost is charged to MTP decode phase. XR83 then rejects the existing
 `full_attention_kv_update_256` materialization candidate on the real
-non-profile chat-tail path. XR84 closes the next native question: a much
-cheaper `128`-token prefix warmup preserves most of the first-token/raw-tail
-benefit while measuring the full `1024`-token chat request on a fresh cache.
-The next theoretical-max target should therefore be a server/load-time prefix
-warm policy with admission, scheduling, amortization, and observability
-guardrails. Productizing the accepted scoped chat/tool MTP opt-in remains the
-parallel shippable-value track.
+non-profile chat-tail path. XR84 then shows that a much cheaper `128`-token
+prefix warmup preserves most of the first-token/raw-tail benefit while
+measuring the full `1024`-token chat request on a fresh cache. XR85 turns that
+into a real persistent-native server control surface with telemetry and
+accepts the candidate, but also shows the standalone steady-state 1K chat/tool
+request delta is mostly neutral once the first cold request is gone. The next
+theoretical-max target should therefore be the MTP protected aggregate/scoped
+productization path on top of this server surface, not another standalone
+prefix-warm micro-optimization.
 
 XR72 closed the immediate native diagnostic question: the remaining
 full-attention tail is dominated by MLX full-attention eval, especially chat
@@ -51,19 +53,24 @@ used only `128` workload tokens, measured requests still used `1024` tokens,
 profile samples stayed `0/756`, peak MLX stayed `7.321 GB`, and raw p99/max
 improved `150.450 -> 102.426 ms` versus runtime default. Exact-context warmup
 remains stronger at `92.789 ms`, but prefix warmup cuts warm event p50 from
-`2837.263 ms` to `1238.137 ms`, making server/load-time policy work the best
-next native lane. XR74 closed the readiness sweep for the current local
-persistent-native default surface.
+`2837.263 ms` to `1238.137 ms`. XR85 then validates the server/load-time
+endpoint, metrics, and harness path: warmups used `128` of `1028` prompt
+tokens, final metrics recorded `2` warmups and `256` warm tokens, request peak
+stayed `7.324 GB`, and measured requests were `6/6` token/text identical. The
+important caveat is that this is a control-surface and first-cold-request win,
+not proof for automatic warmup or a broad native default. XR74 closed the
+readiness sweep for the current local persistent-native default surface.
 
 Recommended order:
 
-1. If the priority is broad theoretical max, turn XR84 into a true
-   server/load-time prefix warm policy candidate with guardrails, then rerun the
-   protected aggregate gates.
-2. Productize the accepted scoped chat/tool MTP opt-in if the priority is
-   shippable value.
-3. Keep request-path preverify warmup and broad MTP default-on disabled until
-   protected aggregate evidence clears the release gate.
+1. If the priority is broad theoretical max, run the next MTP protected
+   aggregate/productization slice using the XR85 server prefix-warm surface as
+   context, without weakening holdouts or exactness gates.
+2. Productize the accepted scoped chat/tool MTP opt-in as the shippable-value
+   path if the protected aggregate still misses the broad `25%` gate.
+3. Keep automatic prefix warmup, request-path preverify warmup, and broad MTP
+   default-on disabled until protected aggregate evidence clears the release
+   gate.
 4. Keep DSpark parked until native and MTP gates are cleaner.
 
 ## Evidence summary
@@ -195,8 +202,18 @@ Recommended order:
   `150.450 -> 102.426 ms` (`+31.920%`), and first-token p50 improved
   `150.450 -> 102.426 ms`. Exact-context warmup still reached `92.789 ms`, but
   its warmup total p50 was `2837.263 ms` versus prefix warmup `1238.137 ms`.
-  Therefore the best next native item is a real server/load-time prefix warm
-  policy with admission, scheduling, amortization, and observability guardrails.
+  That made a real server/load-time policy surface worth testing.
+- XR85 added that persistent-native server path through
+  `POST /v1/runtime/warmup/prefix`, runtime snapshot state, Prometheus metrics,
+  and XR11 `--candidate-prefix-warmup-tokens`. The focused chat/tool 1K server
+  A/B accepted the candidate with no blockers, `6/6` token/text-identical
+  measured records, `2` prefix warmups, `256` warm tokens, warmup totals
+  `2771.085 ms` and `1983.183 ms`, and peak request MLX `7.324 GB`. Warmup
+  cost stayed outside request `gemma4d_metrics`. The first cold measured chat
+  token improved `392.688 -> 73.314 ms`, but steady-state 1K chat/tool request
+  totals were neutral to slightly slower. Therefore XR85 validates the
+  control surface and observability, but does not justify automatic warmup or
+  broad native defaults.
 - XR74 added backend/native-prefill policy visibility to `/health` and the TUI
   dashboard, with tests covering `backend`, `max_context_tokens`, and native
   prefill policy state. Static gates passed: `cargo fmt --all --check`,
@@ -208,73 +225,46 @@ Recommended order:
 
 | Area | Files / symbols | Responsibility | Notes |
 |---|---|---|---|
-| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, profile-perturbation, warmup-probe, warmup-costed, amortized warmup, prefix warmup, full-attention KV update capacity, and XR75 group-eval candidates; XR83 rejects non-profile `full_attention_kv_update_256`, while XR84 selects prefix warm policy work as the next chat-tail lane |
+| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, profile-perturbation, warmup-probe, warmup-costed, amortized warmup, prefix warmup, full-attention KV update capacity, and XR75 group-eval candidates; XR83 rejects non-profile `full_attention_kv_update_256`, while XR84/XR85 validate prefix warm evidence and the next focus shifts to MTP protected aggregate work |
 | Native profile ABI | `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs` | Carries per-token decode profile fields across C ABI and Rust | Current fields split broad forward, deferred KV eval, full-attention/sliding eval, update/capacity/slice/visible-slice, group eval attribution, and eval sync |
 | Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention eval; XR75 rejected simple serial group scheduling |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker; XR83 says the `256` candidate does not improve the non-profile chat tail |
 | Runtime sync point | `native/gemma4_mlx/src/native_model.cc::decode_one` | Runs logits, greedy selection, and final `mlx::core::eval({greedy, max_logit})` | XR72 showed chat outliers are not primarily final eval sync tails |
 | MTP policy harness | `crates/gemma4d-bench/examples/xr15_mtp_policy_variance_ab.rs`, `scripts/xr61_adaptive_n_report.py`, `scripts/xr73_scoped_mtp_report.py`, `scripts/xr81_mtp_overhead_report.py`, `scripts/xr82_first_verify_warmup_report.py` | Measures MTP exactness, acceptance, holdouts, oracle, default-overhead, aggregate gates, optional native warmup context, XR81 overhead attribution, and XR82 first-verifier warmup cost | XR79 accepts scoped chat/tool evidence again; XR82 confirms first verifier-forward warm-state behavior but rejects request-path preverify warmup |
-| Server default/readiness | `crates/gemma4d-server/src/lib.rs`, `crates/gemma4d-server/src/http.rs`, `crates/gemma4d-bench/examples/xr11_persistent_native_server_ab.rs` | Selects persistent-native for `serve --model-path`, applies long-context native prefill default, exposes admission/default state, and runs sentinels | XR74 ready for local persistent-native default surface; explicit rollback flags remain available |
+| Server default/readiness | `crates/gemma4d-server/src/lib.rs`, `crates/gemma4d-server/src/http.rs`, `crates/gemma4d-bench/examples/xr11_persistent_native_server_ab.rs` | Selects persistent-native for `serve --model-path`, applies long-context native prefill default, exposes admission/default state, prefix warm state, and server sentinels | XR74 ready for local persistent-native default surface; XR85 adds explicit prefix warmup control surface and metrics; explicit rollback flags remain available |
 | Operator visibility | `crates/gemma4d-tui/src/{app,provider,ui}.rs`, `crates/gemma4d-tui/tests/m05_acceptance.rs` | Surfaces backend, context, native prefill policy, MTP, cache, adapter, and live metrics state through provider-backed pages | XR74 added dashboard backend/native-prefill visibility |
 
 ## Findings
 
-### high: XR84 selects prefix warm policy as the next native tail lane
+### high: XR85 shifts the next theoretical-max item back to MTP
 
-Evidence: XR72 accepted runtime default against explicit per-layer on all five
-rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
-holdout, memory, and default-overhead gates. XR74 closed the readiness sweep for
-the current local persistent-native default surface. XR75 rejected the simple
-serial group-eval candidate against runtime default on the 3-trial chat
-follow-up. XR76 showed profile-mode perturbation is not the main cause and a
-same-shape warmup probe cut chat first-token p50 `177.571 -> 86.680 ms` while
-raw p99 improved `51.186%`. XR77 repeated the win with cost accounting:
-first-token p50 moved `188.836 -> 92.922 ms` and raw p99 improved `50.792%`,
-but discarded warmup total p50 was `3203.529 ms`. XR78 showed repeated
-same-loaded-target fresh-cache chat requests keep that first-token tail benefit:
-raw p99 improved `76.155%`, first-token p50 moved `387.059 -> 92.292 ms`, and
-the 4K code workload did not reproduce a tail. XR79 then reran the protected
-MTP aggregate with those native warmup boundaries attached: scoped gates passed,
-default overhead was clean, oracle/holdouts passed, selected chat/tool lanes
-improved `+29.237%`, but protected aggregate speed was only `+19.482%`. XR81
-then showed the miss is a `412.747 ms` gap to the `25%` gate. Selected
-chat/tool MTP would need to move `3527.062 -> 3114.315 ms`; verifier forward is
-`3027.162 ms` of selected phase, and first verifier-pass excess is
-`497.460 ms`. XR82 tested the cloned-cache preverify warmup path. It preserved
-exactness and generated-token parity, and first verifier-forward median-sum
-improved `801.087 -> 169.012 ms` (`+78.902%`), but the cost-accounted selected
-MTP phase regressed `3663.085 -> 3791.790 ms` (`-3.514%`) because the warmup
-itself cost `754.613 ms`. XR83 then tested the existing
-`full_attention_kv_update_256` materialization candidate without profile-mode
-scheduling. It stayed correct (`9/9`) with `0/567` profiled samples and peak
-`7.327 GB`, but missed the chat tail gate versus runtime default: raw p50
-`70.750 -> 70.631 ms`, p95 `72.603 -> 71.988 ms`, p99
-`201.004 -> 234.602 ms`, and first-token p50 `201.004 -> 234.602 ms`. XR84
-then tested a cheaper prefix warm shape. It stayed exact (`12/12`) with
-`0/756` profile-enabled samples, peak `7.321 GB`, and records proving
-`warmup_context_tokens=128` while measured requests remained
-`input_tokens=1024`. Versus runtime default, raw p99/max and first-token p50
-moved `150.450 -> 102.426 ms` (`+31.920%`) while p50/p95 stayed neutral.
-Exact-context warmup still reached `92.789 ms`, but its warmup total p50 was
-`2837.263 ms` versus prefix warmup `1238.137 ms`.
+Evidence: XR84 proved a cheaper `128`-token prefix warm shape can reproduce
+most of the non-profile chat first-token/raw-tail benefit in the native harness:
+`12/12` exact records, peak `7.321 GB`, raw p99/max and first-token p50
+`150.450 -> 102.426 ms`, and warm event p50 `1238.137 ms` versus
+`2837.263 ms` for exact-context warmup. XR85 then turned that into a real
+server path. The persistent-native endpoint rejects unsupported backends and
+invalid prefix sizes before model work, records warmup telemetry separately,
+and exposes snapshot plus Prometheus metrics. The focused XR11 chat/tool 1K
+run accepted the candidate with `6/6` token/text-identical measured records,
+`2` warmups, `256` warm tokens, no blockers, and peak request MLX `7.324 GB`.
+Warmup cost stayed outside request `gemma4d_metrics`. The first cold measured
+chat token improved `392.688 -> 73.314 ms`, but repeats 1-2 and tool
+steady-state were neutral to slightly slower.
 
-Impact: The fastest remaining route toward the theoretical max is no longer
-another readiness/doc pass or a serial group-eval full matrix. The remaining
-native speed evidence points at first-token warm/JIT/cache behavior, and XR82
-links that shape directly to the MTP verifier path. The naive request-path
-prewarm shape is rejected, XR83 rules out the already-implemented `256`
-slice-update materialization candidate as the next chat-tail fix, and XR84
-shows a cheaper prefix warm shape is plausible enough to productize as a
-server/load-time candidate. The remaining actionable blocker is turning this
-warm state into off-request work without charging a large user-visible warmup.
+Impact: XR85 closes the server/load-time control-surface question. It gives us
+a safe way to run and observe prefix warm work, but it does not create a broad
+native default or automatic warmup case. The highest-value path toward the
+theoretical max is now to combine this surface with the accepted scoped MTP
+lane and rerun the protected aggregate gates. That directly tests whether the
+warm-state/server-path work helps the known MTP verifier-forward gap without
+weakening exactness, oracle, holdout, memory, or default-overhead safeguards.
 
-Recommendation: Build an XR85 server/load-time prefix warm policy candidate
-first. It should gate by workload/context shape, run out of the request path,
-record warmup cost and hit/miss state, cap memory for tiny16, and keep runtime
-defaults unchanged until a protected aggregate rerun clears the gate. Treat
-profile mode, serial group eval, request-path preverify warmup, and the
-existing `full_attention_kv_update_256` path as rejected promotion lanes unless
-new evidence changes their cost model.
+Recommendation: Make the next XR item an MTP protected aggregate and scoped
+productization pass using the XR85 server surface as context. Keep automatic
+prefix warmup default-off. Treat profile mode, serial group eval, request-path
+preverify warmup, and the existing `full_attention_kv_update_256` path as
+rejected promotion lanes unless new evidence changes their cost model.
 
 ### high: Broad MTP default-on is still unsupported
 
@@ -322,34 +312,31 @@ rewrite old milestone reports.
 
 ## Next work items
 
-### Scoped MTP opt-in productization
+### MTP protected aggregate on the XR85 server surface
 
 The accepted XR73/XR79 chat/tool lane is repeatedly exact, oracle-clean,
 holdout-protected, default-overhead-clean, and roughly `+29%` on selected lanes.
-The next shippable-value task is to expose it as an explicit local opt-in with
-clear workload/request gating, observability, and rollback, while keeping broad
+The next theoretical-max task is to run a protected aggregate/productization
+slice that keeps those safeguards, uses the XR85 server prefix-warm surface as
+context, and checks whether the protected aggregate can move toward or over the
+`25%` broad gate without weakening `mtp_candidate_1k_001` and 4K holdouts.
+
+### Scoped MTP opt-in productization
+
+If the protected aggregate still misses the broad gate, the shippable-value
+task is to expose the accepted chat/tool MTP lane as an explicit local opt-in
+with workload/request gating, observability, and rollback, while keeping broad
 MTP default-off.
-
-### Native prefix warm policy
-
-For broad theoretical max, the next runtime task is a guarded server/load-time
-prefix warm candidate based on XR84. The policy should start with the chat/tool
-1K shapes that already drive the MTP selected lane, keep the warm pass
-off-request, expose warmup cost/hit/miss telemetry, and retain tiny16 memory
-guards. Only after that native improvement lands should the protected aggregate
-rerun attempt to clear `25%` without weakening the `mtp_candidate_1k_001` and
-4K holdout protections. Selected-lane evidence alone is not sufficient for
-broad default-on.
 
 ## Gaps and unknowns
 
 - XR78 proves exact warm-state lifetime only within the same loaded target and
   same-shape fresh-cache benchmark path; XR84 proves a `128`-token prefix warm
   shape can reproduce most of the 1K chat first-token tail benefit in the
-  harness. A production server warmup policy still needs separate admission,
-  scheduling, amortization, telemetry, and memory guard work.
+  harness; XR85 proves the explicit server control surface and telemetry. What
+  remains unproven is automatic admission/scheduling and whether this context
+  helps the MTP protected aggregate enough to justify broad promotion.
 - XR83 tested the existing `full_attention_kv_update_256` lower-level
   materialization path and rejected it for the non-profile chat tail. A
   materially different materialization design remains untested, but it is now
-  lower priority than server/load-time prefix warm policy. The protected
-  aggregate still needs a fresh rerun after any real runtime improvement.
+  lower priority than the MTP protected aggregate/productization path.
