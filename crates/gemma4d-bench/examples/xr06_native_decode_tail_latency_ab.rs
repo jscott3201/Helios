@@ -46,6 +46,7 @@ const ENV_KEYS: &[&str] = &[
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
 ];
 const INHERITED_GLOBAL_ENV_KEYS: &[&str] = &[
     "GEMMA4D_NATIVE_PREFILL_CHUNK_POLICY",
@@ -54,6 +55,7 @@ const INHERITED_GLOBAL_ENV_KEYS: &[&str] = &[
     "GEMMA4D_EXPERIMENTAL_NATIVE_GATHER_GREEDY_LOGIT",
     "GEMMA4D_EXPERIMENTAL_NATIVE_SKIP_DECODE_PEAK_RESET",
     "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE",
+    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -500,6 +502,12 @@ struct DecodeProfileTrace {
     deferred_kv_eval_sliding_bytes: u64,
     deferred_kv_eval_total_bytes: u64,
     deferred_kv_eval_sequence_len: u64,
+    full_attention_kv_update_ms: f64,
+    full_attention_kv_update_capacity_ms: f64,
+    full_attention_kv_update_slice_update_ms: f64,
+    full_attention_kv_update_visible_slice_ms: f64,
+    full_attention_kv_update_capacity_growths: u64,
+    full_attention_kv_update_capacity_tokens: u64,
     lm_head_ms: f64,
     non_kv_forward_graph_ms: f64,
     greedy_select_ms: f64,
@@ -544,6 +552,12 @@ struct DecodeProfileAggregate {
     deferred_kv_eval_sliding_bytes: Option<ScalarStats>,
     deferred_kv_eval_total_bytes: Option<ScalarStats>,
     deferred_kv_eval_sequence_len: Option<ScalarStats>,
+    full_attention_kv_update_ms: Option<LatencyStats>,
+    full_attention_kv_update_capacity_ms: Option<LatencyStats>,
+    full_attention_kv_update_slice_update_ms: Option<LatencyStats>,
+    full_attention_kv_update_visible_slice_ms: Option<LatencyStats>,
+    full_attention_kv_update_capacity_growths: Option<ScalarStats>,
+    full_attention_kv_update_capacity_tokens: Option<ScalarStats>,
     lm_head_ms: Option<LatencyStats>,
     non_kv_forward_graph_ms: Option<LatencyStats>,
     greedy_select_ms: Option<LatencyStats>,
@@ -706,6 +720,71 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             0,
             48,
             [("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE", "1")],
+        ),
+        native_default_variant_with_extra_env(
+            "native_decode_full_attention_kv_update_exact",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [
+                ("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE", "1"),
+                (
+                    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
+                    "exact",
+                ),
+            ],
+        ),
+        native_default_variant_with_extra_env(
+            "native_decode_full_attention_kv_update_64",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [
+                ("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE", "1"),
+                (
+                    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
+                    "64",
+                ),
+            ],
+        ),
+        native_default_variant_with_extra_env(
+            "native_decode_full_attention_kv_update_128",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [
+                ("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE", "1"),
+                (
+                    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
+                    "128",
+                ),
+            ],
+        ),
+        native_default_variant_with_extra_env(
+            "native_decode_full_attention_kv_update_256",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [
+                ("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE", "1"),
+                (
+                    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
+                    "256",
+                ),
+            ],
+        ),
+        native_default_variant_with_extra_env(
+            "native_decode_full_attention_kv_update_512",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            [
+                ("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE", "1"),
+                (
+                    "GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY",
+                    "512",
+                ),
+            ],
         ),
     ];
     if !options.variant_names.is_empty() {
@@ -1369,6 +1448,14 @@ fn decode_profile_trace(
         deferred_kv_eval_total_bytes: profile.deferred_kv_eval_full_attention_bytes
             + profile.deferred_kv_eval_sliding_bytes,
         deferred_kv_eval_sequence_len: profile.deferred_kv_eval_sequence_len,
+        full_attention_kv_update_ms: profile.full_attention_kv_update_ms,
+        full_attention_kv_update_capacity_ms: profile.full_attention_kv_update_capacity_ms,
+        full_attention_kv_update_slice_update_ms: profile.full_attention_kv_update_slice_update_ms,
+        full_attention_kv_update_visible_slice_ms: profile
+            .full_attention_kv_update_visible_slice_ms,
+        full_attention_kv_update_capacity_growths: profile
+            .full_attention_kv_update_capacity_growths,
+        full_attention_kv_update_capacity_tokens: profile.full_attention_kv_update_capacity_tokens,
         lm_head_ms: profile.lm_head_ms,
         non_kv_forward_graph_ms,
         greedy_select_ms: profile.greedy_select_ms,
@@ -1460,6 +1547,29 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             scalar_stats(&profile_scalar_values(&profiles, |profile| {
                 profile.deferred_kv_eval_sequence_len
             }));
+        let full_attention_kv_update_ms = latency_stats(&profile_values(&profiles, |profile| {
+            profile.full_attention_kv_update_ms
+        }));
+        let full_attention_kv_update_capacity_ms =
+            latency_stats(&profile_values(&profiles, |profile| {
+                profile.full_attention_kv_update_capacity_ms
+            }));
+        let full_attention_kv_update_slice_update_ms =
+            latency_stats(&profile_values(&profiles, |profile| {
+                profile.full_attention_kv_update_slice_update_ms
+            }));
+        let full_attention_kv_update_visible_slice_ms =
+            latency_stats(&profile_values(&profiles, |profile| {
+                profile.full_attention_kv_update_visible_slice_ms
+            }));
+        let full_attention_kv_update_capacity_growths =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.full_attention_kv_update_capacity_growths
+            }));
+        let full_attention_kv_update_capacity_tokens =
+            scalar_stats(&profile_scalar_values(&profiles, |profile| {
+                profile.full_attention_kv_update_capacity_tokens
+            }));
         let lm_head_ms = latency_stats(&profile_values(&profiles, |profile| profile.lm_head_ms));
         let non_kv_forward_graph_ms = latency_stats(&profile_values(&profiles, |profile| {
             profile.non_kv_forward_graph_ms
@@ -1495,6 +1605,19 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
                 &deferred_kv_eval_full_attention_ms,
             ),
             ("deferred_kv_eval_sliding_ms", &deferred_kv_eval_sliding_ms),
+            ("full_attention_kv_update_ms", &full_attention_kv_update_ms),
+            (
+                "full_attention_kv_update_capacity_ms",
+                &full_attention_kv_update_capacity_ms,
+            ),
+            (
+                "full_attention_kv_update_slice_update_ms",
+                &full_attention_kv_update_slice_update_ms,
+            ),
+            (
+                "full_attention_kv_update_visible_slice_ms",
+                &full_attention_kv_update_visible_slice_ms,
+            ),
             ("lm_head_ms", &lm_head_ms),
             ("decode_embedding_ms", &decode_embedding_ms),
             ("greedy_select_ms", &greedy_select_ms),
@@ -1532,6 +1655,12 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             deferred_kv_eval_sliding_bytes,
             deferred_kv_eval_total_bytes,
             deferred_kv_eval_sequence_len,
+            full_attention_kv_update_ms,
+            full_attention_kv_update_capacity_ms,
+            full_attention_kv_update_slice_update_ms,
+            full_attention_kv_update_visible_slice_ms,
+            full_attention_kv_update_capacity_growths,
+            full_attention_kv_update_capacity_tokens,
             lm_head_ms,
             non_kv_forward_graph_ms,
             greedy_select_ms,
@@ -1561,6 +1690,7 @@ fn build_decode_profile(records: &[Record]) -> DecodeProfileSummary {
             "deferred_kv_eval_ms is the grouped end-of-decode KV eval path when the selected KV eval mode defers layer KV synchronization".to_owned(),
             "XR69 profile fields split deferred KV eval into full-attention and sliding-window groups; when profiling is enabled these groups are evaluated separately for attribution, while non-profile runtime behavior keeps the original grouped eval call".to_owned(),
             "deferred KV eval array and byte counts are shape/dtype estimates for the arrays submitted to MLX eval at the current decode sequence length".to_owned(),
+            "XR71 profile fields split the default-off full-attention KV update candidate into capacity-growth, slice-update, and visible-slice buckets; eval-sync impact remains visible through deferred_kv_eval_* and eval_sync_ms".to_owned(),
             "eval_sync_ms is the explicit MLX eval call on greedy token and max-logit arrays".to_owned(),
             "output_read_ms covers scalar item reads for greedy token and greedy logit".to_owned(),
             "rust_ffi_overhead_ms is host decode_one latency minus total_native_decode_ms, clamped at zero".to_owned(),
@@ -2171,11 +2301,11 @@ fn render_profile_report(summary: &Summary) -> String {
     out.push_str(&format!("- Records: `{}`\n\n", summary.record_count));
 
     out.push_str("## Stage Aggregates\n\n");
-    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Non-KV graph mean | KV mutation mean | Deferred KV eval mean | Full-attn KV eval mean | Sliding KV eval mean | Eval arrays mean | Eval bytes mean | Eval seq len mean | LM head mean | Eval sync mean | Greedy select mean | Rust/FFI overhead mean | Largest stage |\n");
-    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    out.push_str("| Workload | Variant | Samples | Host latency mean | Native total mean | Forward graph mean | Non-KV graph mean | KV mutation mean | Full-attn update mean | Update capacity mean | Update slice mean | Update visible-slice mean | Capacity growths mean | Capacity tokens mean | Deferred KV eval mean | Full-attn KV eval mean | Sliding KV eval mean | Eval arrays mean | Eval bytes mean | Eval seq len mean | LM head mean | Eval sync mean | Greedy select mean | Rust/FFI overhead mean | Largest stage |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for aggregate in &summary.decode_profile.aggregates {
         out.push_str(&format!(
-            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
+            "| `{}` | `{}` | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | `{}` |\n",
             aggregate.workload_id,
             aggregate.variant,
             aggregate.enabled_sample_count,
@@ -2185,6 +2315,12 @@ fn render_profile_report(summary: &Summary) -> String {
             fmt_stats_mean(&aggregate.forward_graph_ms),
             fmt_stats_mean(&aggregate.non_kv_forward_graph_ms),
             fmt_stats_mean(&aggregate.attention_kv_mutation_ms),
+            fmt_stats_mean(&aggregate.full_attention_kv_update_ms),
+            fmt_stats_mean(&aggregate.full_attention_kv_update_capacity_ms),
+            fmt_stats_mean(&aggregate.full_attention_kv_update_slice_update_ms),
+            fmt_stats_mean(&aggregate.full_attention_kv_update_visible_slice_ms),
+            fmt_scalar_mean(&aggregate.full_attention_kv_update_capacity_growths),
+            fmt_scalar_mean(&aggregate.full_attention_kv_update_capacity_tokens),
             fmt_stats_mean(&aggregate.deferred_kv_eval_ms),
             fmt_stats_mean(&aggregate.deferred_kv_eval_full_attention_ms),
             fmt_stats_mean(&aggregate.deferred_kv_eval_sliding_ms),

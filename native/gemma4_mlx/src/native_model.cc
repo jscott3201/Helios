@@ -98,6 +98,7 @@ struct NativeTextModel::Impl {
     bool experimental_skip_decode_peak_reset = false;
     bool native_decode_profile = false;
     bool experimental_full_attention_kv_update = false;
+    int experimental_full_attention_kv_update_capacity_step = 256;
 };
 
 struct NativeMtpAssistantModel::Impl {
@@ -548,13 +549,14 @@ uint64_t estimate_target_kv_bytes(uint64_t sequence_len) {
     return full_layer_count * full_layer_bytes + sliding_layer_count * sliding_layer_bytes;
 }
 
-int full_attention_kv_update_capacity(int required_tokens) {
+int full_attention_kv_update_capacity(int required_tokens, int capacity_step) {
     if (required_tokens <= 0) {
-        return kFullAttentionKvUpdateCapacityStep;
+        return std::max(1, capacity_step);
     }
-    return ((required_tokens + kFullAttentionKvUpdateCapacityStep - 1) /
-        kFullAttentionKvUpdateCapacityStep) *
-        kFullAttentionKvUpdateCapacityStep;
+    if (capacity_step <= 1) {
+        return required_tokens;
+    }
+    return ((required_tokens + capacity_step - 1) / capacity_step) * capacity_step;
 }
 
 array full_attention_kv_visible_slice(
@@ -571,7 +573,8 @@ void materialize_full_attention_kv_update_storage(
     const array& values,
     int n_kv_heads,
     int head_dim,
-    int min_capacity_tokens) {
+    int min_capacity_tokens,
+    int capacity_step) {
     if (layer == nullptr) {
         return;
     }
@@ -581,7 +584,7 @@ void materialize_full_attention_kv_update_storage(
     }
     const int visible_tokens = key_shape[2];
     const int capacity_tokens =
-        full_attention_kv_update_capacity(std::max(visible_tokens, min_capacity_tokens));
+        full_attention_kv_update_capacity(std::max(visible_tokens, min_capacity_tokens), capacity_step);
     array key_storage = mlx::core::zeros({1, n_kv_heads, capacity_tokens, head_dim}, keys.dtype());
     array value_storage = mlx::core::zeros({1, n_kv_heads, capacity_tokens, head_dim}, values.dtype());
     key_storage = mlx::core::slice_update(
@@ -615,7 +618,8 @@ void ensure_full_attention_kv_update_capacity(
     NativeKvState::Impl::Layer* layer,
     int required_tokens,
     int n_kv_heads,
-    int head_dim) {
+    int head_dim,
+    int capacity_step) {
     if (layer == nullptr || !layer->key.has_value() || !layer->value.has_value()) {
         throw std::runtime_error("native full-attention KV update requires materialized KV");
     }
@@ -628,7 +632,8 @@ void ensure_full_attention_kv_update_capacity(
             *layer->value,
             n_kv_heads,
             head_dim,
-            required_tokens);
+            required_tokens,
+            capacity_step);
         return;
     }
     if (required_tokens <= layer->full_attention_capacity_tokens) {
@@ -637,7 +642,7 @@ void ensure_full_attention_kv_update_capacity(
     const int visible_tokens = layer->full_attention_visible_tokens > 0
         ? layer->full_attention_visible_tokens
         : layer->key->shape()[2];
-    const int capacity_tokens = full_attention_kv_update_capacity(required_tokens);
+    const int capacity_tokens = full_attention_kv_update_capacity(required_tokens, capacity_step);
     array key_storage =
         mlx::core::zeros({1, n_kv_heads, capacity_tokens, head_dim}, layer->key->dtype());
     array value_storage =
@@ -665,7 +670,8 @@ void store_target_layer_kv(
     int sequence_len,
     int n_kv_heads,
     int head_dim,
-    bool use_full_attention_kv_update = false) {
+    bool use_full_attention_kv_update = false,
+    int full_attention_kv_update_capacity_step = kFullAttentionKvUpdateCapacityStep) {
     if (layer == nullptr) {
         return;
     }
@@ -677,7 +683,8 @@ void store_target_layer_kv(
             values,
             n_kv_heads,
             head_dim,
-            sequence_len + 1);
+            sequence_len + 1,
+            full_attention_kv_update_capacity_step);
     } else if (full_attention || sequence_len <= kSlidingWindowSize) {
         layer->key = keys;
         layer->value = values;
@@ -835,7 +842,8 @@ array attention_forward(
         sequence_len,
         n_kv_heads,
         head_dim,
-        impl.experimental_full_attention_kv_update);
+        impl.experimental_full_attention_kv_update,
+        impl.experimental_full_attention_kv_update_capacity_step);
 
     const std::optional<array> mask = full_attention ? std::nullopt : sliding_causal_mask(sequence_len, 1024);
     const std::string mask_mode = sequence_len == 1 || mask.has_value() ? "" : "causal";
@@ -992,7 +1000,31 @@ array target_attention_decode_forward(
         }
         const int previous_key_len = previous_key_shape[2];
         const int updated_len = previous_key_len + 1;
-        ensure_full_attention_kv_update_capacity(target_kv, updated_len, n_kv_heads, head_dim);
+        const auto update_started = decode_profile != nullptr
+                                        ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+        const int previous_capacity = target_kv->full_attention_capacity_tokens;
+        const auto capacity_started = decode_profile != nullptr
+                                          ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+        ensure_full_attention_kv_update_capacity(
+            target_kv,
+            updated_len,
+            n_kv_heads,
+            head_dim,
+            impl.experimental_full_attention_kv_update_capacity_step);
+        if (decode_profile != nullptr) {
+            decode_profile->full_attention_kv_update_capacity_ms += profile_elapsed_ms(capacity_started);
+            if (target_kv->full_attention_capacity_tokens > previous_capacity) {
+                decode_profile->full_attention_kv_update_capacity_growths += 1;
+            }
+            decode_profile->full_attention_kv_update_capacity_tokens = std::max<uint64_t>(
+                decode_profile->full_attention_kv_update_capacity_tokens,
+                static_cast<uint64_t>(std::max(0, target_kv->full_attention_capacity_tokens)));
+        }
+        const auto slice_update_started = decode_profile != nullptr
+                                              ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
         target_kv->full_attention_key_storage = mlx::core::slice_update(
             *target_kv->full_attention_key_storage,
             keys,
@@ -1003,6 +1035,13 @@ array target_attention_decode_forward(
             values,
             {0, 0, previous_key_len, 0},
             {1, n_kv_heads, updated_len, head_dim});
+        if (decode_profile != nullptr) {
+            decode_profile->full_attention_kv_update_slice_update_ms +=
+                profile_elapsed_ms(slice_update_started);
+        }
+        const auto visible_slice_started = decode_profile != nullptr
+                                               ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
         target_kv->full_attention = true;
         target_kv->full_attention_visible_tokens = updated_len;
         target_kv->key = full_attention_kv_visible_slice(
@@ -1015,6 +1054,11 @@ array target_attention_decode_forward(
             updated_len,
             n_kv_heads,
             head_dim);
+        if (decode_profile != nullptr) {
+            decode_profile->full_attention_kv_update_visible_slice_ms +=
+                profile_elapsed_ms(visible_slice_started);
+            decode_profile->full_attention_kv_update_ms += profile_elapsed_ms(update_started);
+        }
     } else {
         array cached_keys = mlx::core::concatenate({*target_kv->key, keys}, 2);
         array cached_values = mlx::core::concatenate({*target_kv->value, values}, 2);
@@ -1116,7 +1160,12 @@ array target_attention_decode_block_forward(
     int attention_key_len = 0;
     if (full_attention && impl.experimental_full_attention_kv_update) {
         const int updated_len = previous_key_len + block_len;
-        ensure_full_attention_kv_update_capacity(target_kv, updated_len, n_kv_heads, head_dim);
+        ensure_full_attention_kv_update_capacity(
+            target_kv,
+            updated_len,
+            n_kv_heads,
+            head_dim,
+            impl.experimental_full_attention_kv_update_capacity_step);
         target_kv->full_attention_key_storage = mlx::core::slice_update(
             *target_kv->full_attention_key_storage,
             keys,
@@ -2113,6 +2162,31 @@ bool experimental_skip_decode_peak_reset_env_enabled() {
 bool experimental_full_attention_kv_update_env_enabled() {
     const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+int experimental_full_attention_kv_update_capacity_step_env() {
+    const char* value = std::getenv("GEMMA4D_EXPERIMENTAL_NATIVE_FULL_ATTENTION_KV_UPDATE_CAPACITY");
+    if (value == nullptr || value[0] == '\0') {
+        return kFullAttentionKvUpdateCapacityStep;
+    }
+    if (std::strcmp(value, "exact") == 0 || std::strcmp(value, "1") == 0) {
+        return 1;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return kFullAttentionKvUpdateCapacityStep;
+    }
+    switch (parsed) {
+        case 64:
+        case 128:
+        case 256:
+        case 512:
+            return static_cast<int>(parsed);
+        default:
+            return kFullAttentionKvUpdateCapacityStep;
+    }
 }
 
 array greedy_logit_for_vector_logits(const array& logits, const array& greedy, bool use_gather) {
@@ -3330,6 +3404,8 @@ bool NativeTextModel::load(
             experimental_skip_decode_peak_reset_env_enabled();
         model->impl_->experimental_full_attention_kv_update =
             experimental_full_attention_kv_update_env_enabled();
+        model->impl_->experimental_full_attention_kv_update_capacity_step =
+            experimental_full_attention_kv_update_capacity_step_env();
 
         const std::vector<std::filesystem::path> files = safetensor_files(model_path);
         if (files.empty()) {
