@@ -427,6 +427,7 @@ struct Variant {
     warmup_decode_before_measurement: bool,
     warmup_once_per_trial_workload: bool,
     warmup_reuse_measured_requests: usize,
+    warmup_context_token_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -804,6 +805,13 @@ fn selected_variants(options: &Options) -> Result<Vec<Variant>, CliError> {
             0,
             48,
         ),
+        native_default_prefix_warmup_variant(
+            "native_decode_runtime_default_warmup_prefix_128",
+            Some("native_decode_runtime_default"),
+            0,
+            48,
+            128,
+        ),
         native_default_warmup_variant(
             "native_decode_runtime_default_warmup_costed",
             Some("native_decode_runtime_default"),
@@ -1016,6 +1024,36 @@ fn native_default_warmup_variant(
     variant
 }
 
+fn native_default_prefix_warmup_variant(
+    name: &str,
+    baseline_variant: Option<&str>,
+    immediate_layer_kv_eval_count: usize,
+    grouped_end_kv_eval_count: usize,
+    prefix_tokens: usize,
+) -> Variant {
+    let mut variant = native_default_warmup_variant(
+        name,
+        baseline_variant,
+        immediate_layer_kv_eval_count,
+        grouped_end_kv_eval_count,
+    );
+    let prefix_tokens = prefix_tokens.max(1);
+    variant.config.insert(
+        "warmup_context_scope".to_owned(),
+        format!("workload_prefix_{prefix_tokens}_tokens"),
+    );
+    variant.config.insert(
+        "warmup_shape_guard".to_owned(),
+        "prefix_token_limit".to_owned(),
+    );
+    variant.config.insert(
+        "warmup_context_token_limit".to_owned(),
+        prefix_tokens.to_string(),
+    );
+    variant.warmup_context_token_limit = Some(prefix_tokens);
+    variant
+}
+
 fn native_default_amortized_warmup_variant(
     name: &str,
     baseline_variant: Option<&str>,
@@ -1083,6 +1121,7 @@ fn native_default_variant_with_extra_env<const N: usize>(
         warmup_decode_before_measurement: false,
         warmup_once_per_trial_workload: false,
         warmup_reuse_measured_requests: 1,
+        warmup_context_token_limit: None,
     }
 }
 
@@ -1128,6 +1167,16 @@ fn native_variant_with_extra_env<const N: usize>(
         warmup_decode_before_measurement: false,
         warmup_once_per_trial_workload: false,
         warmup_reuse_measured_requests: 1,
+        warmup_context_token_limit: None,
+    }
+}
+
+fn warmup_token_slice<'a>(variant: &Variant, token_ids: &'a [i32]) -> &'a [i32] {
+    if let Some(limit) = variant.warmup_context_token_limit {
+        let end = token_ids.len().min(limit.max(1));
+        &token_ids[..end]
+    } else {
+        token_ids
     }
 }
 
@@ -1181,7 +1230,8 @@ fn run_variant_trial(
 
     for workload in workload_inputs {
         if variant.warmup_once_per_trial_workload {
-            let warmup_cost = match warmup_decode_once(&target, &workload.token_ids) {
+            let warmup_tokens = warmup_token_slice(variant, &workload.token_ids);
+            let warmup_cost = match warmup_decode_once(&target, warmup_tokens) {
                 Ok(cost) => cost,
                 Err(error) => {
                     records.push(failed_record(
@@ -1267,7 +1317,8 @@ fn run_decode_record(
     let warmup_cost = if let Some(cost) = warmup_event_cost {
         Some(cost)
     } else if variant.warmup_decode_before_measurement && !variant.warmup_once_per_trial_workload {
-        match warmup_decode_once(target, &workload.token_ids) {
+        let warmup_tokens = warmup_token_slice(variant, &workload.token_ids);
+        match warmup_decode_once(target, warmup_tokens) {
             Ok(cost) => Some(cost),
             Err(error) => {
                 return Ok(failed_record(

@@ -3,7 +3,7 @@
 Date: 2026-07-05
 
 This review reflects the current `main` branch, `BENCHMARKS.md`, and the
-post-XR83 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
+post-XR84 native/MTP evidence. `BENCHMARKS.md` remains the authority for exact
 commands, run IDs, artifacts, and caveats.
 
 ## Decision
@@ -12,10 +12,13 @@ XR82 confirms XR81's first verifier-forward spike is a real warm/JIT/cache
 effect, but rejects the request-path preverify warmup candidate once the warmup
 cost is charged to MTP decode phase. XR83 then rejects the existing
 `full_attention_kv_update_256` materialization candidate on the real
-non-profile chat-tail path, so the next theoretical-max target should be a true
-out-of-request/load-time warm policy or a materially different lower-level
-materialization strategy. Productizing the accepted scoped chat/tool MTP opt-in
-remains the parallel shippable-value track.
+non-profile chat-tail path. XR84 closes the next native question: a much
+cheaper `128`-token prefix warmup preserves most of the first-token/raw-tail
+benefit while measuring the full `1024`-token chat request on a fresh cache.
+The next theoretical-max target should therefore be a server/load-time prefix
+warm policy with admission, scheduling, amortization, and observability
+guardrails. Productizing the accepted scoped chat/tool MTP opt-in remains the
+parallel shippable-value track.
 
 XR72 closed the immediate native diagnostic question: the remaining
 full-attention tail is dominated by MLX full-attention eval, especially chat
@@ -43,15 +46,20 @@ obvious cloned-cache preverify warmup path and found it removes most of the
 first verifier-forward spike, but the request-path warmup cost exceeds the
 savings. XR83 tested the already-implemented 256-token full-attention KV update
 materialization candidate without profile-mode scheduling and rejected it as a
-chat-tail fix. XR74 closed the readiness sweep for the current local
+chat-tail fix. XR84 then tested a cheaper prefix warm shape: discarded warmup
+used only `128` workload tokens, measured requests still used `1024` tokens,
+profile samples stayed `0/756`, peak MLX stayed `7.321 GB`, and raw p99/max
+improved `150.450 -> 102.426 ms` versus runtime default. Exact-context warmup
+remains stronger at `92.789 ms`, but prefix warmup cuts warm event p50 from
+`2837.263 ms` to `1238.137 ms`, making server/load-time policy work the best
+next native lane. XR74 closed the readiness sweep for the current local
 persistent-native default surface.
 
 Recommended order:
 
-1. If the priority is broad theoretical max, test a true out-of-request or
-   load-time warm policy, or a lower-level materialization strategy that is
-   materially different from the XR83-rejected 256 slice-update candidate, then
-   rerun the protected aggregate gates.
+1. If the priority is broad theoretical max, turn XR84 into a true
+   server/load-time prefix warm policy candidate with guardrails, then rerun the
+   protected aggregate gates.
 2. Productize the accepted scoped chat/tool MTP opt-in if the priority is
    shippable value.
 3. Keep request-path preverify warmup and broad MTP default-on disabled until
@@ -177,6 +185,18 @@ Recommended order:
   `7.321 -> 7.327 GB`. First-token p50 and p95/p99/max also regressed
   `201.004 -> 234.602 ms` and `210.701 -> 247.910 ms`. Therefore the existing
   256 slice-update materialization candidate should not be broadened.
+- XR84 added `native_decode_runtime_default_warmup_prefix_128` to test whether
+  a cheaper discarded warm shape can reproduce the non-profile chat tail win.
+  The focused run wrote `12/12` passed records, `0/756` profile-enabled decode
+  samples, no blockers, and peak MLX `7.321 GB`. Prefix warmup records show
+  `warmup_context_tokens=128` while measured requests stayed at
+  `input_tokens=1024`. Versus runtime default, p50/p95 stayed neutral
+  (`69.702 -> 69.811 ms`, `70.189 -> 70.199 ms`), raw p99/max improved
+  `150.450 -> 102.426 ms` (`+31.920%`), and first-token p50 improved
+  `150.450 -> 102.426 ms`. Exact-context warmup still reached `92.789 ms`, but
+  its warmup total p50 was `2837.263 ms` versus prefix warmup `1238.137 ms`.
+  Therefore the best next native item is a real server/load-time prefix warm
+  policy with admission, scheduling, amortization, and observability guardrails.
 - XR74 added backend/native-prefill policy visibility to `/health` and the TUI
   dashboard, with tests covering `backend`, `max_context_tokens`, and native
   prefill policy state. Static gates passed: `cargo fmt --all --check`,
@@ -188,7 +208,7 @@ Recommended order:
 
 | Area | Files / symbols | Responsibility | Notes |
 |---|---|---|---|
-| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, profile-perturbation, warmup-probe, warmup-costed, amortized warmup, full-attention KV update capacity, and XR75 group-eval candidates; XR83 rejects non-profile `full_attention_kv_update_256` as the next chat-tail fix |
+| Native decode benchmark | `crates/gemma4d-bench/examples/xr06_native_decode_tail_latency_ab.rs` | Runs XR06-style real-context decode A/B matrix, variants, profile reports, correctness and tail gates | Existing variants include runtime default, profile-perturbation, warmup-probe, warmup-costed, amortized warmup, prefix warmup, full-attention KV update capacity, and XR75 group-eval candidates; XR83 rejects non-profile `full_attention_kv_update_256`, while XR84 selects prefix warm policy work as the next chat-tail lane |
 | Native profile ABI | `native/gemma4_mlx/include/gemma4_mlx.h`, `crates/gemma4d-ffi/src/lib.rs` | Carries per-token decode profile fields across C ABI and Rust | Current fields split broad forward, deferred KV eval, full-attention/sliding eval, update/capacity/slice/visible-slice, group eval attribution, and eval sync |
 | Full-attention deferred eval | `native/gemma4_mlx/src/native_model.cc::eval_deferred_decode_kv` | Collects full-attention and sliding KV arrays, then calls `mlx::core::eval` | XR72 attributed tails to full-attention eval; XR75 rejected simple serial group scheduling |
 | Full-attention update candidate | `native/gemma4_mlx/src/native_model.cc::decode_layer`, capacity helpers | Maintains default-off slice-update-backed full-attention active KV storage | XR71 says this overhead is small and not the main blocker; XR83 says the `256` candidate does not improve the non-profile chat tail |
@@ -199,7 +219,7 @@ Recommended order:
 
 ## Findings
 
-### high: XR83 narrows native tail work to out-of-request warmup or a new materialization strategy
+### high: XR84 selects prefix warm policy as the next native tail lane
 
 Evidence: XR72 accepted runtime default against explicit per-layer on all five
 rows, and XR73 accepted scoped chat/tool MTP opt-in with exactness, oracle,
@@ -229,25 +249,32 @@ itself cost `754.613 ms`. XR83 then tested the existing
 scheduling. It stayed correct (`9/9`) with `0/567` profiled samples and peak
 `7.327 GB`, but missed the chat tail gate versus runtime default: raw p50
 `70.750 -> 70.631 ms`, p95 `72.603 -> 71.988 ms`, p99
-`201.004 -> 234.602 ms`, and first-token p50 `201.004 -> 234.602 ms`.
+`201.004 -> 234.602 ms`, and first-token p50 `201.004 -> 234.602 ms`. XR84
+then tested a cheaper prefix warm shape. It stayed exact (`12/12`) with
+`0/756` profile-enabled samples, peak `7.321 GB`, and records proving
+`warmup_context_tokens=128` while measured requests remained
+`input_tokens=1024`. Versus runtime default, raw p99/max and first-token p50
+moved `150.450 -> 102.426 ms` (`+31.920%`) while p50/p95 stayed neutral.
+Exact-context warmup still reached `92.789 ms`, but its warmup total p50 was
+`2837.263 ms` versus prefix warmup `1238.137 ms`.
 
 Impact: The fastest remaining route toward the theoretical max is no longer
 another readiness/doc pass or a serial group-eval full matrix. The remaining
 native speed evidence points at first-token warm/JIT/cache behavior, and XR82
 links that shape directly to the MTP verifier path. The naive request-path
-prewarm shape is rejected, and XR83 rules out the already-implemented
-`256` slice-update materialization candidate as the next chat-tail fix. The
-remaining actionable blocker is warm state or graph materialization without
-charging a large user-visible warmup and without relying on the rejected
-candidate shape.
+prewarm shape is rejected, XR83 rules out the already-implemented `256`
+slice-update materialization candidate as the next chat-tail fix, and XR84
+shows a cheaper prefix warm shape is plausible enough to productize as a
+server/load-time candidate. The remaining actionable blocker is turning this
+warm state into off-request work without charging a large user-visible warmup.
 
-Recommendation: Keep native warmup as default-off out-of-request/load-time
-shape work. For theoretical max, build either a true load-time/server warm
-policy or a materially different lower-level verifier/full-attention
-materialization strategy, then rerun protected aggregate gates. Treat profile
-mode, serial group eval, request-path preverify warmup, and the existing
-`full_attention_kv_update_256` path as rejected promotion lanes unless new
-evidence changes their cost model.
+Recommendation: Build an XR85 server/load-time prefix warm policy candidate
+first. It should gate by workload/context shape, run out of the request path,
+record warmup cost and hit/miss state, cap memory for tiny16, and keep runtime
+defaults unchanged until a protected aggregate rerun clears the gate. Treat
+profile mode, serial group eval, request-path preverify warmup, and the
+existing `full_attention_kv_update_256` path as rejected promotion lanes unless
+new evidence changes their cost model.
 
 ### high: Broad MTP default-on is still unsupported
 
@@ -303,25 +330,26 @@ The next shippable-value task is to expose it as an explicit local opt-in with
 clear workload/request gating, observability, and rollback, while keeping broad
 MTP default-off.
 
-### MTP protected aggregate gap
+### Native prefix warm policy
 
-For broad theoretical max, the next runtime task is not request-path preverify
-warmup. XR82 already rejected that shape, and XR83 rejected the existing
-`full_attention_kv_update_256` materialization path for the non-profile chat
-tail. The next candidate should be either a true out-of-request/load-time warm
-shape that avoids the `754.613 ms` request cost or a materially different
-lower-level verifier/full-attention materialization strategy. Only after a real
-native improvement lands should the protected aggregate rerun attempt to clear
-`25%` without weakening the `mtp_candidate_1k_001` and 4K holdout protections.
-Selected-lane evidence alone is not sufficient for broad default-on.
+For broad theoretical max, the next runtime task is a guarded server/load-time
+prefix warm candidate based on XR84. The policy should start with the chat/tool
+1K shapes that already drive the MTP selected lane, keep the warm pass
+off-request, expose warmup cost/hit/miss telemetry, and retain tiny16 memory
+guards. Only after that native improvement lands should the protected aggregate
+rerun attempt to clear `25%` without weakening the `mtp_candidate_1k_001` and
+4K holdout protections. Selected-lane evidence alone is not sufficient for
+broad default-on.
 
 ## Gaps and unknowns
 
-- XR78 proves warm-state lifetime only within the same loaded target and
-  same-shape fresh-cache benchmark path; a production server warmup policy
-  would still need separate admission, scheduling, and observability work.
+- XR78 proves exact warm-state lifetime only within the same loaded target and
+  same-shape fresh-cache benchmark path; XR84 proves a `128`-token prefix warm
+  shape can reproduce most of the 1K chat first-token tail benefit in the
+  harness. A production server warmup policy still needs separate admission,
+  scheduling, amortization, telemetry, and memory guard work.
 - XR83 tested the existing `full_attention_kv_update_256` lower-level
-  materialization path and rejected it for the non-profile chat tail. A true
-  out-of-request server warm policy or a materially different materialization
-  design remains untested. The protected aggregate still needs a fresh rerun
-  after any real runtime improvement.
+  materialization path and rejected it for the non-profile chat tail. A
+  materially different materialization design remains untested, but it is now
+  lower priority than server/load-time prefix warm policy. The protected
+  aggregate still needs a fresh rerun after any real runtime improvement.
