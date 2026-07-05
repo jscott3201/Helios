@@ -170,6 +170,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         adaptive_policy_name: args.adaptive_policy.clone(),
         adaptive_policy_enabled: args.adaptive_policy_enabled(),
         mtp_real_margins_enabled: env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS"),
+        mtp_first_verify_warmup_enabled: env_flag_enabled(
+            "GEMMA4D_EXPERIMENTAL_MTP_FIRST_VERIFY_WARMUP",
+        ),
         adaptive_zero_accept_run: args.adaptive_zero_accept_run,
         adaptive_min_generated_tokens: args.adaptive_min_generated_tokens,
         mtp_disabled: args.disable_mtp,
@@ -449,6 +452,7 @@ struct Summary {
     adaptive_policy_name: Option<String>,
     adaptive_policy_enabled: bool,
     mtp_real_margins_enabled: bool,
+    mtp_first_verify_warmup_enabled: bool,
     adaptive_zero_accept_run: Option<usize>,
     adaptive_min_generated_tokens: usize,
     mtp_disabled: bool,
@@ -529,6 +533,9 @@ struct MtpRun {
     model_load_ms: f64,
     drafter_load_ms: f64,
     prefill_ms: f64,
+    preverify_warmup_ms: f64,
+    preverify_warmup_peak_memory_gb: f32,
+    preverify_warmup_active_kv_bytes: u64,
     draft_ms: f64,
     verify_ms: f64,
     verify_stage_ms: f64,
@@ -747,6 +754,9 @@ fn bypassed_mtp_run(
         model_load_ms: baseline.model_load_ms,
         drafter_load_ms: 0.0,
         prefill_ms: baseline.prefill_ms,
+        preverify_warmup_ms: 0.0,
+        preverify_warmup_peak_memory_gb: baseline.peak_memory_gb,
+        preverify_warmup_active_kv_bytes: baseline.active_kv_bytes,
         draft_ms: 0.0,
         verify_ms: 0.0,
         verify_stage_ms: 0.0,
@@ -999,6 +1009,21 @@ fn run_mtp(
     let prefill_started = Instant::now();
     let first = prefill(&target, &mut cache, &workload.token_ids)?;
     let prefill = prefill_started.elapsed();
+    let first_verify_warmup_enabled =
+        env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_FIRST_VERIFY_WARMUP");
+    let mut preverify_warmup_ms = 0.0_f64;
+    let mut preverify_warmup_peak_memory_gb = first.peak_memory_gb;
+    let mut preverify_warmup_active_kv_bytes = first.active_kv_bytes;
+    if first_verify_warmup_enabled {
+        let warmup_started = Instant::now();
+        let snapshot = cache.export_snapshot()?;
+        let mut warmup_cache = KvCache::create(&KvPolicy::default())?;
+        warmup_cache.import_snapshot(&snapshot)?;
+        let warmup_step = decode_one(&target, &mut warmup_cache, first.greedy_token)?;
+        preverify_warmup_ms = duration_ms(warmup_started.elapsed());
+        preverify_warmup_peak_memory_gb = warmup_step.peak_memory_gb;
+        preverify_warmup_active_kv_bytes = warmup_step.active_kv_bytes;
+    }
     let mut generated = Vec::with_capacity(workload.max_new_tokens);
     let mut draft_duration = Duration::ZERO;
     let mut verify_duration = Duration::ZERO;
@@ -1020,8 +1045,8 @@ fn run_mtp(
     let mut auto_disable_pass = None;
     let mut auto_disable_generated_tokens = None;
     let mut pending_greedy = None;
-    let mut peak_memory_gb = first.peak_memory_gb;
-    let mut active_kv_bytes = first.active_kv_bytes;
+    let mut peak_memory_gb = first.peak_memory_gb.max(preverify_warmup_peak_memory_gb);
+    let mut active_kv_bytes = first.active_kv_bytes.max(preverify_warmup_active_kv_bytes);
     let mut events = Vec::new();
     let real_margins_enabled = env_flag_enabled("GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS");
     let adaptive_policy_enabled = args.adaptive_policy_enabled();
@@ -1242,6 +1267,9 @@ fn run_mtp(
         model_load_ms: duration_ms(model_load),
         drafter_load_ms: duration_ms(drafter_load),
         prefill_ms: duration_ms(prefill),
+        preverify_warmup_ms,
+        preverify_warmup_peak_memory_gb,
+        preverify_warmup_active_kv_bytes,
         draft_ms,
         verify_ms,
         verify_stage_ms,
@@ -1252,7 +1280,7 @@ fn run_mtp(
         repair_fallback_ms,
         fallback_decode_ms,
         total_ms: duration_ms(started.elapsed()),
-        decode_phase_ms: draft_ms + verify_ms + fallback_decode_ms,
+        decode_phase_ms: preverify_warmup_ms + draft_ms + verify_ms + fallback_decode_ms,
         attempted_draft_tokens,
         accepted_draft_tokens,
         acceptance_rate: ratio(accepted_draft_tokens, attempted_draft_tokens),
@@ -2014,6 +2042,10 @@ fn render_report(summary: &Summary) -> String {
         summary.mtp_real_margins_enabled
     ));
     out.push_str(&format!(
+        "| First verifier warmup | `{}` |\n",
+        summary.mtp_first_verify_warmup_enabled
+    ));
+    out.push_str(&format!(
         "| Adaptive zero-accept run | `{}` |\n",
         summary
             .adaptive_zero_accept_run
@@ -2050,11 +2082,13 @@ fn render_report(summary: &Summary) -> String {
     out.push('\n');
 
     out.push_str("## Records\n\n");
-    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Fallback decode ms | Repair clone ms | Repair forward ms | Repair fallback ms | Speedup % | Accepted/Attempted | Terminal skips | Auto disabled | Peak GB | Status |\n");
-    out.push_str("|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|\n");
+    out.push_str("| Workload | Trial | Block | Exact | Baseline decode ms | MTP decode phase ms | Preverify warmup ms | Verify forward ms | Fallback decode ms | Repair clone ms | Repair forward ms | Repair fallback ms | Speedup % | Accepted/Attempted | Terminal skips | Auto disabled | Peak GB | Status |\n");
+    out.push_str(
+        "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---|\n",
+    );
     for record in &summary.records {
         out.push_str(&format!(
-            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {}/{} | {} | `{}` | {:.3} | `{}` |\n",
+            "| `{}` | `{}` {} | {} | `{}` | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {}/{} | {} | `{}` | {:.3} | `{}` |\n",
             record.workload_id,
             record.trial_kind,
             record.trial_index,
@@ -2062,6 +2096,8 @@ fn render_report(summary: &Summary) -> String {
             record.comparison.byte_identical,
             record.baseline.decode_ms,
             record.mtp.decode_phase_ms,
+            record.mtp.preverify_warmup_ms,
+            record.mtp.verify_forward_ms,
             record.mtp.fallback_decode_ms,
             record.mtp.repair_clone_ms,
             record.mtp.repair_forward_ms,
@@ -2131,6 +2167,7 @@ fn measurement_notes() -> Vec<String> {
         "real per-slot target top-5, drafter logits, and drafter margins are captured only when GEMMA4D_EXPERIMENTAL_MTP_REAL_MARGINS is truthy; the default path records target top-1 and zero draft score fields to preserve the XR57 performance guard".to_owned(),
         "adaptive zero-accept fallback is disabled unless --adaptive-zero-accept-run is passed; when active it uses native decode_one for the remaining tail after the gate fires".to_owned(),
         "--disable-mtp is a default-overhead probe: it bypasses drafter load, draft, verify, and repair work while recording baseline-equivalent generated tokens".to_owned(),
+        "GEMMA4D_EXPERIMENTAL_MTP_FIRST_VERIFY_WARMUP=1 exports/imports a cloned KV snapshot after prefill, runs one uncommitted target decode on the imported cache, records preverify_warmup_ms, and includes that cost in MTP decode_phase_ms".to_owned(),
         "warmup records remain in records.jsonl and summary.json but policy summaries use measured records only".to_owned(),
         "each evidence summary and record stamps git SHA, dirty-diff SHA-256, dirty-diff byte count, runner binary path, and runner binary link mtime; missing provenance aborts before measurement".to_owned(),
         "the net-latency guard requires exact MTP output, at least 5% decode-phase speedup, and peak MLX memory under the configured gate".to_owned(),
@@ -2200,7 +2237,7 @@ where
 
 fn usage() -> String {
     format!(
-        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--allow-missing-source-replay] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-policy xr61-real-margin-v1] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--disable-mtp] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
+        "usage: GEMMA4D_REQUIRE_MLX=1 GEMMA4D_USE_NATIVE_GRAPH=1 cargo run -p gemma4d-bench --example xr15_mtp_policy_variance_ab -- [--out-dir PATH] [--source-replay PATH] [--allow-missing-source-replay] [--trials N] [--warmups N] [--max-new-tokens N] [--block-sizes 1,2] [--experimental-terminal-no-lookahead] [--adaptive-policy xr61-real-margin-v1] [--adaptive-zero-accept-run N] [--adaptive-min-generated-tokens N] [--disable-mtp] [--workload-id ID] [--clear-workload-ids] [--max-workloads N]\n\noptional env: GEMMA4D_EXPERIMENTAL_MTP_FIRST_VERIFY_WARMUP=1 adds a cost-accounted cloned-cache target decode before measured MTP verification\n\ndefault out-dir: {DEFAULT_OUT_DIR}"
     )
 }
 
